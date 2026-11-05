@@ -8,7 +8,8 @@ This document records the exact provenance, sources, and checksums of all input 
 
 | Asset | Source / Project | Version / Build | Critical Components |
 |---|---|---|---|
-| **crDroid 12.x (Android 16)** | Official crDroid for OnePlus 7T (`hotdogb`) | `v12.11` (Android 16 / BP4A) | - Proven 4.14 non-GKI kernel with SM8150 A16 adaptations<br>- Vendor image with Adreno 640 GPU stack, display DSI, Synaptics touch HAL<br>- Audio (WCD9340 Tavil), Bluetooth, Wi-Fi HALs |
+| **LineageOS 23.2 (Android 16)** | Official LineageOS for OnePlus 7T (`hotdogb`) | `lineage-23.2-20261009-nightly-hotdogb-signed.zip` | - Extracted `vendor.img` (558M, ext4), `odm.img` (207M, ext4), `vendor_dlkm.img` (12M, ext4)<br>- Exact SDK 36 (Android 16 / BP4A.251205.006) HAL match<br>- Full SM8150 Adreno 640 graphics, audio, display, sensors stack |
+| **crDroid 12.x (Android 16)** | Official crDroid for OnePlus 7T (`hotdogb`) | `v12.11` (Android 16 / BP4A) | - Proven 4.14 non-GKI kernel with SM8150 A16 adaptations<br>- Live device verified in Test T0 / T1 |
 | **OnePlus 7T Hardware Dumps** | Live device pull from `/dev/block/bootdevice/by-name/*` | 84 Partitions Verified | `boot_b`, `dtbo_b`, `vbmeta_b`, `persist`, `param`, `carrier`, `dsp_b`, `modem_b` |
 
 ---
