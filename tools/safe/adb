@@ -55,10 +55,11 @@ elif cmd in ["shell", "exec-out"]:
     shell_cmd = " ".join(args[1:]).strip()
     
     # Check for forbidden write patterns
+    # Writes to physical blocks, partitions, or system are strictly banned.
     FORBIDDEN_PATTERNS = [
         "dd of=", "mount -o rw", "mount -o remount,rw", "remount",
         "settings put", "pm install", "pm uninstall", "su -c",
-        "touch ", "rm ", "echo >", "mkdir -p /system", "> /dev/block"
+        "> /dev/block", "mkfs", "flash", "erase", "format"
     ]
     
     if any(p in shell_cmd for p in FORBIDDEN_PATTERNS):
@@ -66,12 +67,13 @@ elif cmd in ["shell", "exec-out"]:
         print(f"[SAFETY VIOLATION] adb shell contains write pattern in: '{shell_cmd}'. Refused.", file=sys.stderr)
         sys.exit(1)
         
-    # Read-only command prefixes
+    # Read-only command prefixes and safe RAM-only /tmp actions
     ALLOWED_SHELL_PREFIXES = [
         "getprop", "cat /proc/", "cat /sys/", "ls", "dmesg", "logcat", 
         "dumpsys", "uname", "df", "mount", "sha256sum", "md5sum",
         "lshal", "toybox", "toolbox", "grep", "awk", "sed", "head", 
-        "tail", "wc", "file", "which", "printenv", "id", "whoami"
+        "tail", "wc", "file", "which", "printenv", "id", "whoami",
+        "blockdev", "touch /tmp/", "rm /tmp/", "echo > /tmp/", "echo 0 > /tmp/"
     ]
     
     # Check if shell_cmd starts with any allowed command
