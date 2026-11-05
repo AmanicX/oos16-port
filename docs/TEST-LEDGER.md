@@ -2,7 +2,7 @@
 
 | ID | Date | Build Hash | Change / Target | Hypothesis | Command | Timeout | Result | Pass/Fail | Next Step |
 |---|---|---|---|---|---|---|---|---|---|
-| **T0** | 2026-11-05 | `4555fd32...` | Stage-1 Harmless Boot | Minimal kernel + ramdisk boots to RAM; visible USB adb comes up; reboot returns cleanly to Android | `tools/safe/fastboot boot build/stage1.img` | 60s | Ready for User Approval | Ready | T1 |
+| **T0** | 2026-11-05 | `0c45df5a...` | Stage-1 Native RAM Boot | Native static init + adbd; all fstabs removed; disks setro; 90s watchdog; adb root | `tools/safe/fastboot boot build/stage1.img` | 60s | Ready for User Approval | Ready | T1 |
 | **T1** | Planned | Pending | Block Layer Read-Only Proof | All physical UFS block devices (`/dev/block/sd*`) are read-only; write attempts fail | `tools/safe/adb shell "dd if=/dev/zero of=/dev/block/sda seek=100 count=1"` -> fails | 30s | Pending | - | T2 |
 | **T2** | Planned | Pending | RAM Transfer | Compressed trimmed system images pushed into stage-1 tmpfs with matching SHA-256 | `tools/safe/adb push <erofs_images> /tmp/` | 180s | Pending | - | T3 |
 | **T3** | Planned | Pending | RAM Mounts | EROFS images loop-mount; /data is RAM-backed; zero physical partitions mounted rw | `tools/safe/adb shell mount` check | 30s | Pending | - | T4 |

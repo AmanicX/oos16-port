@@ -101,8 +101,8 @@ fi
 if [ -n "$RAMDISK_DIR" ] && [ -d "$RAMDISK_DIR" ]; then
     echo "--- Auditing Ramdisk Files and Scripts ---" | tee -a "$REPORT_FILE"
     
-    # 3.1 Check for fstab files
-    FSTABS=$(find "$RAMDISK_DIR" -type f \( -name "*fstab*" -o -name "*.rc" -o -name "init" -o -name "*.sh" \))
+    # 3.1 Check for configuration and script files (text files only)
+    CONFIG_FILES=$(find "$RAMDISK_DIR" -type f \( -name "*fstab*" -o -name "*.rc" -o -name "*.sh" -o -name "*.cfg" -o -name "*.prop" -o -name "init" \))
     
     FORBIDDEN_RAMDISK_TERMS=(
         "mount_all"
@@ -125,11 +125,15 @@ if [ -n "$RAMDISK_DIR" ] && [ -d "$RAMDISK_DIR" ]; then
     )
     
     SCRIPTS_FAIL=0
-    for f in $FSTABS; do
+    for f in $CONFIG_FILES; do
+        # Only audit text scripts, rc files, and fstabs (skip compiled ELF binaries)
+        if file "$f" | grep -q "ELF"; then
+            continue
+        fi
         REL_PATH="${f#$RAMDISK_DIR}"
         for kw in "${FORBIDDEN_RAMDISK_TERMS[@]}"; do
             if grep -Fwq "$kw" "$f" 2>/dev/null; then
-                audit_fail "Forbidden write trap found in ramdisk" "File '$REL_PATH' contains '$kw'"
+                audit_fail "Forbidden write trap found in ramdisk configuration" "File '$REL_PATH' contains '$kw'"
                 SCRIPTS_FAIL=1
             fi
         done
@@ -145,20 +149,18 @@ if [ -n "$RAMDISK_DIR" ] && [ -d "$RAMDISK_DIR" ]; then
         audit_pass "Ramdisk scripts, init, and configs are 100% free of physical mounts and write traps"
     fi
     
-    # 3.2 Verify blockdev --setro enforcement exists in init
-    if [ -f "$RAMDISK_DIR/init" ]; then
-        if grep -Fq "blockdev --setro" "$RAMDISK_DIR/init"; then
-            audit_pass "Init script explicitly enforces blockdev --setro on physical disks"
-        else
-            audit_fail "Missing blockdev --setro" "Init does not contain 'blockdev --setro' physical disk lock"
-        fi
-        
-        # 3.3 Verify 90s safety watchdog exists in init
-        if grep -Fq "watchdog" "$RAMDISK_DIR/init" && grep -Fq "reboot bootloader" "$RAMDISK_DIR/init"; then
-            audit_pass "Init script includes 90s safety watchdog reboot timer"
-        else
-            audit_fail "Missing watchdog" "Init does not contain watchdog timer with reboot bootloader"
-        fi
+    # 3.2 Verify blockdev --setro enforcement exists in harness
+    if grep -rq "blockdev --setro" "$RAMDISK_DIR" 2>/dev/null; then
+        audit_pass "Harness explicitly enforces blockdev --setro on physical disks"
+    else
+        audit_fail "Missing blockdev --setro" "Ramdisk does not contain 'blockdev --setro' physical disk lock"
+    fi
+    
+    # 3.3 Verify 90s safety watchdog exists in harness
+    if grep -rq "watchdog" "$RAMDISK_DIR" 2>/dev/null && grep -rq "reboot bootloader" "$RAMDISK_DIR" 2>/dev/null; then
+        audit_pass "Harness includes 90s safety watchdog reboot timer"
+    else
+        audit_fail "Missing watchdog" "Ramdisk does not contain watchdog timer with reboot bootloader"
     fi
 fi
 

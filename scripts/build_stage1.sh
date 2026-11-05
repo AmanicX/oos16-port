@@ -2,34 +2,36 @@
 set -euo pipefail
 
 # build_stage1.sh
-# Rebuilds the minimal Stage-1 RAM harness boot image (build/stage1.img)
-# Uses the stock A16 kernel from partitions/boot_b.img and minimal tools from recovery_b.img.
+# Rebuilds the Stage-1 RAM harness boot image (build/stage1.img)
+# Uses the phone's native A16 static init, adbd, toybox, and kernel.
+# Strips all fstabs, disables recovery wipe, locks physical disks read-only.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-echo "=== Building Stage-1 RAM Boot Image ==="
+echo "=== Building Stage-1 RAM Boot Image (Native Plumbed) ==="
 
 STAGE1_DIR="$PROJECT_ROOT/stage1"
-RAMDISK_ROOT="$STAGE1_DIR/ramdisk_root"
+NATIVE_RAMDISK="$STAGE1_DIR/native_ramdisk"
 BUILD_DIR="$PROJECT_ROOT/build"
 OTATOOLS="$PROJECT_ROOT/external/coloros_port/otatools/bin"
 
 mkdir -p "$BUILD_DIR"
 
-if [ ! -d "$RAMDISK_ROOT" ]; then
-    echo "Error: $RAMDISK_ROOT does not exist!"
+if [ ! -d "$NATIVE_RAMDISK" ]; then
+    echo "Error: $NATIVE_RAMDISK does not exist!"
     exit 1
 fi
 
-echo "1. Packaging Stage-1 Initramfs with mkbootfs..."
-"$OTATOOLS/mkbootfs" "$RAMDISK_ROOT" | lz4 -l -12 --favor-decSpeed > "$STAGE1_DIR/stage1_ramdisk.cpio.lz4"
+echo "1. Packaging Native Stage-1 Ramdisk with mkbootfs..."
+"$OTATOOLS/mkbootfs" "$NATIVE_RAMDISK" | lz4 -l -12 --favor-decSpeed > "$STAGE1_DIR/stage1_native_ramdisk.cpio.lz4"
 
 echo "2. Assembling Android Boot Image with mkbootimg..."
 "$OTATOOLS/mkbootimg" \
     --kernel "$STAGE1_DIR/kernel_src/kernel" \
-    --ramdisk "$STAGE1_DIR/stage1_ramdisk.cpio.lz4" \
+    --ramdisk "$STAGE1_DIR/stage1_native_ramdisk.cpio.lz4" \
     --dtb "$STAGE1_DIR/kernel_src/dtb" \
+    --recovery_dtbo "/tmp/unpack_recovery/recovery_dtbo" \
     --cmdline "androidboot.hardware=qcom androidboot.memcg=1 androidboot.usbcontroller=a600000.dwc3 kpti=off loop.max_part=7 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 service_locator.enable=1 swiotlb=2048 androidboot.selinux=permissive enforcing=0 panic=5" \
     --base 0x00000000 \
     --kernel_offset 0x00008000 \
