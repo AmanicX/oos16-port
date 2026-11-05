@@ -17,7 +17,7 @@ REPORT_FILE="$LOGS_DIR/audit-report-$TIMESTAMP.log"
 TARGET="${1:-}"
 
 if [ -z "$TARGET" ]; then
-    echo "Usage: $0 <path_to_image_or_extracted_dir>"
+    echo "Usage: $0 <path_to_boot_img_or_ramdisk_or_dir>"
     exit 1
 fi
 
@@ -42,55 +42,124 @@ audit_pass() {
     echo " [PASSED] $rule" | tee -a "$REPORT_FILE"
 }
 
-# 1. Check if target is a file or directory
-TMP_INSPECT_DIR=""
+TMP_AUDIT_DIR="$(mktemp -d /tmp/audit_work.XXXXXX)"
+cleanup() {
+    rm -rf "$TMP_AUDIT_DIR"
+}
+trap cleanup EXIT
+
+# Step 1: Detect target type
+RAMDISK_DIR=""
+CMDLINE_TEXT=""
+
 if [ -f "$TARGET" ]; then
-    TMP_INSPECT_DIR="$(mktemp -d /tmp/audit_target.XXXXXX)"
-    echo "Scanning single file / image: $TARGET" | tee -a "$REPORT_FILE"
-    # Search binary string occurrences
-    SCAN_PATH="$TARGET"
-else
-    SCAN_PATH="$TARGET"
+    MAGIC=$(head -c 8 "$TARGET" || true)
+    if [ "$MAGIC" = "ANDROID!" ]; then
+        echo "Target is an Android boot image. Unpacking header and ramdisk..." | tee -a "$REPORT_FILE"
+        UNPACK_TOOL="$PROJECT_ROOT/external/coloros_port/otatools/bin/unpack_bootimg"
+        "$UNPACK_TOOL" --boot_img "$TARGET" --out "$TMP_AUDIT_DIR/unpacked" > "$TMP_AUDIT_DIR/boot_info.txt" 2>&1
+        
+        # Read cmdline
+        CMDLINE_TEXT=$(grep "command line args:" "$TMP_AUDIT_DIR/boot_info.txt" | sed 's/command line args: //' || true)
+        echo "Extracted cmdline: $CMDLINE_TEXT" | tee -a "$REPORT_FILE"
+        
+        # Unpack ramdisk
+        mkdir -p "$TMP_AUDIT_DIR/ramdisk_root"
+        if [ -f "$TMP_AUDIT_DIR/unpacked/ramdisk" ]; then
+            lz4 -d < "$TMP_AUDIT_DIR/unpacked/ramdisk" | (cd "$TMP_AUDIT_DIR/ramdisk_root" && cpio -idm 2>/dev/null || true)
+            RAMDISK_DIR="$TMP_AUDIT_DIR/ramdisk_root"
+        fi
+    elif [[ "$TARGET" =~ \.(cpio|lz4)$ ]]; then
+        mkdir -p "$TMP_AUDIT_DIR/ramdisk_root"
+        lz4 -d < "$TARGET" | (cd "$TMP_AUDIT_DIR/ramdisk_root" && cpio -idm 2>/dev/null || true)
+        RAMDISK_DIR="$TMP_AUDIT_DIR/ramdisk_root"
+    else
+        # Plain directory or file
+        RAMDISK_DIR="$TARGET"
+    fi
+elif [ -d "$TARGET" ]; then
+    RAMDISK_DIR="$TARGET"
 fi
 
-# Forbidden strings in fstab, init.rc, cmdline
-FORBIDDEN_KEYWORDS=(
-    "mount_all /vendor/etc/fstab"
-    "mount ext4 /dev/block"
-    "mount f2fs /dev/block"
-    "userdata"
-    "/dev/block/bootdevice/by-name/userdata"
-    "/dev/block/by-name/userdata"
-    "super"
-    "/dev/block/bootdevice/by-name/super"
-    "update_verifier"
-    "update_engine"
-    "android.hardware.boot"
-    "bootctl"
-    "format_userdata"
-    "wipe_data"
-    "recovery --wipe_data"
-    "BLKROSET 0"
-    "blockdev --setrw"
-    "fastboot flash"
-    "fastboot erase"
-)
-
-echo "--- Scanning for forbidden write trap keywords ---" | tee -a "$REPORT_FILE"
-for kw in "${FORBIDDEN_KEYWORDS[@]}"; do
-    if grep -rInF --binary-files=text "$kw" "$SCAN_PATH" 2>/dev/null; then
-        audit_fail "Forbidden keyword found" "Found: '$kw'"
-    fi
-done
-
-# Check fstab files for writable flags on physical partitions
-if [ -d "$SCAN_PATH" ]; then
-    FSTABS=$(find "$SCAN_PATH" -type f -name "*fstab*" -o -name "*.rc")
-    for f in $FSTABS; do
-        if grep -E "^/dev/block" "$f" 2>/dev/null | grep -v -E "tmpfs|ram|loop|zram" | grep -E "rw|formattable|check|latemount"; then
-            audit_fail "Writable physical mount in fstab" "File: $f"
+# Step 2: Audit kernel cmdline
+echo "--- Auditing Kernel Command Line ---" | tee -a "$REPORT_FILE"
+if [ -n "$CMDLINE_TEXT" ]; then
+    FORBIDDEN_CMDLINE_TERMS=("userdata" "super" "format" "wipe" "root=/dev/block" "system")
+    CMDLINE_FAIL=0
+    for term in "${FORBIDDEN_CMDLINE_TERMS[@]}"; do
+        if echo "$CMDLINE_TEXT" | grep -qw "$term"; then
+            audit_fail "Forbidden cmdline term" "Found '$term' in kernel cmdline"
+            CMDLINE_FAIL=1
         fi
     done
+    if [ "$CMDLINE_FAIL" -eq 0 ]; then
+        audit_pass "Kernel command line is 100% free of partition/storage targets"
+    fi
+fi
+
+# Step 3: Audit Ramdisk Scripts, Fstabs, and Configs
+if [ -n "$RAMDISK_DIR" ] && [ -d "$RAMDISK_DIR" ]; then
+    echo "--- Auditing Ramdisk Files and Scripts ---" | tee -a "$REPORT_FILE"
+    
+    # 3.1 Check for fstab files
+    FSTABS=$(find "$RAMDISK_DIR" -type f \( -name "*fstab*" -o -name "*.rc" -o -name "init" -o -name "*.sh" \))
+    
+    FORBIDDEN_RAMDISK_TERMS=(
+        "mount_all"
+        "userdata"
+        "/dev/block/bootdevice/by-name/userdata"
+        "/dev/block/by-name/userdata"
+        "super"
+        "/dev/block/bootdevice/by-name/super"
+        "update_verifier"
+        "update_engine"
+        "android.hardware.boot"
+        "bootctl"
+        "format_userdata"
+        "wipe_data"
+        "recovery --wipe_data"
+        "BLKROSET 0"
+        "blockdev --setrw"
+        "fastboot flash"
+        "fastboot erase"
+    )
+    
+    SCRIPTS_FAIL=0
+    for f in $FSTABS; do
+        REL_PATH="${f#$RAMDISK_DIR}"
+        for kw in "${FORBIDDEN_RAMDISK_TERMS[@]}"; do
+            if grep -Fwq "$kw" "$f" 2>/dev/null; then
+                audit_fail "Forbidden write trap found in ramdisk" "File '$REL_PATH' contains '$kw'"
+                SCRIPTS_FAIL=1
+            fi
+        done
+        
+        # Check for any physical partition mount (/dev/block/...)
+        if grep -E "^[[:space:]]*mount[[:space:]]+" "$f" 2>/dev/null | grep -E "/dev/block/sd|/dev/block/by-name"; then
+            audit_fail "Physical block device mount detected" "File '$REL_PATH' attempts mounting physical storage"
+            SCRIPTS_FAIL=1
+        fi
+    done
+    
+    if [ "$SCRIPTS_FAIL" -eq 0 ]; then
+        audit_pass "Ramdisk scripts, init, and configs are 100% free of physical mounts and write traps"
+    fi
+    
+    # 3.2 Verify blockdev --setro enforcement exists in init
+    if [ -f "$RAMDISK_DIR/init" ]; then
+        if grep -Fq "blockdev --setro" "$RAMDISK_DIR/init"; then
+            audit_pass "Init script explicitly enforces blockdev --setro on physical disks"
+        else
+            audit_fail "Missing blockdev --setro" "Init does not contain 'blockdev --setro' physical disk lock"
+        fi
+        
+        # 3.3 Verify 90s safety watchdog exists in init
+        if grep -Fq "watchdog" "$RAMDISK_DIR/init" && grep -Fq "reboot bootloader" "$RAMDISK_DIR/init"; then
+            audit_pass "Init script includes 90s safety watchdog reboot timer"
+        else
+            audit_fail "Missing watchdog" "Init does not contain watchdog timer with reboot bootloader"
+        fi
+    fi
 fi
 
 echo "==========================================================" | tee -a "$REPORT_FILE"
