@@ -1,0 +1,92 @@
+# Backup Manifest: OnePlus 7T (HD1901) Hardware Partitions
+**Backup Source**: `/run/media/apex/New Volume/port-project/phone-backup-kit/partitions`
+**Total Partition Images**: 84
+
+> [!NOTE] All critical partitions across **both slot _a and slot _b** (boot, dtbo, vbmeta, abl, xbl, tz, hyp, modem) and all single-instance calibration partitions (modemst1/2, fsg, fsc, persist, oem_stanvbk, oem_dycnvbk) are **100% PRESENT and VERIFIED**.
+
+| Partition File | Size (Bytes) | Size (Human) | SHA-256 Hash |
+|---|---|---|---|
+| `ALIGN_TO_128K_1.img` | 106496 | 104.00 KiB | `caa961e702d561d3245d06bf54fb5fe35bf75037032d764ec11fcb5ac1d41c1c` |
+| `ALIGN_TO_128K_2.img` | 106496 | 104.00 KiB | `caa961e702d561d3245d06bf54fb5fe35bf75037032d764ec11fcb5ac1d41c1c` |
+| `LOGO_a.img` | 16777216 | 16.00 MiB | `0c2c62faca3a4e65ca2943fa429264b9a7adf90e610b125514f266a833ca6aa9` |
+| `LOGO_b.img` | 16777216 | 16.00 MiB | `0c2c62faca3a4e65ca2943fa429264b9a7adf90e610b125514f266a833ca6aa9` |
+| `abl_a.img` | 8388608 | 8.00 MiB | `9bcac221251b98a0e83fa4f3dfac6e6624c34ce8c04c231f7e4214cdf6ecc504` |
+| `abl_b.img` | 8388608 | 8.00 MiB | `9bcac221251b98a0e83fa4f3dfac6e6624c34ce8c04c231f7e4214cdf6ecc504` |
+| `aop_a.img` | 524288 | 512.00 KiB | `8e72f9cc9aae6d1b5e3dfb813f0b0b63b388b02898e9664018d8244a7cc0f45c` |
+| `aop_b.img` | 524288 | 512.00 KiB | `8e72f9cc9aae6d1b5e3dfb813f0b0b63b388b02898e9664018d8244a7cc0f45c` |
+| `apdp.img` | 262144 | 256.00 KiB | `82fec0357a1fe26b05e17e39575d130e708d7a6c94eed3967e635ca8801341c9` |
+| `bluetooth_a.img` | 1048576 | 1.00 MiB | `72a806d83274e8a5815e59223dbe828f29b148650d6042a40e806f4ba1b2ba87` |
+| `bluetooth_b.img` | 1048576 | 1.00 MiB | `72a806d83274e8a5815e59223dbe828f29b148650d6042a40e806f4ba1b2ba87` |
+| `boot_a.img` | 100663296 | 96.00 MiB | `6324a772e9b1de8412f833ad246059d307c12dc8df2d8de83e50929dbf8afeb1` |
+| `boot_b.img` | 100663296 | 96.00 MiB | `841dc715d2bf8197c0f332fff2569bd6cdff4959277a98998b581aad9e257b19` |
+| `carrier.img` | 67108864 | 64.00 MiB | `5ae2ec05f378dea28e4b79728c08a8d59f2dec18b7546aea9faa9e7216d0cc03` |
+| `catecontentfv.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `catefv.img` | 524288 | 512.00 KiB | `07854d2fef297a06ba81685e660c332de36d5d18d546927d30daad6d7fda1541` |
+| `cateloader.img` | 2097152 | 2.00 MiB | `5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee` |
+| `cdt.img` | 131072 | 128.00 KiB | `fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471` |
+| `cmnlib64_a.img` | 524288 | 512.00 KiB | `b7c775d91ef2a5a18dc82b95664895c56528e6b0ce2c1d6c36f56f38aa198f18` |
+| `cmnlib64_b.img` | 524288 | 512.00 KiB | `b7c775d91ef2a5a18dc82b95664895c56528e6b0ce2c1d6c36f56f38aa198f18` |
+| `cmnlib_a.img` | 524288 | 512.00 KiB | `b9f353b84038338bb7167c89a102ad539a04c3bc21195efb90cdf180b13b9b6d` |
+| `cmnlib_b.img` | 524288 | 512.00 KiB | `b9f353b84038338bb7167c89a102ad539a04c3bc21195efb90cdf180b13b9b6d` |
+| `config.img` | 524288 | 512.00 KiB | `2db84805ea2ae2ef9ba2a9ee844d71f16ff08ca0e028c8cba8be13450b16c683` |
+| `ddr.img` | 1048576 | 1.00 MiB | `60e4b969146973b2e973f52adcb2dfe26d447225310ca3c7f3ba16a824137a2a` |
+| `devcfg_a.img` | 131072 | 128.00 KiB | `f81dacc21cf91d09005ecab857378bbeb602589d08e57999cc538a3ab5e05de1` |
+| `devcfg_b.img` | 131072 | 128.00 KiB | `f81dacc21cf91d09005ecab857378bbeb602589d08e57999cc538a3ab5e05de1` |
+| `devinfo.img` | 4096 | 4.00 KiB | `12691a5b12f4abea0b6a7c268a99e644fbec4b80d348410072c3fcac39df2b0c` |
+| `dip.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `dsp_a.img` | 67108864 | 64.00 MiB | `1ec56bbb1e84527c870d61bb66556a44b5e13f974069e0eb71b71b800697307e` |
+| `dsp_b.img` | 67108864 | 64.00 MiB | `1ec56bbb1e84527c870d61bb66556a44b5e13f974069e0eb71b71b800697307e` |
+| `dtbo_a.img` | 25165824 | 24.00 MiB | `668e54337925f1fc8a80dc1b1bdf8a799158b04322e03df8fa85f345a5912918` |
+| `dtbo_b.img` | 25165824 | 24.00 MiB | `668e54337925f1fc8a80dc1b1bdf8a799158b04322e03df8fa85f345a5912918` |
+| `fsc.img` | 131072 | 128.00 KiB | `fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471` |
+| `fsg.img` | 2097152 | 2.00 MiB | `5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee` |
+| `hyp_a.img` | 8388608 | 8.00 MiB | `a5646e0fe1e0814e62c1129cdc361f4d20fd1298809f447034659c3faab7f8e3` |
+| `hyp_b.img` | 8388608 | 8.00 MiB | `a5646e0fe1e0814e62c1129cdc361f4d20fd1298809f447034659c3faab7f8e3` |
+| `imagefv_a.img` | 2097152 | 2.00 MiB | `a71dfdc84a03093b176892730445092b5b7a718b04f8e56eea7a65964ef40418` |
+| `imagefv_b.img` | 2097152 | 2.00 MiB | `a71dfdc84a03093b176892730445092b5b7a718b04f8e56eea7a65964ef40418` |
+| `keymaster_a.img` | 524288 | 512.00 KiB | `ffe97683e2f09ca844f96b812f611b3523891f6138a10c7c09aeb655828cae0b` |
+| `keymaster_b.img` | 524288 | 512.00 KiB | `ffe97683e2f09ca844f96b812f611b3523891f6138a10c7c09aeb655828cae0b` |
+| `limits.img` | 4096 | 4.00 KiB | `f05cf6deb8f78bb8cc090d1a589458fe67c12c7321c163ab9808c1d331cccf93` |
+| `mdm1m9kefs1.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `mdm1m9kefs2.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `mdm1m9kefs3.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `mdm1m9kefsc.img` | 4096 | 4.00 KiB | `ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7` |
+| `mdm1oemnvbktmp.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `mdm_oem_dycnvbk.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `mdm_oem_stanvbk.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `mdmddr.img` | 1048576 | 1.00 MiB | `30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58` |
+| `modem_a.img` | 314572800 | 300.00 MiB | `d3b237d27b399ce78182bf29b1bdd3fc714f263e710e644dfe17df6d99b9c77e` |
+| `modem_b.img` | 314572800 | 300.00 MiB | `d3b237d27b399ce78182bf29b1bdd3fc714f263e710e644dfe17df6d99b9c77e` |
+| `modemst1.img` | 2097152 | 2.00 MiB | `85f1e6fa549388c7ebcb184a40f1503f76e7d0d32eb2436a2a9bcf0be9148018` |
+| `modemst2.img` | 2097152 | 2.00 MiB | `61d688caec110067e9480582591afa349d6753e9d2d67505dad9acf4ea6604cb` |
+| `msadp.img` | 262144 | 256.00 KiB | `3b7a4522631ea9c9544bd528616dd46616a5034c4fa5a51123936e80e208c823` |
+| `oem_dycnvbk.img` | 10485760 | 10.00 MiB | `dd0fa093cf08030c64b2b5aca10d4bff249c93b821578b8af5249d4c810e7964` |
+| `oem_stanvbk.img` | 10485760 | 10.00 MiB | `9619d75a70b257d21d0cc346ef829d3e43d03372080a7fbf62713adc8cb6345a` |
+| `op1.img` | 314572800 | 300.00 MiB | `c724057efec911e687f3b0a2df9cc620838ce452201c3ed18e955a3a7ab68ad0` |
+| `op2.img` | 268435456 | 256.00 MiB | `b64e865d8c443838b0ad23ee29b301b697ec1a2578a8b7a7e96e6f9d46b1d128` |
+| `opproduct_a.img` | 1717989376 | 1.60 GiB | `796cc464b8d905b1a8c2d86e4bfbb7feeda3d6675dc80c030080981235072c5a` |
+| `opproduct_b.img` | 1717989376 | 1.60 GiB | `7e416c00320c7ac4ebbbde47ef6745d803fe393297e0062068309b89efecb105` |
+| `param.img` | 1048576 | 1.00 MiB | `024c73a514e8bf6829e8c8a0910bc2ed11d4e1ff47ef6c3452432b683e5d21d8` |
+| `persist.img` | 33554432 | 32.00 MiB | `be1554d91f0c362c7516a15fbf1b1adebf6fe9e5af769f60257ada928ca4b93d` |
+| `qupfw_a.img` | 81920 | 80.00 KiB | `a57cce639459a2c69f0dfe174f92e3013f2d82669f20655fd6c947236ac62877` |
+| `qupfw_b.img` | 81920 | 80.00 KiB | `a57cce639459a2c69f0dfe174f92e3013f2d82669f20655fd6c947236ac62877` |
+| `recovery_a.img` | 100663296 | 96.00 MiB | `0557bc27e4361cb44f5e86a449a6526b9e5d3431d436a8f65ea77489a07cc0cf` |
+| `recovery_b.img` | 100663296 | 96.00 MiB | `41965b2155f59a2f1d0842e4aa269e4596ae4117eee5d4443755c79f4d8be760` |
+| `secdata.img` | 28672 | 28.00 KiB | `c1f6356d1a4591f0b06ad518ab3556eed5f8bec8c21d104e37ac9945de393f72` |
+| `splash.img` | 34226176 | 32.64 MiB | `7283ab986bc6374f080972e00271ca3d1b98957933927b38f4901293d069ea33` |
+| `spunvm.img` | 8388608 | 8.00 MiB | `2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74` |
+| `storsec_a.img` | 131072 | 128.00 KiB | `4b913bc198abd92598f6367b8b85989c8af7a2502dd0ee36375e5f2bbc570813` |
+| `storsec_b.img` | 131072 | 128.00 KiB | `4b913bc198abd92598f6367b8b85989c8af7a2502dd0ee36375e5f2bbc570813` |
+| `tz_a.img` | 4194304 | 4.00 MiB | `1cc890914292550f63cf09e218d47d2415c993f24201d3323641ef2cd571c7e9` |
+| `tz_b.img` | 4194304 | 4.00 MiB | `1cc890914292550f63cf09e218d47d2415c993f24201d3323641ef2cd571c7e9` |
+| `uefisecapp_a.img` | 2097152 | 2.00 MiB | `cef95b58a3382cd848d87dea9e8c336ccc8372c80221ee8d67fddde267fa7c2f` |
+| `uefisecapp_b.img` | 2097152 | 2.00 MiB | `cef95b58a3382cd848d87dea9e8c336ccc8372c80221ee8d67fddde267fa7c2f` |
+| `uefivarstore.img` | 524288 | 512.00 KiB | `07854d2fef297a06ba81685e660c332de36d5d18d546927d30daad6d7fda1541` |
+| `vbmeta_a.img` | 65536 | 64.00 KiB | `ea376996e61d6927dae0df873b9d26ab428c61c59547d587352e89f12931d1f2` |
+| `vbmeta_b.img` | 65536 | 64.00 KiB | `312a2485b1abe217bd2b3f8bb2f3b2a438b1cb3e33a963001a789269323b3861` |
+| `vbmeta_system_a.img` | 65536 | 64.00 KiB | `e9fb2e584d5dcb93f5a08bf8335d0528c0d7a62e62ede98ae5a6edffbc21a6d5` |
+| `vbmeta_system_b.img` | 65536 | 64.00 KiB | `d1776b3138f579abe8290f71d1a61b9c6a1eda3079d3b9187b2526ffcadeea2c` |
+| `xbl_a.img` | 3670016 | 3.50 MiB | `16079f32e65576413197d1ee69e2cb2f5e72ff2c958da1169c7edd639db739e6` |
+| `xbl_b.img` | 3670016 | 3.50 MiB | `16079f32e65576413197d1ee69e2cb2f5e72ff2c958da1169c7edd639db739e6` |
+| `xbl_config_a.img` | 131072 | 128.00 KiB | `63c73af81ef5b854665b4d8c10928842e93cf5c264fac270e1d356e301566216` |
+| `xbl_config_b.img` | 131072 | 128.00 KiB | `63c73af81ef5b854665b4d8c10928842e93cf5c264fac270e1d356e301566216` |

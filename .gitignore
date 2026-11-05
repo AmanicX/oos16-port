@@ -1,0 +1,22 @@
+# Safety and sensitive artifacts
+backups/
+firmware_dumps/
+partitions/
+*.ipsw
+*.dmg
+*.bin
+*.img
+*.zip
+*.tar
+*.tar.gz
+*.7z
+payload.bin
+extracted/
+dyld_shared_cache*
+*.pem
+*.key
+logs/phone-commands.log
+external/
+*.part*
+build/
+out/

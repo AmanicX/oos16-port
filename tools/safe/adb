@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+from datetime import datetime
+
+LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
+REAL_ADB = "/usr/bin/adb"
+
+def log_command(allowed, args):
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        timestamp = datetime.now().isoformat()
+        status = "ALLOWED" if allowed else "BLOCKED"
+        f.write(f"[{timestamp}] [ADB] [{status}] {' '.join(args)}\n")
+
+args = sys.argv[1:]
+
+if not args:
+    res = subprocess.run([REAL_ADB])
+    sys.exit(res.returncode)
+
+cmd = args[0].lower()
+
+# Check against absolute banned subcommands
+if cmd in ["sideload", "install", "uninstall"]:
+    log_command(False, args)
+    print(f"[SAFETY VIOLATION] adb '{cmd}' modifies device state. Refused.", file=sys.stderr)
+    sys.exit(1)
+
+is_allowed = False
+
+if cmd in ["devices", "get-state", "version", "help", "--help"]:
+    is_allowed = True
+elif cmd == "reboot":
+    if len(args) == 2 and args[1] in ["bootloader", "fastboot"]:
+        is_allowed = True
+    elif len(args) == 1:
+        is_allowed = True
+elif cmd == "pull":
+    # Pulling from phone to laptop is always read-only
+    is_allowed = True
+elif cmd == "push":
+    # Push allowed ONLY to proven RAM-backed paths (e.g. /tmp, /dev/tmpfs, /data/local/tmp)
+    if len(args) >= 3:
+        dest = args[-1]
+        RAM_DESTINATIONS = ["/tmp/", "/tmp", "/dev/tmpfs", "/data/local/tmp"]
+        if any(dest == r or dest.startswith(r if r.endswith("/") else r + "/") for r in RAM_DESTINATIONS):
+            is_allowed = True
+        else:
+            log_command(False, args)
+            print(f"[SAFETY VIOLATION] adb push target '{dest}' is not a proven RAM path. Refused.", file=sys.stderr)
+            sys.exit(1)
+elif cmd in ["shell", "exec-out"]:
+    shell_cmd = " ".join(args[1:]).strip()
+    
+    # Check for forbidden write patterns
+    FORBIDDEN_PATTERNS = [
+        "dd of=", "mount -o rw", "mount -o remount,rw", "remount",
+        "settings put", "pm install", "pm uninstall", "su -c",
+        "touch ", "rm ", "echo >", "mkdir -p /system", "> /dev/block"
+    ]
+    
+    if any(p in shell_cmd for p in FORBIDDEN_PATTERNS):
+        log_command(False, args)
+        print(f"[SAFETY VIOLATION] adb shell contains write pattern in: '{shell_cmd}'. Refused.", file=sys.stderr)
+        sys.exit(1)
+        
+    # Read-only command prefixes
+    ALLOWED_SHELL_PREFIXES = [
+        "getprop", "cat /proc/", "cat /sys/", "ls", "dmesg", "logcat", 
+        "dumpsys", "uname", "df", "mount", "sha256sum", "md5sum",
+        "lshal", "toybox", "toolbox", "grep", "awk", "sed", "head", 
+        "tail", "wc", "file", "which", "printenv", "id", "whoami"
+    ]
+    
+    # Check if shell_cmd starts with any allowed command
+    cmd_first_word = shell_cmd.split()[0] if shell_cmd.split() else ""
+    if any(shell_cmd.startswith(p) for p in ALLOWED_SHELL_PREFIXES) or cmd_first_word in ["ls", "cat", "df", "uname", "getprop", "mount", "dmesg", "dumpsys"]:
+        is_allowed = True
+
+if is_allowed:
+    log_command(True, args)
+    res = subprocess.run([REAL_ADB] + args)
+    sys.exit(res.returncode)
+else:
+    log_command(False, args)
+    print(f"[SAFETY VIOLATION] adb command '{' '.join(args)}' is not in the safe allowlist. Refused.", file=sys.stderr)
+    sys.exit(1)
