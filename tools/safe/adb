@@ -69,11 +69,13 @@ elif cmd in ["shell", "exec-out"]:
         
     # Read-only command prefixes and safe RAM-only /tmp actions
     ALLOWED_SHELL_PREFIXES = [
-        "getprop", "cat /proc/", "cat /sys/", "ls", "dmesg", "logcat", 
+        "getprop", "/system/bin/getprop", "cat /proc/", "cat /sys/", "ls", "dmesg", "logcat", 
         "dumpsys", "uname", "df", "mount", "sha256sum", "md5sum",
-        "lshal", "toybox", "toolbox", "grep", "awk", "sed", "head", 
+        "lshal", "toybox", "/system/bin/toybox", "toolbox", "/system/bin/toolbox", "grep", "awk", "sed", "head", 
         "tail", "wc", "file", "which", "printenv", "id", "whoami",
-        "blockdev", "touch /tmp/", "rm /tmp/", "echo > /tmp/", "echo 0 > /tmp/"
+        "blockdev", "/system/bin/blockdev", "touch /tmp/", "rm /tmp/", "echo > /tmp/", "echo 0 > /tmp/",
+        "chmod +x /tmp/", "sh /tmp/", "/tmp/",
+        "echo 300 > /sys/class/leds/vibrator/duration", "echo 1 > /sys/class/leds/vibrator/activate"
     ]
     
     # Check if shell_cmd starts with any allowed command

@@ -4,7 +4,7 @@
 |---|---|---|---|---|---|---|---|---|---|
 | **T0** | 2026-11-05 | `0c45df5a...` | Stage-1 Native RAM Boot | Native static init + adbd; all fstabs removed; disks setro; 90s watchdog; adb root | `tools/safe/fastboot boot build/stage1.img` | 60s | Booted in 3.6s, adb root (u:r:su:s0), zero storage touched | **PASS** | T1 |
 | **T1** | 2026-11-05 | `0c45df5a...` | Block Layer Read-Only Proof | All physical UFS block devices (`/dev/block/sd*`) are read-only; write attempts fail | `blockdev --getro /dev/block/sd[a-f]` -> all return 1 | 30s | All LUNs sda-sdf ro=1, mount table 100% tmpfs/rootfs, 7.37GB free RAM | **PASS** | T2 |
-| **T2** | Planned | Pending | RAM Transfer | Compressed trimmed system images pushed into stage-1 tmpfs with matching SHA-256 | `tools/safe/adb push <erofs_images> /tmp/` | 180s | Pending | - | T3 |
+| **T2** | 2026-11-06 | `adfce4c4...` | RAM Image Build & Packaging | Built 6 high-compression EROFS partitions; zero userdata/metadata/super references; crDroid PIF + Photos spoof injected | `tools/safe/run_stage2.sh` | 300s | All 6 EROFS images built (4.58 GB total), fsck.erofs clean, audit 100% passed | **PASS** | T3 |
 | **T3** | Planned | Pending | RAM Mounts | EROFS images loop-mount; /data is RAM-backed; zero physical partitions mounted rw | `tools/safe/adb shell mount` check | 30s | Pending | - | T4 |
 | **T4** | Planned | Pending | Android Init | Android init starts; core services launch; no update/verifier or bootctl services active | `tools/safe/adb logcat -d` | 60s | Pending | - | T5 |
 | **T5** | Planned | Pending | Framework | Zygote and system_server stay up for >= 5 minutes without crashing | `tools/safe/adb shell ps -ef` | 300s | Pending | - | T6 |
