@@ -1,8 +1,32 @@
---- a/vendor/build.prop
-+++ b/vendor/build.prop
-@@ -35,6 +35,10 @@
- # Display optimizations for aftermarket 60Hz AMOLED screen (dsi_samsung_s6e3fc2x01_cmd_display)
+--- a/vendor/build.prop	2026-11-07 19:27:35.539510217 +0500
++++ b/vendor/build.prop	2026-11-07 19:27:35.536588443 +0500
+@@ -147,6 +147,7 @@
+ vendor.display.disable_ui_3d_tonemap=1
+ vendor.display.enable_default_color_mode=1
+ vendor.display.enable_null_display=0
++vendor.display.enable_optimize_refresh=1
+ vendor.gralloc.disable_ubwc=0
+ # DPM
+ persist.vendor.dpmhalservice.enable=1
+@@ -169,7 +170,21 @@
+ ro.hardware.egl=adreno
+ ro.hardware.vulkan=adreno
+ ro.opengles.version=196610
++ro.surface_flinger.force_hwc_copy_for_virtual_displays=true
++ro.surface_flinger.has_HDR_display=true
++ro.surface_flinger.has_wide_color_display=true
++ro.surface_flinger.max_frame_buffer_acquired_buffers=3
++ro.surface_flinger.max_virtual_display_dimension=4096
++ro.surface_flinger.protected_contents=true
++ro.surface_flinger.set_idle_timer_ms=4000
++ro.surface_flinger.set_touch_timer_ms=4000
++ro.surface_flinger.supports_background_blur=1
++ro.surface_flinger.use_color_management=true
++ro.surface_flinger.wcg_composition_dataspace=143261696
+ # Replacement Aftermarket Panel (60Hz fixed refresh rate)
 +ro.surface_flinger.game_default_frame_rate_override=60
 +ro.surface_flinger.enable_frame_rate_override=false
 +persist.sys.sf.native_mode=0
-+vendor.display.enable_optimize_refresh=1
+ # Incremental FS
+ ro.incremental.enable=yes
+ # Media

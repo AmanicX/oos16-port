@@ -13,7 +13,7 @@
 The objective of this project is to port and run OxygenOS 16 (Android 16 / SDK 36) on the user's OnePlus 7T, complete with:
 1. **Google Photos Unlimited Original Backup Spoof** (`pixel_2016_experience.xml` + `NEXUS_PRELOAD`).
 2. **Play Integrity Fix** (`pif.json` for CTS / Play Integrity passing).
-3. **Hardware Display & UI Bringup** (SurfaceFlinger and Qualcomm DRM rendering on the Samsung 90Hz AMOLED display).
+3. **Hardware Display & UI Bringup** (SurfaceFlinger and Qualcomm DRM rendering on the Samsung AMOLED display, locked to fixed 60Hz for the physical device's aftermarket replacement panel).
 
 ### The Non-Negotiable Safety Directive
 Under **no circumstances** is the phone's internal physical storage to be altered:

@@ -61,7 +61,10 @@
   - `panel_type=x_talk`
 - **Native Resolution**: `1080 x 2340`
 - **Density**: `420 dpi` (xDpi: 403.411, yDpi: 409.903)
-- **Refresh Rates**: `60 Hz` (default), `90 Hz` (peak supported)
+- **Refresh Rates**: 
+  - *OEM Stock Specification*: 60 Hz / 90 Hz peak
+  - *Current Physical Panel (Aftermarket Replacement)*: Strictly fixed **60.00 Hz** (`activeMode={id=0, resolution=1080x2340, vsyncRate=60.00 Hz}`).
+  - *Configuration*: Display properties explicitly lock SurfaceFlinger to 60Hz (`ro.surface_flinger.game_default_frame_rate_override=60`, `ro.surface_flinger.enable_frame_rate_override=false`) to prevent connector detachment.
 - **MDSS MDP Base Address**: `0x0ae00000` (`soc/ae00000.qcom,mdss_mdp`)
 - **DSI Interface**: `card0-DSI-1` (Command mode panel)
 - **Cutout Inset**: Top notch `Rect(455, 0 - 625, 68)`

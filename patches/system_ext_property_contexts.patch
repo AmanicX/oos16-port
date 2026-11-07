@@ -1,39 +1,91 @@
---- a/system_ext/etc/selinux/system_ext_property_contexts
-+++ b/system_ext/etc/selinux/system_ext_property_contexts
-@@ -485,7 +485,7 @@
--# ro.bootimage.build.fingerprint u:object_r:exported_default_prop:s0
+--- a/etc/selinux/system_ext_property_contexts	2026-11-07 19:27:13.228455918 +0500
++++ b/etc/selinux/system_ext_property_contexts	2026-11-07 19:27:13.225455911 +0500
+@@ -482,18 +482,18 @@
+ persist.version.confidential u:object_r:exported_system_prop:s0
+ ro.oplusupgrade.alpha.version u:object_r:exported_system_prop:s0
+ ro.aee.enforcing u:object_r:exported_default_prop:s0
+-ro.bootimage.build.fingerprint u:object_r:exported_default_prop:s0
+-ro.build.date u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.bootimage.build.fingerprint u:object_r:exported_default_prop:s0
--# ro.build.date u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.build.date u:object_r:exported_default_prop:s0
--# ro.build.date.utc u:object_r:exported_default_prop:s0
+ ro.build.date.Ymd u:object_r:exported_default_prop:s0
+ ro.build.date.ymd u:object_r:exported_default_prop:s0
+ ro.build.date.YmdHM u:object_r:exported_default_prop:s0
+-ro.build.date.utc u:object_r:exported_default_prop:s0
+-ro.build.version.incremental u:object_r:exported_default_prop:s0
+-ro.build.product u:object_r:exported_default_prop:s0
+-ro.build.version.base_os u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.build.date.utc u:object_r:exported_default_prop:s0
--# ro.build.version.incremental u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.build.version.incremental u:object_r:exported_default_prop:s0
--# ro.build.product u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.build.product u:object_r:exported_default_prop:s0
--# ro.build.version.base_os u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.build.version.base_os u:object_r:exported_default_prop:s0
--# ro.build.display.id u:object_r:exported_default_prop:s0
+ ro.build.version.ota u:object_r:exported_default_prop:s0
+ ro.build.version.oplusrom u:object_r:exported_default_prop:s0
+-ro.build.display.id u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.build.display.id u:object_r:exported_default_prop:s0
--# ro.product.brand u:object_r:exported_default_prop:s0
+ ro.build.kernel.id u:object_r:exported_default_prop:s0
+ ro.build.master.date u:object_r:exported_default_prop:s0
+ ro.build.release_type u:object_r:exported_default_prop:s0
+@@ -507,10 +507,10 @@
+ ro.product.hw u:object_r:exported_default_prop:s0
+ ro.product.sar u:object_r:exported_default_prop:s0
+ ro.xxversion u:object_r:exported_default_prop:s0
+-ro.product.brand u:object_r:exported_default_prop:s0
+-ro.product.model u:object_r:exported_default_prop:s0
+-ro.product.device u:object_r:exported_default_prop:s0
+-ro.product.name u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.product.brand u:object_r:exported_default_prop:s0
--# ro.product.model u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.product.model u:object_r:exported_default_prop:s0
--# ro.product.device u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.product.device u:object_r:exported_default_prop:s0
--# ro.product.name u:object_r:exported_default_prop:s0
 +# [CONFLICT-FIX] ro.product.name u:object_r:exported_default_prop:s0
--# vendor.oplus.video.dump.output u:object_r:oplus_video_exported_system_prop:s0
-+# [CONFLICT-FIX] vendor.oplus.video.dump.output u:object_r:oplus_video_exported_system_prop:s0
--# ro.build.flavor u:object_r:exported_system_prop:s0
-+# [CONFLICT-FIX] ro.build.flavor u:object_r:exported_system_prop:s0
--# camera.disable_zsl_mode u:object_r:exported_system_prop:s0
-+# [CONFLICT-FIX] camera.disable_zsl_mode u:object_r:exported_system_prop:s0
--# persist.vendor.side.fp.near.feature.support u:object_r:oppo_fingerprint_prop:s0
+ ro.reserve1.get u:object_r:exported_default_prop:s0
+ ro.script.version u:object_r:exported_default_prop:s0
+ persist.oplus.display.resolution u:object_r:debug_prop:s0
+@@ -1063,7 +1063,7 @@
+ 
+ #ifdef OPLUS_FEATURE_VIDEO_SCREENSHOT_DUMP_OUTPUT
+ #liuxiaofo@MULTIMEDIA.MMSERVER.PLAYER, 2025/01/07, add for screen shot dump video output
+-vendor.oplus.video.dump.output     u:object_r:oplus_video_exported_system_prop:s0
++# [CONFLICT-FIX] vendor.oplus.video.dump.output     u:object_r:oplus_video_exported_system_prop:s0
+ #endif
+ 
+ #ifdef OPLUS_FEATURE_IO_priority
+@@ -1365,9 +1365,9 @@
+ 
+ oppo.front.switch.res                     u:object_r:exported_system_prop:s0
+ oppo.open.camera.name                     u:object_r:exported_system_prop:s0
+-ro.build.flavor                           u:object_r:exported_system_prop:s0
++# [CONFLICT-FIX] ro.build.flavor                           u:object_r:exported_system_prop:s0
+ ro.camera.attr.detect.enable              u:object_r:exported_system_prop:s0
+-camera.disable_zsl_mode                   u:object_r:exported_system_prop:s0
++# [CONFLICT-FIX] camera.disable_zsl_mode                   u:object_r:exported_system_prop:s0
+ adrc.gain                                 u:object_r:exported_system_prop:s0
+ darkboost.gain                            u:object_r:exported_system_prop:s0
+ #endif
+@@ -1466,13 +1466,13 @@
+ persist.vendor.fingerprint.optical.circlenumber u:object_r:oppo_fingerprint_prop:s0
+ persist.vendor.fingerprint.sensor_type u:object_r:oppo_fingerprint_prop:s0
+ persist.vendor.fingerprint.version u:object_r:oppo_fingerprint_prop:s0
+-persist.vendor.side.fp.near.feature.support u:object_r:oppo_fingerprint_prop:s0
 +# [CONFLICT-FIX] persist.vendor.side.fp.near.feature.support u:object_r:oppo_fingerprint_prop:s0
--# persist.vendor.rpmb.enable.state u:object_r:powerctl_prop:s0
+ persist.vendor.fingerprint.side.broken.check u:object_r:oppo_fingerprint_prop:s0
+ persist.vendor.fingerprint.side.sensorlocation u:object_r:oppo_fingerprint_prop:s0
+ 
+ #ifdef OPLUS_FEATURE_SECURITY_COMMON
+ #Dongnan.Wu@BSP.Security.Basic, add for get rpmb enable state
+-persist.vendor.rpmb.enable.state u:object_r:powerctl_prop:s0
 +# [CONFLICT-FIX] persist.vendor.rpmb.enable.state u:object_r:powerctl_prop:s0
--# ro.cdma.home.operator.numeric u:object_r:system_prop:s0
-+# [CONFLICT-FIX] ro.cdma.home.operator.numeric u:object_r:system_prop:s0
--# ro.cdma.home.operator.alpha u:object_r:system_prop:s0
-+# [CONFLICT-FIX] ro.cdma.home.operator.alpha u:object_r:system_prop:s0
+ #endif /* OPLUS_FEATURE_SECURITY_COMMON */
+ 
+ #ifdef OPLUS_FEATURE_HEALTHINFO
+@@ -1500,8 +1500,8 @@
+ 
+ # Jerome.deng add for Sprint Chameleon properties
+ ro.home.operator.carrierid              u:object_r:system_prop:s0
+-ro.cdma.home.operator.numeric           u:object_r:system_prop:s0
+-ro.cdma.home.operator.alpha             u:object_r:system_prop:s0
++# [CONFLICT-FIX] ro.cdma.home.operator.numeric           u:object_r:system_prop:s0
++# [CONFLICT-FIX] ro.cdma.home.operator.alpha             u:object_r:system_prop:s0
+ op.carrierid                            u:object_r:system_prop:s0
+ 
+ #ifdef OPLUS_FEATURE_POWER_MONITOR

@@ -1,94 +1,217 @@
 #!/usr/bin/env python3
+"""
+tools/safe/adb - Hardened Safety Interceptor Proxy for Android Debug Bridge
+Enforces strict zero-storage-write guarantees for OxygenOS 16 RAM Bringup.
+All destructive commands, shell metacharacters, and non-RAM targets are rejected.
+"""
+
 import sys
 import os
 import subprocess
+import shlex
+import re
 from datetime import datetime
 
 LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
 REAL_ADB = "/usr/bin/adb"
 
-def log_command(allowed, args):
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    with open(LOG_FILE, "a") as f:
-        timestamp = datetime.now().isoformat()
-        status = "ALLOWED" if allowed else "BLOCKED"
-        f.write(f"[{timestamp}] [ADB] [{status}] {' '.join(args)}\n")
+if not os.path.exists(REAL_ADB):
+    for p in os.environ.get("PATH", "").split(os.path.pathsep):
+        candidate = os.path.join(p, "adb")
+        if os.path.exists(candidate) and os.path.abspath(candidate) != os.path.abspath(__file__):
+            REAL_ADB = candidate
+            break
 
-args = sys.argv[1:]
+def log_command(allowed, args, reason=""):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            timestamp = datetime.now().isoformat()
+            status = "ALLOWED" if allowed else "BLOCKED"
+            extra = f" [{reason}]" if reason else ""
+            f.write(f"[{timestamp}] [ADB] [{status}]{extra} {' '.join(args)}\n")
+    except Exception:
+        pass
 
-if not args:
+def abort(msg, args):
+    log_command(False, args, msg)
+    print(f"[ADB SAFETY VIOLATION] {msg}. Refused.", file=sys.stderr)
+    sys.exit(1)
+
+# 1. Parse global adb flags (-s <serial>, -d, -e, -t <id>, -H <host>, -P <port>)
+raw_args = sys.argv[1:]
+if not raw_args:
     res = subprocess.run([REAL_ADB])
     sys.exit(res.returncode)
 
-cmd = args[0].lower()
+idx = 0
+global_flags = []
+while idx < len(raw_args):
+    arg = raw_args[idx]
+    if arg in ["-d", "-e"]:
+        global_flags.append(arg)
+        idx += 1
+    elif arg in ["-s", "-t", "-H", "-P", "-L"]:
+        if idx + 1 >= len(raw_args):
+            abort(f"Global flag '{arg}' missing required argument", raw_args)
+        global_flags.extend([arg, raw_args[idx + 1]])
+        idx += 2
+    elif arg.startswith("-"):
+        # Other unexpected global flags
+        abort(f"Disallowed global flag '{arg}'", raw_args)
+    else:
+        break
 
-# Check against absolute banned subcommands
-if cmd in ["sideload", "install", "uninstall"]:
-    log_command(False, args)
-    print(f"[SAFETY VIOLATION] adb '{cmd}' modifies device state. Refused.", file=sys.stderr)
-    sys.exit(1)
-
-is_allowed = False
-
-if cmd in ["devices", "get-state", "version", "help", "--help", "root", "unroot", "wait-for-device"]:
-    is_allowed = True
-elif cmd == "reboot":
-    if len(args) == 2 and args[1] in ["bootloader", "fastboot"]:
-        is_allowed = True
-    elif len(args) == 1:
-        is_allowed = True
-elif cmd == "pull":
-    # Pulling from phone to laptop is always read-only
-    is_allowed = True
-elif cmd == "push":
-    # Push allowed ONLY to proven RAM-backed paths (e.g. /tmp, /dev/tmpfs, /data/local/tmp)
-    if len(args) >= 3:
-        dest = args[-1]
-        RAM_DESTINATIONS = ["/tmp/", "/tmp", "/mnt/", "/mnt", "/dev/tmpfs", "/data/local/tmp", "/sdcard/", "/sdcard"]
-        if any(dest == r or dest.startswith(r if r.endswith("/") else r + "/") for r in RAM_DESTINATIONS):
-            is_allowed = True
-        else:
-            log_command(False, args)
-            print(f"[SAFETY VIOLATION] adb push target '{dest}' is not a proven RAM path. Refused.", file=sys.stderr)
-            sys.exit(1)
-elif cmd in ["shell", "exec-out"]:
-    shell_cmd = " ".join(args[1:]).strip()
-    
-    # Check for forbidden write patterns
-    # Writes to physical blocks, partitions, or system are strictly banned.
-    FORBIDDEN_PATTERNS = [
-        "dd of=", "mount -o rw", "mount -o remount,rw", "remount",
-        "settings put", "pm install", "pm uninstall", "su -c",
-        "> /dev/block", "mkfs", "flash", "erase", "format"
-    ]
-    
-    if any(p in shell_cmd for p in FORBIDDEN_PATTERNS):
-        log_command(False, args)
-        print(f"[SAFETY VIOLATION] adb shell contains write pattern in: '{shell_cmd}'. Refused.", file=sys.stderr)
-        sys.exit(1)
-        
-    # Read-only command prefixes and safe RAM-only /tmp actions
-    ALLOWED_SHELL_PREFIXES = [
-        "getprop", "/system/bin/getprop", "cat /proc/", "cat /sys/", "ls", "dmesg", "logcat", "ps", "/system/bin/ps", 
-        "dumpsys", "uname", "df", "mount", "sha256sum", "md5sum",
-        "lshal", "toybox", "/system/bin/toybox", "toolbox", "/system/bin/toolbox", "grep", "awk", "sed", "head", 
-        "tail", "wc", "file", "which", "printenv", "id", "whoami",
-        "blockdev", "/system/bin/blockdev", "gsi_tool", "/system/bin/gsi_tool", "touch /tmp/", "touch /mnt/", "rm /tmp/", "rm /mnt/", "rm /sdcard/Download/oos16-dsu.zip", "echo > /tmp/", "echo 0 > /tmp/",
-        "chmod +x /tmp/", "chmod +x /mnt/", "sh /tmp/", "sh /mnt/", "/tmp/", "/mnt/", "sh /storage/emulated/", "sh /sdcard/", "am start-activity", "unzip", "/system/bin/unzip", "mkdir",
-        "echo 300 > /sys/class/leds/vibrator/duration", "echo 1 > /sys/class/leds/vibrator/activate",
-        "chroot", "/system/bin/chroot"
-    ]
-    
-    # Check if shell_cmd starts with any allowed command
-    cmd_first_word = shell_cmd.split()[0] if shell_cmd.split() else ""
-    if any(shell_cmd.startswith(p) for p in ALLOWED_SHELL_PREFIXES) or cmd_first_word in ["ls", "cat", "df", "uname", "getprop", "mount", "dmesg", "dumpsys"]:
-        is_allowed = True
-
-if is_allowed:
-    log_command(True, args)
-    res = subprocess.run([REAL_ADB] + args)
+if idx >= len(raw_args):
+    # Just global flags or help
+    res = subprocess.run([REAL_ADB] + raw_args)
     sys.exit(res.returncode)
+
+subcmd = raw_args[idx]
+subargs = raw_args[idx + 1:]
+
+# 2. Strict Whitelist of Safe ADB Subcommands
+SAFE_NOARG_CMDS = {"devices", "get-state", "version", "help", "--help", "wait-for-device", "root"}
+
+if subcmd in SAFE_NOARG_CMDS:
+    # Allow safe no-arg or standard option subcommands
+    if subcmd == "devices":
+        if subargs and subargs != ["-l"]:
+            abort("Unexpected arguments to 'adb devices'", raw_args)
+    elif subcmd in ["get-state", "version", "help", "--help", "wait-for-device", "root"]:
+        if subargs:
+            abort(f"Unexpected arguments to 'adb {subcmd}'", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
+
+elif subcmd == "reboot":
+    # Allowed reboot targets: bootloader, fastboot, recovery, or empty (defaults to reboot)
+    if len(subargs) == 0:
+        pass
+    elif len(subargs) == 1 and subargs[0] in ["bootloader", "fastboot", "recovery"]:
+        pass
+    else:
+        abort(f"Disallowed reboot target: '{' '.join(subargs)}'", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
+
+elif subcmd == "pull":
+    # Pulling from device to host is read-only
+    if len(subargs) < 1:
+        abort("adb pull requires at least a source path", raw_args)
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
+
+elif subcmd == "push":
+    # Pushing allowed ONLY to strictly verified volatile RAM paths.
+    # /sdcard is strictly BANNED because it is backed by physical UFS storage in crDroid!
+    if len(subargs) < 2:
+        abort("adb push requires source and destination arguments", raw_args)
+    
+    dest = subargs[-1]
+    ALLOWED_RAM_PREFIXES = ("/tmp/", "/mnt/", "/dev/tmpfs")
+    ALLOWED_RAM_EXACT = {"/tmp", "/mnt"}
+
+    is_ram_dest = (dest in ALLOWED_RAM_EXACT) or any(dest.startswith(p) for p in ALLOWED_RAM_PREFIXES)
+    
+    # Explicit rejection of /sdcard or /data (outside /data/local/tmp on tmpfs)
+    if dest.startswith("/sdcard") or dest.startswith("/storage") or "/sdcard" in dest:
+        abort(f"Push destination '{dest}' is on physical storage (/sdcard is not RAM). REJECTED", raw_args)
+
+    if not is_ram_dest:
+        abort(f"Push destination '{dest}' is not in approved volatile RAM directories (/tmp/, /mnt/)", raw_args)
+
+    # Verify all local sources exist on host
+    sources = subargs[:-1]
+    for src in sources:
+        if not os.path.exists(src):
+            abort(f"Local source file '{src}' does not exist", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
+
+elif subcmd in ["shell", "exec-out"]:
+    # 3. Strict Validation for 'adb shell' / 'exec-out'
+    if not subargs:
+        abort("Interactive adb shell sessions are blocked to prevent untracked writes", raw_args)
+
+    shell_str = " ".join(subargs).strip()
+
+    # Reject any shell chaining, piping, redirection, or command substitution
+    SHELL_METACHAR_PATTERN = re.compile(r"[;&|><$`\n\r()]")
+    if SHELL_METACHAR_PATTERN.search(shell_str):
+        abort(f"Shell metacharacters (chaining, pipes, redirection, subshell) are strictly blocked: '{shell_str}'", raw_args)
+
+    try:
+        tokens = shlex.split(shell_str)
+    except Exception as e:
+        abort(f"Malformed shell command string: {e}", raw_args)
+
+    if not tokens:
+        abort("Empty shell command", raw_args)
+
+    base_cmd = tokens[0]
+    # Normalize /system/bin/foo -> foo
+    norm_cmd = os.path.basename(base_cmd)
+    cmd_args = tokens[1:]
+
+    # Whitelist of approved diagnostic tools and strict argument validators
+    ALLOWED_DIAGNOSTIC_COMMANDS = {
+        "getprop": lambda a: all(re.match(r"^[a-zA-Z0-9_.-]+$", x) for x in a) and len(a) <= 1,
+        "dmesg": lambda a: all(x in ["-c", "-s", "-r", "-n", "-l"] or re.match(r"^[0-9]+$", x) for x in a),
+        "logcat": lambda a: all(x in ["-d", "-c", "-b", "all", "main", "system", "crash", "events", "-v", "threadtime", "brief", "time", "-s"] or re.match(r"^[a-zA-Z0-9_:*.-]+$", x) for x in a),
+        "ps": lambda a: all(x in ["-ef", "-A", "-e", "-f", "-l", "-T", "-o"] or re.match(r"^[a-zA-Z0-9_,]+$", x) for x in a),
+        "df": lambda a: all(x in ["-h", "-k", "-m", "-a"] or x.startswith("/") for x in a),
+        "free": lambda a: all(x in ["-m", "-k", "-h", "-b"] for x in a),
+        "uname": lambda a: all(x in ["-a", "-r", "-m", "-n", "-s", "-v"] for x in a),
+        "id": lambda a: len(a) == 0 or all(x in ["-u", "-g", "-n", "-G"] for x in a),
+        "whoami": lambda a: len(a) == 0,
+        "uptime": lambda a: len(a) == 0,
+        "mount": lambda a: len(a) == 0,  # Read-only mount table inspection ONLY
+        "lshal": lambda a: all(x in ["--types=all", "--types=b", "--types=c", "-v"] for x in a),
+        "dumpsys": lambda a: all(re.match(r"^[a-zA-Z0-9_.-]+$", x) for x in a) and len(a) <= 2,
+        "cat": lambda a: len(a) == 1 and (a[0].startswith("/proc/") or a[0].startswith("/sys/")),
+        "ls": lambda a: all(x.startswith("-") or x.startswith(("/tmp", "/mnt", "/proc", "/sys", "/dev", "/system", "/vendor", "/apex", "/linkerconfig")) for x in a),
+        "readlink": lambda a: len(a) <= 2 and all(x in ["-f", "-m", "-n"] or x.startswith("/") for x in a),
+        "file": lambda a: len(a) <= 2 and all(x.startswith(("-", "/tmp", "/mnt", "/system", "/vendor", "/apex")) for x in a),
+        "sha256sum": lambda a: all(x.startswith(("/tmp", "/mnt")) for x in a),
+        "md5sum": lambda a: all(x.startswith(("/tmp", "/mnt")) for x in a),
+        "blockdev": lambda a: len(a) == 2 and a[0] == "--getro" and (a[1].startswith("/dev/block/sd") or a[1].startswith("/dev/block/mmcblk") or a[1].startswith("/dev/block/loop")),
+        "touch": lambda a: len(a) == 1 and a[0] in ["/tmp/watchdog_cancel", "/tmp/watchdog_heartbeat"],
+        "rm": lambda a: len(a) == 2 and a[0] == "-f" and a[1] in ["/tmp/watchdog_cancel", "/tmp/watchdog_heartbeat"],
+        "chmod": lambda a: len(a) == 2 and a[0] == "+x" and a[1] == "/tmp/stage2_init.sh",
+        "stage2_init.sh": lambda a: len(a) == 0,
+        "sh": lambda a: len(a) == 1 and a[0] == "/tmp/stage2_init.sh"
+    }
+
+    # Handle toybox/toolbox wrapper: toybox <applet> <args>
+    if norm_cmd in ["toybox", "toolbox"]:
+        if not cmd_args:
+            abort(f"Missing applet for '{norm_cmd}'", raw_args)
+        applet = os.path.basename(cmd_args[0])
+        applet_args = cmd_args[1:]
+        if applet not in ALLOWED_DIAGNOSTIC_COMMANDS:
+            abort(f"Toybox applet '{applet}' is not in the safe whitelist", raw_args)
+        validator = ALLOWED_DIAGNOSTIC_COMMANDS[applet]
+        if not validator(applet_args):
+            abort(f"Arguments to toybox applet '{applet}' rejected: {applet_args}", raw_args)
+    else:
+        # Check direct command
+        if norm_cmd not in ALLOWED_DIAGNOSTIC_COMMANDS:
+            abort(f"Command '{norm_cmd}' is not in the safe whitelist", raw_args)
+        validator = ALLOWED_DIAGNOSTIC_COMMANDS[norm_cmd]
+        if not validator(cmd_args):
+            abort(f"Arguments to command '{norm_cmd}' rejected: {cmd_args}", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
+
 else:
-    log_command(False, args)
-    print(f"[SAFETY VIOLATION] adb command '{' '.join(args)}' is not in the safe allowlist. Refused.", file=sys.stderr)
-    sys.exit(1)
+    abort(f"Subcommand '{subcmd}' is not in the safe allowlist", raw_args)

@@ -1,69 +1,153 @@
 #!/usr/bin/env python3
+"""
+tools/safe/fastboot - Hardened Safety Interceptor Proxy for Fastboot
+Enforces strict volatile RAM boot operation only.
+All flash, erase, format, partition modification, or slot-switch commands are permanently blocked.
+"""
+
 import sys
 import os
 import subprocess
+import stat
+import re
 from datetime import datetime
 
 LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
 REAL_FASTBOOT = "/usr/bin/fastboot"
 
-def log_command(allowed, args):
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    with open(LOG_FILE, "a") as f:
-        timestamp = datetime.now().isoformat()
-        status = "ALLOWED" if allowed else "BLOCKED"
-        f.write(f"[{timestamp}] [FASTBOOT] [{status}] {' '.join(args)}\n")
+if not os.path.exists(REAL_FASTBOOT):
+    for p in os.environ.get("PATH", "").split(os.path.pathsep):
+        candidate = os.path.join(p, "fastboot")
+        if os.path.exists(candidate) and os.path.abspath(candidate) != os.path.abspath(__file__):
+            REAL_FASTBOOT = candidate
+            break
 
-args = sys.argv[1:]
+def log_command(allowed, args, reason=""):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            timestamp = datetime.now().isoformat()
+            status = "ALLOWED" if allowed else "BLOCKED"
+            extra = f" [{reason}]" if reason else ""
+            f.write(f"[{timestamp}] [FASTBOOT] [{status}]{extra} {' '.join(args)}\n")
+    except Exception:
+        pass
 
-if not args:
+def abort(msg, args):
+    log_command(False, args, msg)
+    print(f"[FASTBOOT SAFETY VIOLATION] {msg}. Refused.", file=sys.stderr)
+    sys.exit(1)
+
+raw_args = sys.argv[1:]
+if not raw_args:
     res = subprocess.run([REAL_FASTBOOT])
     sys.exit(res.returncode)
 
-cmd = args[0].lower()
+# 1. Parse global fastboot options
+idx = 0
+global_flags = []
+while idx < len(raw_args):
+    arg = raw_args[idx]
+    if arg in ["-s", "-i"]:
+        if idx + 1 >= len(raw_args):
+            abort(f"Global option '{arg}' missing required argument", raw_args)
+        global_flags.extend([arg, raw_args[idx + 1]])
+        idx += 2
+    elif arg.startswith("-s") or arg.startswith("-i"):
+        global_flags.append(arg)
+        idx += 1
+    elif arg in ["-h", "--help", "-v", "--version"]:
+        log_command(True, raw_args)
+        res = subprocess.run([REAL_FASTBOOT] + raw_args)
+        sys.exit(res.returncode)
+    elif arg.startswith("-"):
+        abort(f"Disallowed global flag '{arg}'", raw_args)
+    else:
+        break
 
-# Check against absolute banned operations
-BANNED_SUBCOMMANDS = [
-    "flash", "flashall", "flashing", "update", "erase", "format", 
-    "wipe", "set_active", "snapshot-update", "gsi", "oem"
-]
-
-for b in BANNED_SUBCOMMANDS:
-    if cmd == b or f"-{b}" in args or f"--{b}" in args:
-        log_command(False, args)
-        print(f"[SAFETY VIOLATION] fastboot command '{' '.join(args)}' contains banned operation '{b}'. ABORTING.", file=sys.stderr)
-        sys.exit(1)
-
-if "-w" in args or "--wipe" in args:
-    log_command(False, args)
-    print(f"[SAFETY VIOLATION] fastboot wipe flag detected in '{' '.join(args)}'. ABORTING.", file=sys.stderr)
-    sys.exit(1)
-
-# Allowlists
-is_allowed = False
-
-if cmd in ["devices", "help", "--help", "-h", "version", "--version"]:
-    is_allowed = True
-elif cmd == "getvar":
-    is_allowed = True
-elif cmd == "reboot":
-    if len(args) == 1 or (len(args) == 2 and args[1] in ["bootloader", "fastboot"]):
-        is_allowed = True
-elif cmd == "boot":
-    if len(args) == 2:
-        img_path = args[1]
-        # Booting from RAM allowed only if file exists
-        if os.path.isfile(img_path):
-            is_allowed = True
-        else:
-            print(f"[SAFETY ERROR] Fastboot boot image '{img_path}' not found.", file=sys.stderr)
-            sys.exit(1)
-
-if is_allowed:
-    log_command(True, args)
-    res = subprocess.run([REAL_FASTBOOT] + args)
+if idx >= len(raw_args):
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
     sys.exit(res.returncode)
+
+cmd = raw_args[idx].lower()
+subargs = raw_args[idx + 1:]
+
+# 2. Permanent Ban on Dangerous Operations
+BANNED_COMMANDS = {
+    "flash", "flashall", "flashing", "update", "erase", "format", 
+    "wipe", "-w", "--wipe", "set_active", "snapshot-update", 
+    "gsi", "oem", "stage", "get_staged"
+}
+
+if cmd in BANNED_COMMANDS or any(x in BANNED_COMMANDS for x in subargs):
+    abort(f"Operation '{cmd}' or flag alters physical storage and is PERMANENTLY BANNED", raw_args)
+
+# 3. Whitelist of Safe Operations
+if cmd in ["devices"]:
+    if subargs and subargs != ["-l"]:
+        abort("Unexpected arguments to 'fastboot devices'", raw_args)
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+elif cmd == "getvar":
+    if len(subargs) != 1:
+        abort("fastboot getvar requires exactly 1 variable name", raw_args)
+    var = subargs[0]
+    ALLOWED_GETVARS = {
+        "all", "version", "version-bootloader", "version-baseband", 
+        "product", "serialno", "secure", "unlocked", "current-slot", 
+        "slot-count", "slot-successful", "slot-unbootable", "slot-retry-count",
+        "max-download-size", "has-slot", "is-userspace", "battery-voltage", 
+        "battery-soc-ok", "hw-revision", "variant"
+    }
+    # Allow exact match or standard indexed query like has-slot:boot
+    base_var = var.split(":")[0]
+    if base_var not in ALLOWED_GETVARS and not re.match(r"^[a-zA-Z0-9_-]+$", var):
+        abort(f"Disallowed getvar variable: '{var}'", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+elif cmd == "reboot":
+    if len(subargs) == 0:
+        pass
+    elif len(subargs) == 1 and subargs[0] in ["bootloader", "fastboot", "recovery"]:
+        pass
+    else:
+        abort(f"Disallowed reboot target: '{' '.join(subargs)}'", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+elif cmd == "boot":
+    # fastboot boot <image_file> (strictly loads into RAM without flashing)
+    if len(subargs) != 1:
+        abort("fastboot boot requires exactly 1 local image path", raw_args)
+    
+    img_path = subargs[0]
+    if not os.path.exists(img_path):
+        abort(f"Image file '{img_path}' does not exist on host", raw_args)
+    
+    try:
+        st = os.stat(img_path)
+        if not stat.S_ISREG(st.st_mode):
+            abort(f"Target '{img_path}' is not a regular file", raw_args)
+        if st.st_size == 0:
+            abort(f"Target image '{img_path}' is 0 bytes (empty file)", raw_args)
+    except Exception as e:
+        abort(f"Cannot stat target image '{img_path}': {e}", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+elif cmd in ["help", "--help", "version", "--version"]:
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
 else:
-    log_command(False, args)
-    print(f"[SAFETY VIOLATION] fastboot command '{' '.join(args)}' is not in the strict allowlist. Refused.", file=sys.stderr)
-    sys.exit(1)
+    abort(f"Command '{cmd}' is not in the safe fastboot allowlist", raw_args)

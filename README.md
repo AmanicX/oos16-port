@@ -16,7 +16,7 @@ This project ports and runs **OxygenOS 16** (Android 16 / SDK 36 / `BP4A.251205.
 1. **Zero Storage Alteration**: The phone's internal UFS flash partitions (`sda` through `sdf`), existing OS (crDroid/LineageOS), and user data remain 100% write-locked and untouched.
 2. **Display & Graphics Bringup**: Full hardware UI rendering (`SurfaceFlinger` + Qualcomm DRM compositor `msm_drm` + `bootanimation`) on the OnePlus 7T's AMOLED display (including aftermarket fixed 60Hz panels: `dsi_samsung_s6e3fc2x01_cmd_display`).
 3. **Google Photos Unlimited Original Quality Backup**: Native XML injection (`pixel_2016_experience.xml` + `NEXUS_PRELOAD`).
-4. **Play Integrity & CTS Spoof**: Play Integrity Fix configuration (`pif.json`).
+4. **Play Integrity & CTS Spoof**: Play Integrity Fix configuration template (`pif.json`), providing the certified OEM Android 12 release-keys device fingerprint (`HD1901`) for use by integrity modules. *(Note: Injecting `pif.json` provides the required device properties template, but does not by itself guarantee or establish Google Play Integrity / CTS compliance on Android 16 without runtime attestation hooking such as Zygisk).*
 
 ---
 
@@ -38,7 +38,7 @@ Every file, partition image, and tool used in this project is documented with it
 | :--- | :--- | :--- | :--- |
 | **`ota_full-LE2113_16.0.10.500.zip`** | Android 16 (`BP4A.251205.006`) | Official OnePlus / OPPO OTA Update Servers for OnePlus 9 Pro (`martinit`) | **Donor OS**: Provides OxygenOS 16 system framework, `system`, `system_ext`, `my_product`, and regional configurations. |
 | **`lineage-23.2-20261009-nightly-hotdogb-signed.zip`** | Android 16 / SDK 36 | Official LineageOS for OnePlus 7T (`hotdogb`) | **Base Hardware HALs**: Provides Snapdragon 855 (SM8150) graphics, display, sensor, audio, and camera HALs matching Android 16. |
-| **`crDroid 12.x / LineageOS Recovery`** | Kernel 4.14.336-perf+ | crDroid Android / LineageOS hotdogb releases | **Stage-1 Kernel & Ramdisk**: Provides the recovery kernel, DTB, DTBO, and initial USB ADB endpoint. |
+| **`crDroid 12.x / LineageOS Recovery`** | Kernel 4.14.357-perf+ (`4.14.357-perf-gcd3073fb68f1`) | crDroid Android / LineageOS hotdogb releases | **Stage-1 Kernel & Ramdisk**: Provides the recovery kernel, DTB, DTBO, and initial USB ADB endpoint. |
 | **`external/coloros_port`** | Branch `COS16/OOS16` | [GitHub: toraidl/coloros_port](https://github.com/toraidl/coloros_port) | **Porting Utilities**: Provides `mkfs.erofs`, `fsck.erofs`, SELinux context patchers, and smali hooks. |
 | **`pixel_2016_experience.xml`** | 2026 Revision | Google Pixel sysconfig / crDroid feature overlay | **Photos Spoof**: Grants unlimited original quality Google Photos cloud backup. |
 | **`pif.json`** | OnePlus 7T HD1901 Target | Play Integrity Fix profile | **Play Integrity**: Spoofs CTS / MEETS_DEVICE_INTEGRITY profile for Google Play Services. |

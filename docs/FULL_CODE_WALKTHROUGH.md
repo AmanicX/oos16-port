@@ -20,10 +20,13 @@ This document contains the entire codebase used in the port, detailing:
    - [scripts/build_stage2_erofs.sh](#scriptsbuild_stage2_erofssh)
    - [scripts/stage2_init.sh](#scriptsstage2_initsh)
    - [scripts/build_loader.sh](#scriptsbuild_loadersh)
-3. [Configuration & Injected Feature XMLs (`configs/`)](#3-configuration--injected-feature-xmls-configs)
+3. [Test Suites (`tests/`)](#3-test-suites-tests)
+   - [tests/test_safe_adb.py](#teststest_safe_adbpy)
+   - [tests/test_safe_fastboot.py](#teststest_safe_fastbootpy)
+4. [Configuration & Injected Feature XMLs (`configs/`)](#4-configuration--injected-feature-xmls-configs)
    - [configs/pixel_2016_experience.xml](#configspixel_2016_experiencexml)
    - [configs/pif.json](#configspifjson)
-4. [Patches (`patches/`)](#4-patches-patches)
+5. [Patches (`patches/`)](#5-patches-patches)
    - [patches/system_ext_property_contexts.patch](#patchessystem_ext_property_contextspatch)
    - [patches/vendor_build_prop_display.patch](#patchesvendor_build_prop_displaypatch)
 
@@ -34,15 +37,20 @@ This document contains the entire codebase used in the port, detailing:
 ### `tools/safe/fastboot`
 * **Path**: `tools/safe/fastboot`
 * **Role**: Python-based interceptor wrapper around the platform `fastboot` binary.
-* **Safety Contract**: Intercepts and strictly bans any command that attempts to write, erase, format, or flash physical storage (`flash`, `erase`, `format`, `wipe`, `set_active`, `snapshot-update`). Only permits RAM boot (`boot <file>`), device listing (`devices`), property queries (`getvar`), and rebooting (`reboot`).
+* **Safety Contract**: Intercepts and strictly bans any command that attempts to write, erase, format, or flash physical storage (`flash`, `erase`, `format`, `wipe`, `set_active`, `snapshot-update`). Only permits RAM boot (`boot <file>`), device listing (`devices`), property queries (`getvar`), and rebooting (`reboot`). Validates image paths (must be non-empty regular files).
 
 ```python
 #!/usr/bin/env python3
 import sys
-import subprocess
 import os
+import subprocess
+import stat
+import re
+from datetime import datetime
 
+LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
 REAL_FASTBOOT = "/usr/bin/fastboot"
+
 if not os.path.exists(REAL_FASTBOOT):
     for p in os.environ.get("PATH", "").split(os.path.pathsep):
         candidate = os.path.join(p, "fastboot")
@@ -50,31 +58,130 @@ if not os.path.exists(REAL_FASTBOOT):
             REAL_FASTBOOT = candidate
             break
 
-BANNED_SUBCOMMANDS = {
-    "flash", "erase", "format", "wipe", "set_active", "oem", "flashing",
-    "snapshot-update", "delete-logical-partition", "create-logical-partition",
-    "resize-logical-partition"
+def log_command(allowed, args, reason=""):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            timestamp = datetime.now().isoformat()
+            status = "ALLOWED" if allowed else "BLOCKED"
+            extra = f" [{reason}]" if reason else ""
+            f.write(f"[{timestamp}] [FASTBOOT] [{status}]{extra} {' '.join(args)}\n")
+    except Exception:
+        pass
+
+def abort(msg, args):
+    log_command(False, args, msg)
+    print(f"[FASTBOOT SAFETY VIOLATION] {msg}. Refused.", file=sys.stderr)
+    sys.exit(1)
+
+raw_args = sys.argv[1:]
+if not raw_args:
+    res = subprocess.run([REAL_FASTBOOT])
+    sys.exit(res.returncode)
+
+idx = 0
+global_flags = []
+while idx < len(raw_args):
+    arg = raw_args[idx]
+    if arg in ["-s", "-i"]:
+        if idx + 1 >= len(raw_args):
+            abort(f"Global option '{arg}' missing required argument", raw_args)
+        global_flags.extend([arg, raw_args[idx + 1]])
+        idx += 2
+    elif arg.startswith("-s") or arg.startswith("-i"):
+        global_flags.append(arg)
+        idx += 1
+    elif arg in ["-h", "--help", "-v", "--version"]:
+        log_command(True, raw_args)
+        res = subprocess.run([REAL_FASTBOOT] + raw_args)
+        sys.exit(res.returncode)
+    elif arg.startswith("-"):
+        abort(f"Disallowed global flag '{arg}'", raw_args)
+    else:
+        break
+
+if idx >= len(raw_args):
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+cmd = raw_args[idx].lower()
+subargs = raw_args[idx + 1:]
+
+BANNED_COMMANDS = {
+    "flash", "flashall", "flashing", "update", "erase", "format", 
+    "wipe", "-w", "--wipe", "set_active", "snapshot-update", 
+    "gsi", "oem", "stage", "get_staged"
 }
 
-args = sys.argv[1:]
-if not args:
-    subprocess.run([REAL_FASTBOOT])
-    sys.exit(0)
+if cmd in BANNED_COMMANDS or any(x in BANNED_COMMANDS for x in subargs):
+    abort(f"Operation '{cmd}' or flag alters physical storage and is PERMANENTLY BANNED", raw_args)
 
-cmd = args[0].lower()
-if cmd in BANNED_SUBCOMMANDS:
-    print(f"CRITICAL SAFETY VIOLATION: Command 'fastboot {cmd}' is PERMANENTLY BLOCKED.", file=sys.stderr)
-    print("This project operates 100% in volatile RAM. Flashing/wiping storage is strictly forbidden.", file=sys.stderr)
-    sys.exit(1)
+if cmd in ["devices"]:
+    if subargs and subargs != ["-l"]:
+        abort("Unexpected arguments to 'fastboot devices'", raw_args)
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
 
-ALLOWED_COMMANDS = {"devices", "getvar", "reboot", "boot"}
-if cmd not in ALLOWED_COMMANDS:
-    print(f"SAFETY VIOLATION: Command 'fastboot {cmd}' is not in the strict whitelist.", file=sys.stderr)
-    print("Allowed commands: devices, getvar, reboot, boot <file>", file=sys.stderr)
-    sys.exit(1)
+elif cmd == "getvar":
+    if len(subargs) != 1:
+        abort("fastboot getvar requires exactly 1 variable name", raw_args)
+    var = subargs[0]
+    ALLOWED_GETVARS = {
+        "all", "version", "version-bootloader", "version-baseband", 
+        "product", "serialno", "secure", "unlocked", "current-slot", 
+        "slot-count", "slot-successful", "slot-unbootable", "slot-retry-count",
+        "max-download-size", "has-slot", "is-userspace", "battery-voltage", 
+        "battery-soc-ok", "hw-revision", "variant"
+    }
+    base_var = var.split(":")[0]
+    if base_var not in ALLOWED_GETVARS and not re.match(r"^[a-zA-Z0-9_-]+$", var):
+        abort(f"Disallowed getvar variable: '{var}'", raw_args)
 
-res = subprocess.run([REAL_FASTBOOT] + args)
-sys.exit(res.returncode)
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+elif cmd == "reboot":
+    if len(subargs) == 0:
+        pass
+    elif len(subargs) == 1 and subargs[0] in ["bootloader", "fastboot", "recovery"]:
+        pass
+    else:
+        abort(f"Disallowed reboot target: '{' '.join(subargs)}'", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+elif cmd == "boot":
+    if len(subargs) != 1:
+        abort("fastboot boot requires exactly 1 local image path", raw_args)
+    
+    img_path = subargs[0]
+    if not os.path.exists(img_path):
+        abort(f"Image file '{img_path}' does not exist on host", raw_args)
+    
+    try:
+        st = os.stat(img_path)
+        if not stat.S_ISREG(st.st_mode):
+            abort(f"Target '{img_path}' is not a regular file", raw_args)
+        if st.st_size == 0:
+            abort(f"Target image '{img_path}' is 0 bytes (empty file)", raw_args)
+    except Exception as e:
+        abort(f"Cannot stat target image '{img_path}': {e}", raw_args)
+
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+elif cmd in ["help", "--help", "version", "--version"]:
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_FASTBOOT] + raw_args)
+    sys.exit(res.returncode)
+
+else:
+    abort(f"Command '{cmd}' is not in the safe fastboot allowlist", raw_args)
 ```
 
 ---
@@ -82,21 +189,20 @@ sys.exit(res.returncode)
 ### `tools/safe/adb`
 * **Path**: `tools/safe/adb`
 * **Role**: Python-based audit logging and safety proxy around `adb`.
-* **Safety Contract**: Logs every command with timestamp to `logs/phone-commands.log`. Blocks raw block modifications, sideloading, package installations, and non-RAM targets.
+* **Safety Contract**: Validates all shell tokens using `shlex`. Blocks shell metacharacters (pipes, chaining, redirects). Disallows arbitrary commands, toybox applets outside whitelist, and push to `/sdcard/`.
 
 ```python
 #!/usr/bin/env python3
 import sys
-import subprocess
 import os
-import datetime
+import subprocess
+import shlex
+import re
+from datetime import datetime
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
-LOG_FILE = os.path.join(PROJECT_ROOT, "logs/phone-commands.log")
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-
+LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
 REAL_ADB = "/usr/bin/adb"
+
 if not os.path.exists(REAL_ADB):
     for p in os.environ.get("PATH", "").split(os.path.pathsep):
         candidate = os.path.join(p, "adb")
@@ -104,342 +210,180 @@ if not os.path.exists(REAL_ADB):
             REAL_ADB = candidate
             break
 
-def log_command(args, status="EXEC"):
-    ts = datetime.datetime.now().isoformat()
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{ts}] [{status}] adb {' '.join(args)}\n")
+def log_command(allowed, args, reason=""):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            timestamp = datetime.now().isoformat()
+            status = "ALLOWED" if allowed else "BLOCKED"
+            extra = f" [{reason}]" if reason else ""
+            f.write(f"[{timestamp}] [ADB] [{status}]{extra} {' '.join(args)}\n")
+    except Exception:
+        pass
 
-BANNED_ADB_CMDS = {
-    "sideload", "install", "install-multiple", "uninstall", 
-    "sync", "remount", "disable-verity", "enable-verity",
-    "restore", "unroot"
-}
-
-args = sys.argv[1:]
-if not args:
-    subprocess.run([REAL_ADB])
-    sys.exit(0)
-
-cmd = args[0].lower()
-if cmd in ["-s", "-d", "-e", "-t"]:
-    if len(args) > 2:
-        cmd = args[2].lower()
-
-if cmd in BANNED_ADB_CMDS:
-    log_command(args, "BLOCKED")
-    print(f"CRITICAL SAFETY VIOLATION: Command 'adb {cmd}' is PERMANENTLY BLOCKED.", file=sys.stderr)
+def abort(msg, args):
+    log_command(False, args, msg)
+    print(f"[ADB SAFETY VIOLATION] {msg}. Refused.", file=sys.stderr)
     sys.exit(1)
 
-log_command(args, "EXEC")
-res = subprocess.run([REAL_ADB] + args)
-sys.exit(res.returncode)
-```
+raw_args = sys.argv[1:]
+if not raw_args:
+    res = subprocess.run([REAL_ADB])
+    sys.exit(res.returncode)
 
----
+idx = 0
+global_flags = []
+while idx < len(raw_args):
+    arg = raw_args[idx]
+    if arg in ["-d", "-e"]:
+        global_flags.append(arg)
+        idx += 1
+    elif arg in ["-s", "-t", "-H", "-P", "-L"]:
+        if idx + 1 >= len(raw_args):
+            abort(f"Global flag '{arg}' missing required argument", raw_args)
+        global_flags.extend([arg, raw_args[idx + 1]])
+        idx += 2
+    elif arg.startswith("-"):
+        abort(f"Disallowed global flag '{arg}'", raw_args)
+    else:
+        break
 
-### `tools/safe/audit-no-writes.sh`
-* **Path**: `tools/safe/audit-no-writes.sh`
-* **Role**: Static binary auditor verifying that boot images contain no physical flash write targets.
+if idx >= len(raw_args):
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+subcmd = raw_args[idx]
+subargs = raw_args[idx + 1:]
 
-IMAGE="${1:-build/stage1.img}"
-echo "Auditing $IMAGE for storage safety..."
+SAFE_NOARG_CMDS = {"devices", "get-state", "version", "help", "--help", "wait-for-device", "root"}
 
-if [ ! -f "$IMAGE" ]; then
-    echo "Error: Image $IMAGE does not exist."
-    exit 1
-fi
+if subcmd in SAFE_NOARG_CMDS:
+    if subcmd == "devices":
+        if subargs and subargs != ["-l"]:
+            abort("Unexpected arguments to 'adb devices'", raw_args)
+    elif subcmd in ["get-state", "version", "help", "--help", "wait-for-device", "root"]:
+        if subargs:
+            abort(f"Unexpected arguments to 'adb {subcmd}'", raw_args)
 
-TMP_DIR=$(mktemp -d /tmp/audit_img.XXXXXX)
-trap "rm -rf '$TMP_DIR'" EXIT
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
 
-# Unpack boot image with magiskboot
-(cd "$TMP_DIR" && magiskboot unpack "$OLDPWD/$IMAGE" >/dev/null 2>&1)
+elif subcmd == "reboot":
+    if len(subargs) == 0:
+        pass
+    elif len(subargs) == 1 and subargs[0] in ["bootloader", "fastboot", "recovery"]:
+        pass
+    else:
+        abort(f"Disallowed reboot target: '{' '.join(subargs)}'", raw_args)
 
-# Check kernel cmdline
-CMDLINE=""
-if [ -f "$TMP_DIR/cmdline" ]; then
-    CMDLINE=$(cat "$TMP_DIR/cmdline")
-fi
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
 
-echo "Kernel Cmdline: $CMDLINE"
-if echo "$CMDLINE" | grep -qE "androidboot\.fstab|skip_initramfs"; then
-    echo "FAIL: Cmdline references physical fstab or skips initramfs!"
-    exit 1
-fi
+elif subcmd == "pull":
+    if len(subargs) < 1:
+        abort("adb pull requires at least a source path", raw_args)
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
 
-echo "Audit PASSED: Zero write commands detected. Safe for volatile RAM boot."
-exit 0
-```
+elif subcmd == "push":
+    if len(subargs) < 2:
+        abort("adb push requires source and destination arguments", raw_args)
+    
+    dest = subargs[-1]
+    ALLOWED_RAM_PREFIXES = ("/tmp/", "/mnt/", "/dev/tmpfs")
+    ALLOWED_RAM_EXACT = {"/tmp", "/mnt"}
 
----
+    is_ram_dest = (dest in ALLOWED_RAM_EXACT) or any(dest.startswith(p) for p in ALLOWED_RAM_PREFIXES)
+    
+    if dest.startswith("/sdcard") or dest.startswith("/storage") or "/sdcard" in dest:
+        abort(f"Push destination '{dest}' is on physical storage (/sdcard is not RAM). REJECTED", raw_args)
 
-### `tools/safe/run_stage2.sh`
-* **Path**: `tools/safe/run_stage2.sh`
-* **Role**: Host-side orchestrator pushing EROFS images to RAM and triggering Stage 2.
+    if not is_ram_dest:
+        abort(f"Push destination '{dest}' is not in approved volatile RAM directories (/tmp/, /mnt/)", raw_args)
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+    sources = subargs[:-1]
+    for src in sources:
+        if not os.path.exists(src):
+            abort(f"Local source file '{src}' does not exist", raw_args)
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SAFE_ADB="$PROJECT_ROOT/tools/safe/adb"
-IMAGES_DIR="$PROJECT_ROOT/build/images"
-STAGE2_SCRIPT="$PROJECT_ROOT/scripts/stage2_init.sh"
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
 
-echo "=========================================================="
-echo "      STAGE-2 RAM RESIDENT BOOT ORCHESTRATOR             "
-echo "      OxygenOS 16 on OnePlus 7T (HD1901)                 "
-echo "=========================================================="
+elif subcmd in ["shell", "exec-out"]:
+    if not subargs:
+        abort("Interactive adb shell sessions are blocked to prevent untracked writes", raw_args)
 
-echo "1. Checking phone ADB connection in RAM..."
-if ! "$SAFE_ADB" get-state 2>/dev/null | grep -q "device\|recovery"; then
-    echo "Error: Phone is not connected in Stage-1 ADB mode."
-    exit 1
-fi
-echo "Phone connected successfully in Stage-1 RAM mode."
+    shell_str = " ".join(subargs).strip()
 
-echo "2. Disarming safety watchdog timer (set to 24 hours)..."
-"$SAFE_ADB" shell "touch /tmp/watchdog_cancel"
+    SHELL_METACHAR_PATTERN = re.compile(r"[;&|><$`\n\r()]")
+    if SHELL_METACHAR_PATTERN.search(shell_str):
+        abort(f"Shell metacharacters (chaining, pipes, redirection, subshell) are strictly blocked: '{shell_str}'", raw_args)
 
-echo "3. Verifying block-layer read-only status on physical storage..."
-LUNS=$("$SAFE_ADB" shell "/system/bin/toybox blockdev --getro /dev/block/sd[a-f]")
-for ro_val in $LUNS; do
-    if [ "$ro_val" != "1" ]; then
-        echo "CRITICAL SAFETY VIOLATION: Physical block device is not read-only ($ro_val)!"
-        exit 1
-    fi
-done
-echo "Verified: All physical UFS block devices (sda-sdf) are read-only (100% write-locked)."
+    try:
+        tokens = shlex.split(shell_str)
+    except Exception as e:
+        abort(f"Malformed shell command string: {e}", raw_args)
 
-echo "4. Checking phone free RAM headroom..."
-"$SAFE_ADB" shell "/system/bin/toybox free -m"
+    if not tokens:
+        abort("Empty shell command", raw_args)
 
-echo "5. Pushing optimized EROFS partition images to phone RAM..."
-IMAGES=(
-    "odm.erofs.img:/tmp/odm.img"
-    "vendor.erofs.img:/tmp/vendor.img"
-    "my_region.erofs.img:/tmp/my_region.img"
-    "runtime_apex.erofs.img:/tmp/runtime_apex.img"
-    "system.erofs.img:/tmp/system.img"
-    "system_ext.erofs.img:/tmp/system_ext.img"
-    "my_product.erofs.img:/mnt/my_product.img"
-)
+    base_cmd = tokens[0]
+    norm_cmd = os.path.basename(base_cmd)
+    cmd_args = tokens[1:]
 
-for pair in "${IMAGES[@]}"; do
-    SRC="${pair%%:*}"
-    DST="${pair##*:}"
-    SRC_PATH="$IMAGES_DIR/$SRC"
-    if [ ! -f "$SRC_PATH" ]; then
-        echo "Error: Missing required image: $SRC_PATH"
-        exit 1
-    fi
-    SIZE=$(ls -lh "$SRC_PATH" | awk '{print $5}')
-    echo " -> Pushing $SRC ($SIZE) to $DST..."
-    "$SAFE_ADB" push "$SRC_PATH" "$DST"
-done
+    ALLOWED_DIAGNOSTIC_COMMANDS = {
+        "getprop": lambda a: all(re.match(r"^[a-zA-Z0-9_.-]+$", x) for x in a) and len(a) <= 1,
+        "dmesg": lambda a: all(x in ["-c", "-s", "-r", "-n", "-l"] or re.match(r"^[0-9]+$", x) for x in a),
+        "logcat": lambda a: all(x in ["-d", "-c", "-b", "all", "main", "system", "crash", "events", "-v", "threadtime", "brief", "time", "-s"] or re.match(r"^[a-zA-Z0-9_:*.-]+$", x) for x in a),
+        "ps": lambda a: all(x in ["-ef", "-A", "-e", "-f", "-l", "-T", "-o"] or re.match(r"^[a-zA-Z0-9_,]+$", x) for x in a),
+        "df": lambda a: all(x in ["-h", "-k", "-m", "-a"] or x.startswith("/") for x in a),
+        "free": lambda a: all(x in ["-m", "-k", "-h", "-b"] for x in a),
+        "uname": lambda a: all(x in ["-a", "-r", "-m", "-n", "-s", "-v"] for x in a),
+        "id": lambda a: len(a) == 0 or all(x in ["-u", "-g", "-n", "-G"] for x in a),
+        "whoami": lambda a: len(a) == 0,
+        "uptime": lambda a: len(a) == 0,
+        "mount": lambda a: len(a) == 0,
+        "lshal": lambda a: all(x in ["--types=all", "--types=b", "--types=c", "-v"] for x in a),
+        "dumpsys": lambda a: all(re.match(r"^[a-zA-Z0-9_.-]+$", x) for x in a) and len(a) <= 2,
+        "cat": lambda a: len(a) == 1 and (a[0].startswith("/proc/") or a[0].startswith("/sys/")),
+        "ls": lambda a: all(x.startswith("-") or x.startswith(("/tmp", "/mnt", "/proc", "/sys", "/dev", "/system", "/vendor", "/apex", "/linkerconfig")) for x in a),
+        "readlink": lambda a: len(a) <= 2 and all(x in ["-f", "-m", "-n"] or x.startswith("/") for x in a),
+        "file": lambda a: len(a) <= 2 and all(x.startswith(("-", "/tmp", "/mnt", "/system", "/vendor", "/apex")) for x in a),
+        "sha256sum": lambda a: all(x.startswith(("/tmp", "/mnt")) for x in a),
+        "md5sum": lambda a: all(x.startswith(("/tmp", "/mnt")) for x in a),
+        "blockdev": lambda a: len(a) == 2 and a[0] == "--getro" and (a[1].startswith("/dev/block/sd") or a[1].startswith("/dev/block/mmcblk") or a[1].startswith("/dev/block/loop")),
+        "touch": lambda a: len(a) == 1 and a[0] in ["/tmp/watchdog_cancel", "/tmp/watchdog_heartbeat"],
+        "rm": lambda a: len(a) == 2 and a[0] == "-f" and a[1] in ["/tmp/watchdog_cancel", "/tmp/watchdog_heartbeat"],
+        "chmod": lambda a: len(a) == 2 and a[0] == "+x" and a[1] == "/tmp/stage2_init.sh",
+        "stage2_init.sh": lambda a: len(a) == 0,
+        "sh": lambda a: len(a) == 1 and a[0] == "/tmp/stage2_init.sh"
+    }
 
-echo "6. Pushing Stage-2 init transition script..."
-"$SAFE_ADB" push "$STAGE2_SCRIPT" "/tmp/stage2_init.sh"
-"$SAFE_ADB" shell chmod +x /tmp/stage2_init.sh
+    if norm_cmd in ["toybox", "toolbox"]:
+        if not cmd_args:
+            abort(f"Missing applet for '{norm_cmd}'", raw_args)
+        applet = os.path.basename(cmd_args[0])
+        applet_args = cmd_args[1:]
+        if applet not in ALLOWED_DIAGNOSTIC_COMMANDS:
+            abort(f"Toybox applet '{applet}' is not in the safe whitelist", raw_args)
+        validator = ALLOWED_DIAGNOSTIC_COMMANDS[applet]
+        if not validator(applet_args):
+            abort(f"Arguments to toybox applet '{applet}' rejected: {applet_args}", raw_args)
+    else:
+        if norm_cmd not in ALLOWED_DIAGNOSTIC_COMMANDS:
+            abort(f"Command '{norm_cmd}' is not in the safe whitelist", raw_args)
+        validator = ALLOWED_DIAGNOSTIC_COMMANDS[norm_cmd]
+        if not validator(cmd_args):
+            abort(f"Arguments to command '{norm_cmd}' rejected: {cmd_args}", raw_args)
 
-echo "7. Executing Stage-2 Android Init Transition in RAM..."
-"$SAFE_ADB" shell /tmp/stage2_init.sh
-```
+    log_command(True, raw_args)
+    res = subprocess.run([REAL_ADB] + raw_args)
+    sys.exit(res.returncode)
 
----
-
-## 2. Build & Orchestration Scripts (`scripts/`)
-
-### `scripts/build_stage1.sh`
-* **Path**: `scripts/build_stage1.sh`
-* **Role**: Combines kernel, DTB, DTBO, and recovery ramdisk into `build/stage1.img`.
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-KERNEL_SRC="$PROJECT_ROOT/stage1/kernel_src"
-RAMDISK_DIR="$PROJECT_ROOT/stage1/native_ramdisk"
-BUILD_DIR="$PROJECT_ROOT/build"
-STAGE1_IMG="$BUILD_DIR/stage1.img"
-
-mkdir -p "$BUILD_DIR"
-
-echo "=========================================================="
-echo "          STAGE-1 NATIVE RAM IMAGE BUILDER                "
-echo "=========================================================="
-
-# Embed host adb key for instant passwordless adb root
-if [ -f "$HOME/.android/adbkey.pub" ]; then
-    echo "Embedding host adbkey.pub into ramdisk..."
-    cp "$HOME/.android/adbkey.pub" "$RAMDISK_DIR/adb_keys"
-    chmod 644 "$RAMDISK_DIR/adb_keys"
-fi
-
-# Repack native ramdisk into cpio.lz4
-echo "Packing native ramdisk into stage1_native_ramdisk.cpio.lz4..."
-(cd "$RAMDISK_DIR" && find . | cpio -H newc -o 2>/dev/null | lz4 -l -12 --favor-decSpeed > "$PROJECT_ROOT/stage1/stage1_native_ramdisk.cpio.lz4")
-
-# Build boot image with mkbootimg
-echo "Building $STAGE1_IMG with mkbootimg..."
-mkbootimg \
-    --kernel "$KERNEL_SRC/kernel" \
-    --ramdisk "$PROJECT_ROOT/stage1/stage1_native_ramdisk.cpio.lz4" \
-    --dtb "$KERNEL_SRC/dtb" \
-    --recovery_dtbo "$KERNEL_SRC/recovery_dtbo" \
-    --cmdline "console=null androidboot.hardware=qcom video=vfb:640x400,bpp=32,memsize=3072000 msm_rtb.filter=0x237 ehci-hcd.park=3 lpm_levels.sleep_disabled=1 service_locator.enable=1 firmware_class.path=/vendor/firmware_mnt/image loop.max_part=7 buildvariant=userdebug" \
-    --base 0x00000000 \
-    --pagesize 4096 \
-    --kernel_offset 0x00008000 \
-    --ramdisk_offset 0x01000000 \
-    --second_offset 0x00f00000 \
-    --tags_offset 0x00000100 \
-    --dtb_offset 0x01f00000 \
-    --header_version 2 \
-    --os_version 16.0.0 \
-    --os_patch_level 2026-10 \
-    -o "$STAGE1_IMG"
-
-echo "Stage-1 image successfully generated at: $STAGE1_IMG"
-ls -lh "$STAGE1_IMG"
-```
-
----
-
-### `scripts/stage2_init.sh`
-* **Path**: `scripts/stage2_init.sh`
-* **Role**: Executes inside phone RAM to mount EROFS partitions, bridge Bionic runtime, and launch Android 16 `init`.
-
-```bash
-#!/system/bin/sh
-set -e
-
-echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null || true
-echo "=== STAGE-2 RAM BRINGUP STARTING ===" > /dev/kmsg
-
-# Tactile haptic buzz
-echo 300 > /sys/class/leds/vibrator/duration 2>/dev/null || true
-echo 1 > /sys/class/leds/vibrator/activate 2>/dev/null || true
-
-# 1. Cancel watchdog timer
-touch /tmp/watchdog_cancel
-echo "[STAGE2] Safety watchdog timer disarmed." > /dev/kmsg
-
-# 2. Strict read-only verification of physical UFS block devices
-for lun in /dev/block/sda /dev/block/sdb /dev/block/sdc /dev/block/sdd /dev/block/sde /dev/block/sdf; do
-    if [ -b "$lun" ]; then
-        ro=$(/system/bin/toybox blockdev --getro "$lun")
-        if [ "$ro" != "1" ]; then
-            echo "[STAGE2 FATAL] $lun is NOT read-only (ro=$ro)! Halting." > /dev/kmsg
-            exit 1
-        fi
-    fi
-done
-
-# 3. Create sysroot mount directory structure
-/system/bin/toybox umount -R /mnt/sysroot 2>/dev/null || true
-mkdir -p /mnt/sysroot
-
-# 4. Mount EROFS system images
-echo "[STAGE2] Mounting EROFS system images..." > /dev/kmsg
-/system/bin/toybox mount -t erofs -o ro,loop /tmp/system.img /mnt/sysroot
-/system/bin/toybox mount -t erofs -o ro,loop /tmp/system_ext.img /mnt/sysroot/system_ext
-if [ -f /mnt/my_product.img ]; then
-    /system/bin/toybox mount -t erofs -o ro,loop /mnt/my_product.img /mnt/sysroot/my_product
-    /system/bin/toybox mount -t erofs -o ro,loop /mnt/my_product.img /mnt/sysroot/product
-else
-    /system/bin/toybox mount -t erofs -o ro,loop /tmp/my_product.img /mnt/sysroot/my_product
-    /system/bin/toybox mount -t erofs -o ro,loop /tmp/my_product.img /mnt/sysroot/product
-fi
-if [ -f /tmp/my_region.img ]; then
-    /system/bin/toybox mount -t erofs -o ro,loop /tmp/my_region.img /mnt/sysroot/my_region
-fi
-/system/bin/toybox mount -t erofs -o ro,loop /tmp/vendor.img /mnt/sysroot/vendor
-/system/bin/toybox mount -t erofs -o ro,loop /tmp/odm.img /mnt/sysroot/odm
-
-# Mount RAM tmpfs on /mnt/sysroot/apex and bridge Bionic runtime linker
-/system/bin/toybox mount -t tmpfs -o mode=0755 tmpfs /mnt/sysroot/apex
-mkdir -p /mnt/sysroot/apex/com.android.runtime
-if [ -f /tmp/runtime_apex.img ]; then
-    /system/bin/toybox mount -t erofs -o ro,loop /tmp/runtime_apex.img /mnt/sysroot/apex/com.android.runtime
-fi
-
-mkdir -p /mnt/sysroot/apex/com.android.runtime/bin
-/system/bin/toybox ln -sf /system/bin/bootstrap/linker64 /mnt/sysroot/apex/com.android.runtime/bin/linker64 2>/dev/null || true
-/system/bin/toybox ln -sf /system/bin/bootstrap/linker /mnt/sysroot/apex/com.android.runtime/bin/linker 2>/dev/null || true
-
-# Secondary fallback symlinks for Bionic libraries
-mkdir -p /mnt/sysroot/apex/com.android.runtime/lib64/bionic /mnt/sysroot/apex/com.android.runtime/lib/bionic
-/system/bin/toybox ln -sf /system/lib64/bootstrap/libc.so /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libc.so 2>/dev/null || true
-/system/bin/toybox ln -sf /system/lib64/bootstrap/libm.so /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libm.so 2>/dev/null || true
-/system/bin/toybox ln -sf /system/lib64/bootstrap/libdl.so /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libdl.so 2>/dev/null || true
-
-# Ephemeral RAM tmpfs for /data (1024 MB)
-echo "[STAGE2] Initializing RAM tmpfs for /data (1024 MB)..." > /dev/kmsg
-/system/bin/toybox mount -t tmpfs -o rw,nosuid,nodev,noatime,mode=0771,size=1024M tmpfs /mnt/sysroot/data
-mkdir -p /mnt/sysroot/data/system /mnt/sysroot/data/misc /mnt/sysroot/data/user /mnt/sysroot/data/user_de /mnt/sysroot/data/local /mnt/sysroot/data/local/tmp /mnt/sysroot/data/media
-
-# Bind kernel filesystems and isolate properties/sockets
-/system/bin/toybox mount --bind /dev /mnt/sysroot/dev
-/system/bin/toybox mount -t devpts devpts /mnt/sysroot/dev/pts || true
-/system/bin/toybox mount -t proc proc /mnt/sysroot/proc
-/system/bin/toybox mount --bind /sys /mnt/sysroot/sys
-/system/bin/toybox mount -t selinuxfs selinuxfs /mnt/sysroot/sys/fs/selinux || true
-
-mkdir -p /mnt/sysroot/dev/__properties__ /mnt/sysroot/dev/socket
-/system/bin/toybox mount -t tmpfs tmpfs /mnt/sysroot/dev/__properties__
-/system/bin/toybox mount -t tmpfs tmpfs /mnt/sysroot/dev/socket
-
-# Start second-stage Android init via chroot
-export PATH=/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin
-export ANDROID_ROOT=/system
-export ANDROID_DATA=/data
-export ANDROID_STORAGE=/storage
-
-exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage
-```
-
----
-
-## 3. Configuration & Injected Feature XMLs (`configs/`)
-
-### `configs/pixel_2016_experience.xml`
-Injected into `/product/etc/permissions/` and `/my_product/etc/permissions/` to grant unlimited original quality cloud backup in Google Photos.
-
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Copyright (C) 2026 crDroid Android Project / Pixel Experience Spoof -->
-<permissions>
-    <feature name="com.google.android.apps.photos.NEXUS_PRELOAD" />
-    <feature name="com.google.android.apps.photos.nexus_preload" />
-    <feature name="com.google.android.feature.PIXEL_2016_EXPERIENCE" />
-    <feature name="com.google.android.feature.PIXEL_EXPERIENCE" />
-</permissions>
-```
-
-### `configs/pif.json`
-Play Integrity Fix profile for OnePlus 7T (`HD1901`) to pass device integrity and CTS profile checks.
-
-```json
-{
-  "MANUFACTURER": "OnePlus",
-  "BRAND": "OnePlus",
-  "PRODUCT": "OnePlus7T",
-  "DEVICE": "OnePlus7T",
-  "MODEL": "HD1901",
-  "FINGERPRINT": "OnePlus/OnePlus7T/OnePlus7T:12/SKQ1.211113.001/Q.202303230244:user/release-keys",
-  "SECURITY_PATCH": "2023-04-05",
-  "FIRST_API_LEVEL": "29",
-  "ID": "SKQ1.211113.001",
-  "TYPE": "user",
-  "TAGS": "release-keys",
-  "INCREMENTAL": "Q.202303230244"
-}
+else:
+    abort(f"Subcommand '{subcmd}' is not in the safe allowlist", raw_args)
 ```
