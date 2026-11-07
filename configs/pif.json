@@ -1,0 +1,14 @@
+{
+  "MANUFACTURER": "OnePlus",
+  "BRAND": "OnePlus",
+  "PRODUCT": "OnePlus7T",
+  "DEVICE": "OnePlus7T",
+  "MODEL": "HD1901",
+  "FINGERPRINT": "OnePlus/OnePlus7T/OnePlus7T:12/SKQ1.211113.001/Q.202303230244:user/release-keys",
+  "SECURITY_PATCH": "2023-04-05",
+  "FIRST_API_LEVEL": "29",
+  "ID": "SKQ1.211113.001",
+  "TYPE": "user",
+  "TAGS": "release-keys",
+  "INCREMENTAL": "Q.202303230244"
+}

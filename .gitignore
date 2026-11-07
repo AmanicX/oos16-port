@@ -20,7 +20,11 @@ external/
 *.part*
 build/
 out/
+work/
+trimmed_stash/
 stage1/kernel_src/
 stage1/ramdisk_root/
 stage1/*.lz4
 logs/*.log
+__pycache__/
+*.pyc

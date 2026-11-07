@@ -31,7 +31,7 @@ echo "2. Assembling Android Boot Image with mkbootimg..."
     --kernel "$STAGE1_DIR/kernel_src/kernel" \
     --ramdisk "$STAGE1_DIR/stage1_native_ramdisk.cpio.lz4" \
     --dtb "$STAGE1_DIR/kernel_src/dtb" \
-    --recovery_dtbo "/tmp/unpack_recovery/recovery_dtbo" \
+    --recovery_dtbo "$STAGE1_DIR/kernel_src/recovery_dtbo" \
     --cmdline "androidboot.hardware=qcom androidboot.memcg=1 androidboot.usbcontroller=a600000.dwc3 kpti=off loop.max_part=7 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 service_locator.enable=1 swiotlb=2048 androidboot.selinux=permissive enforcing=0 panic=5" \
     --base 0x00000000 \
     --kernel_offset 0x00008000 \

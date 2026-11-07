@@ -19,24 +19,31 @@ echo "=========================================================="
 
 # 1. Verify phone connection
 echo "1. Checking phone ADB connection in RAM..."
-if ! "$SAFE_ADB" get-state 2>/dev/null | grep -q "device"; then
+if ! "$SAFE_ADB" get-state 2>/dev/null | grep -qE "device|recovery"; then
     echo "Error: Phone is not connected in Stage-1 ADB mode."
     echo "Please boot Stage-1 first using: tools/safe/fastboot boot build/stage1.img"
     exit 1
 fi
-echo "Phone connected successfully."
+echo "Phone connected successfully in Stage-1 RAM mode."
 
-# 2. Immediately disarm safety watchdog
-echo "2. Disarming Stage-1 90s safety watchdog..."
-"$SAFE_ADB" shell touch /tmp/watchdog_cancel
-echo "Watchdog disarmed."
+# 2. Start laptop heartbeat loop (extends Stage-1 90s watchdog)
+echo "2. Starting laptop safety heartbeat loop..."
+(
+    while true; do
+        "$SAFE_ADB" shell "touch /tmp/watchdog_heartbeat" 2>/dev/null || true
+        sleep 10
+    done
+) &
+HEARTBEAT_PID=$!
+trap 'kill $HEARTBEAT_PID 2>/dev/null || true' EXIT
+echo "Laptop heartbeat active (auto-fallback if laptop disconnects)."
 
 # 3. Verify block layer read-only status on all physical disks
 echo "3. Verifying block-layer read-only status on physical storage..."
-LUNS=$("$SAFE_ADB" shell "/system/bin/toybox blockdev --getro /dev/block/sd[a-f]")
-for ro_val in $LUNS; do
+for dev in /dev/block/sda /dev/block/sdb /dev/block/sdc /dev/block/sdd /dev/block/sde /dev/block/sdf; do
+    ro_val=$("$SAFE_ADB" shell "/system/bin/toybox blockdev --getro $dev" | tr -d '\r\n[:space:]')
     if [ "$ro_val" != "1" ]; then
-        echo "CRITICAL SAFETY VIOLATION: A physical block device is not read-only ($ro_val)!"
+        echo "CRITICAL SAFETY VIOLATION: Device $dev is not read-only ($ro_val)!"
         echo "Aborting immediately to protect physical storage."
         exit 1
     fi
@@ -47,9 +54,17 @@ echo "Verified: All physical UFS block devices (sda-sdf) are read-only (100% wri
 echo "4. Checking phone free RAM headroom..."
 "$SAFE_ADB" shell "/system/bin/toybox free -m"
 
-# 5. Push EROFS images to RAM tmpfs (/tmp/)
+# 5. Push EROFS images to RAM tmpfs (/tmp/ and /mnt/)
 echo "5. Pushing optimized EROFS partition images to phone RAM..."
-IMAGES=("odm.erofs.img:odm.img" "vendor.erofs.img:vendor.img" "my_region.erofs.img:my_region.img" "system.erofs.img:system.img" "system_ext.erofs.img:system_ext.img" "my_product.erofs.img:my_product.img")
+IMAGES=(
+    "odm.erofs.img:/tmp/odm.img"
+    "vendor.erofs.img:/tmp/vendor.img"
+    "my_region.erofs.img:/tmp/my_region.img"
+    "runtime_apex.erofs.img:/tmp/runtime_apex.img"
+    "system.erofs.img:/tmp/system.img"
+    "system_ext.erofs.img:/tmp/system_ext.img"
+    "my_product.erofs.img:/mnt/my_product.img"
+)
 
 for pair in "${IMAGES[@]}"; do
     SRC="${pair%%:*}"
@@ -60,8 +75,8 @@ for pair in "${IMAGES[@]}"; do
         exit 1
     fi
     SIZE=$(ls -lh "$SRC_PATH" | awk '{print $5}')
-    echo " -> Pushing $SRC ($SIZE) to /tmp/$DST..."
-    "$SAFE_ADB" push "$SRC_PATH" "/tmp/$DST"
+    echo " -> Pushing $SRC ($SIZE) to $DST..."
+    "$SAFE_ADB" push "$SRC_PATH" "$DST"
 done
 
 # 6. Push Stage-2 init script

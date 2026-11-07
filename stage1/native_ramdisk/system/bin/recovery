@@ -1,0 +1,78 @@
+#!/system/bin/sh
+# Stage-1 Safe Harness (PID root service)
+echo "==========================================================" > /dev/kmsg
+echo "  STAGE-1 SAFE RAM HARNESS STARTING ON ONEPLUS 7T         " > /dev/kmsg
+echo "==========================================================" > /dev/kmsg
+
+# 1. Enforce read-only lock on all physical storage devices
+for dev in /dev/block/sd* /dev/block/mmcblk*; do
+    if [ -b "$dev" ]; then
+        /system/bin/toybox blockdev --setro "$dev" 2>/dev/null || true
+    fi
+done
+echo "[STAGE1] Physical flash disks locked read-only (blockdev --setro)." > /dev/kmsg
+
+# 2. Continuous Safety Guard Loop & Heartbeat Watchdog in background
+(
+    TIMER=90
+    echo "[STAGE1-GUARD] Continuous hardware RO monitor and 90s heartbeat watchdog armed." > /dev/kmsg
+    while true; do
+        # A. Guard check: verify all physical UFS disks sda-sdf are strictly read-only
+        for dev in /dev/block/sda /dev/block/sdb /dev/block/sdc /dev/block/sdd /dev/block/sde /dev/block/sdf; do
+            if [ -b "$dev" ]; then
+                ro_status=$(/system/bin/toybox blockdev --getro "$dev" 2>/dev/null)
+                if [ "$ro_status" != "1" ]; then
+                    echo "[GUARD FATAL] Security violation: $dev became writable (ro=$ro_status)! Re-locking and emergency rebooting to bootloader!" > /dev/kmsg
+                    /system/bin/toybox blockdev --setro "$dev" 2>/dev/null || true
+                    /system/bin/reboot bootloader
+                fi
+            fi
+        done
+
+        # B. Heartbeat check: extend watchdog if laptop sends heartbeat signal or cancelled
+        if [ -f /tmp/watchdog_cancel ]; then
+            TIMER=86400
+        elif [ -f /tmp/watchdog_heartbeat ]; then
+            /system/bin/toybox rm -f /tmp/watchdog_heartbeat
+            TIMER=300
+        fi
+
+        TIMER=$((TIMER - 1))
+        if [ "$TIMER" -le 0 ]; then
+            echo "[WATCHDOG FATAL] Heartbeat lost for 90s! Safety timeout reached. Rebooting to bootloader..." > /dev/kmsg
+            /system/bin/reboot bootloader
+        fi
+
+        /system/bin/toybox sleep 1
+    done
+) &
+
+# 3. Turn on screen backlight
+if [ -f /sys/class/backlight/panel0-backlight/brightness ]; then
+    echo 200 > /sys/class/backlight/panel0-backlight/brightness
+fi
+
+# 4. Draw test pattern to framebuffer if present
+for fb in /dev/graphics/fb0 /dev/fb0; do
+    if [ -c "$fb" ] || [ -b "$fb" ]; then
+        echo "[STAGE1] Framebuffer detected at $fb, drawing test pattern..." > /dev/kmsg
+        head -c 4194304 /dev/urandom > "$fb" 2>/dev/null || true
+        break
+    fi
+done
+
+# 5. Trigger USB ADB mode
+echo "[STAGE1] Setting sys.usb.config=adb..." > /dev/kmsg
+/system/bin/toolbox setprop sys.usb.config adb
+
+echo "==========================================================" > /dev/kmsg
+echo "  STAGE-1 SAFE RAM HARNESS RUNNING & READY                " > /dev/kmsg
+echo "  - Physical flash read-only verified                     " > /dev/kmsg
+echo "  - ADB daemon ready                                      " > /dev/kmsg
+echo "  - 90s watchdog active (cancel: touch /tmp/watchdog_cancel)" > /dev/kmsg
+echo "==========================================================" > /dev/kmsg
+
+# Keep service alive
+while true; do
+    /system/bin/toybox sleep 5
+done

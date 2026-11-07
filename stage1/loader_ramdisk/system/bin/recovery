@@ -1,0 +1,61 @@
+#!/system/bin/sh
+# Stage-1 Safe Harness (PID root service)
+echo "==========================================================" > /dev/kmsg
+echo "  STAGE-1 SAFE RAM HARNESS STARTING ON ONEPLUS 7T         " > /dev/kmsg
+echo "==========================================================" > /dev/kmsg
+
+# 1. Enforce read-only lock on all physical storage devices
+for dev in /dev/block/sd* /dev/block/mmcblk*; do
+    if [ -b "$dev" ]; then
+        /system/bin/toybox blockdev --setro "$dev" 2>/dev/null || true
+    fi
+done
+echo "[STAGE1] Physical flash disks locked read-only (blockdev --setro)." > /dev/kmsg
+
+# 2. Launch 90-second safety watchdog timer in background
+(
+    for i in $(/system/bin/toybox seq 90 -1 1); do
+        if [ -f /tmp/watchdog_cancel ]; then
+            echo "[WATCHDOG] Timer cancelled by user request." > /dev/kmsg
+            exit 0
+        fi
+        if [ -f /tmp/watchdog_pet ]; then
+            rm -f /tmp/watchdog_pet
+            echo "[WATCHDOG] Timer reset to 90s." > /dev/kmsg
+            i=90
+        fi
+        /system/bin/toybox sleep 1
+    done
+    echo "[WATCHDOG] 90s safety timeout reached! Rebooting to bootloader..." > /dev/kmsg
+    /system/bin/reboot bootloader
+) &
+
+# 3. Turn on screen backlight
+if [ -f /sys/class/backlight/panel0-backlight/brightness ]; then
+    echo 200 > /sys/class/backlight/panel0-backlight/brightness
+fi
+
+# 4. Draw test pattern to framebuffer if present
+for fb in /dev/graphics/fb0 /dev/fb0; do
+    if [ -c "$fb" ] || [ -b "$fb" ]; then
+        echo "[STAGE1] Framebuffer detected at $fb, drawing test pattern..." > /dev/kmsg
+        head -c 4194304 /dev/urandom > "$fb" 2>/dev/null || true
+        break
+    fi
+done
+
+# 5. Trigger USB ADB mode
+echo "[STAGE1] Setting sys.usb.config=adb..." > /dev/kmsg
+/system/bin/toolbox setprop sys.usb.config adb
+
+echo "==========================================================" > /dev/kmsg
+echo "  STAGE-1 SAFE RAM HARNESS RUNNING & READY                " > /dev/kmsg
+echo "  - Physical flash read-only verified                     " > /dev/kmsg
+echo "  - ADB daemon ready                                      " > /dev/kmsg
+echo "  - 90s watchdog active (cancel: touch /tmp/watchdog_cancel)" > /dev/kmsg
+echo "==========================================================" > /dev/kmsg
+
+# Keep service alive
+while true; do
+    /system/bin/toybox sleep 5
+done

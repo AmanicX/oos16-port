@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2026 crDroid Android Project / Pixel Experience Spoof -->
+<permissions>
+    <feature name="com.google.android.apps.photos.NEXUS_PRELOAD" />
+    <feature name="com.google.android.apps.photos.nexus_preload" />
+    <feature name="com.google.android.feature.PIXEL_2016_EXPERIENCE" />
+    <feature name="com.google.android.feature.PIXEL_EXPERIENCE" />
+</permissions>

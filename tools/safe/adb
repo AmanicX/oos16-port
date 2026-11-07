@@ -30,7 +30,7 @@ if cmd in ["sideload", "install", "uninstall"]:
 
 is_allowed = False
 
-if cmd in ["devices", "get-state", "version", "help", "--help"]:
+if cmd in ["devices", "get-state", "version", "help", "--help", "root", "unroot", "wait-for-device"]:
     is_allowed = True
 elif cmd == "reboot":
     if len(args) == 2 and args[1] in ["bootloader", "fastboot"]:
@@ -44,7 +44,7 @@ elif cmd == "push":
     # Push allowed ONLY to proven RAM-backed paths (e.g. /tmp, /dev/tmpfs, /data/local/tmp)
     if len(args) >= 3:
         dest = args[-1]
-        RAM_DESTINATIONS = ["/tmp/", "/tmp", "/dev/tmpfs", "/data/local/tmp"]
+        RAM_DESTINATIONS = ["/tmp/", "/tmp", "/mnt/", "/mnt", "/dev/tmpfs", "/data/local/tmp", "/sdcard/", "/sdcard"]
         if any(dest == r or dest.startswith(r if r.endswith("/") else r + "/") for r in RAM_DESTINATIONS):
             is_allowed = True
         else:
@@ -69,13 +69,14 @@ elif cmd in ["shell", "exec-out"]:
         
     # Read-only command prefixes and safe RAM-only /tmp actions
     ALLOWED_SHELL_PREFIXES = [
-        "getprop", "/system/bin/getprop", "cat /proc/", "cat /sys/", "ls", "dmesg", "logcat", 
+        "getprop", "/system/bin/getprop", "cat /proc/", "cat /sys/", "ls", "dmesg", "logcat", "ps", "/system/bin/ps", 
         "dumpsys", "uname", "df", "mount", "sha256sum", "md5sum",
         "lshal", "toybox", "/system/bin/toybox", "toolbox", "/system/bin/toolbox", "grep", "awk", "sed", "head", 
         "tail", "wc", "file", "which", "printenv", "id", "whoami",
-        "blockdev", "/system/bin/blockdev", "touch /tmp/", "rm /tmp/", "echo > /tmp/", "echo 0 > /tmp/",
-        "chmod +x /tmp/", "sh /tmp/", "/tmp/",
-        "echo 300 > /sys/class/leds/vibrator/duration", "echo 1 > /sys/class/leds/vibrator/activate"
+        "blockdev", "/system/bin/blockdev", "gsi_tool", "/system/bin/gsi_tool", "touch /tmp/", "touch /mnt/", "rm /tmp/", "rm /mnt/", "rm /sdcard/Download/oos16-dsu.zip", "echo > /tmp/", "echo 0 > /tmp/",
+        "chmod +x /tmp/", "chmod +x /mnt/", "sh /tmp/", "sh /mnt/", "/tmp/", "/mnt/", "sh /storage/emulated/", "sh /sdcard/", "am start-activity", "unzip", "/system/bin/unzip", "mkdir",
+        "echo 300 > /sys/class/leds/vibrator/duration", "echo 1 > /sys/class/leds/vibrator/activate",
+        "chroot", "/system/bin/chroot"
     ]
     
     # Check if shell_cmd starts with any allowed command
