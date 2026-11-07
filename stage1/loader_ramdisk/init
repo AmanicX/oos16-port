@@ -1,9 +1,11 @@
 #!/system/bin/sh
 # ==============================================================================
 # stage1/loader_ramdisk/init - Stage-1 RAM Boot Supervisor (PID 1)
+# Target: OnePlus 7T HD1901 (hotdogb), Snapdragon 855+ / SM8150, Adreno 640.
 # Strictly volatile RAM resident. Zero writes to physical flash.
 # Discovers physical storage, enforces block-level read-only locks,
-# manages watchdog heartbeat, stages images in RAM, and hands over PID 1 to Android init.
+# initialises device nodes via ueventd & binderfs, manages watchdog heartbeat,
+# stages images in RAM, and hands over PID 1 to Android init via exec.
 # ==============================================================================
 
 set +e
@@ -27,9 +29,24 @@ fatal_halt() {
 # 1. Mount Core Kernel Pseudo-Filesystems
 /system/bin/toybox mount -t proc proc /proc
 /system/bin/toybox mount -t sysfs sysfs /sys
-/system/bin/toybox mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
-/system/bin/toybox mkdir -p /dev/pts /dev/block /dev/socket /dev/usb-ffs /dev/usb-ffs/adb
+
+# Mount /dev using devtmpfs (with fallback to tmpfs if devtmpfs is not supported)
+if ! /system/bin/toybox mount -t devtmpfs devtmpfs /dev 2>/dev/null; then
+    /system/bin/toybox mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
+fi
+
+/system/bin/toybox mkdir -p /dev/pts /dev/block /dev/socket /dev/usb-ffs /dev/usb-ffs/adb /dev/binderfs /dev/dri /dev/graphics /dev/input
 /system/bin/toybox mount -t devpts devpts /dev/pts
+
+# Mount binderfs and create binder device nodes
+if /system/bin/toybox mount -t binder binder /dev/binderfs -o stats=global 2>/dev/null || \
+   /system/bin/toybox mount -t binder binder /dev/binderfs 2>/dev/null; then
+    [ -e /dev/binderfs/binder ] && /system/bin/toybox ln -sf /dev/binderfs/binder /dev/binder
+    [ -e /dev/binderfs/hwbinder ] && /system/bin/toybox ln -sf /dev/binderfs/hwbinder /dev/hwbinder
+    [ -e /dev/binderfs/vndbinder ] && /system/bin/toybox ln -sf /dev/binderfs/vndbinder /dev/vndbinder
+    /system/bin/toybox chmod 0666 /dev/binderfs/* /dev/binder /dev/hwbinder /dev/vndbinder 2>/dev/null || true
+    log_kmsg "[LOADER-PID1] Binderfs mounted and symlinks established."
+fi
 
 # 2. Create Essential Device Nodes
 [ ! -c /dev/null ] && /system/bin/toybox mknod /dev/null c 1 3
@@ -44,11 +61,101 @@ for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     [ ! -b /dev/loop$i ] && /system/bin/toybox mknod /dev/loop$i b 7 $i
 done
 
+# Ensure canonical ueventd.rc link exists in rootfs
+[ ! -f /ueventd.rc ] && [ -f /system/etc/ueventd.rc ] && /system/bin/toybox ln -sf /system/etc/ueventd.rc /ueventd.rc 2>/dev/null || true
+
+# 3. Launch ueventd & Trigger Coldboot for Dynamic Hardware Nodes
+if [ -x /system/bin/ueventd ]; then
+    /system/bin/ueventd &
+    UEVENTD_PID=$!
+    log_kmsg "[LOADER-PID1] Started ueventd background daemon (PID: $UEVENTD_PID)"
+fi
+
+log_kmsg "[LOADER-PID1] Triggering coldboot uevents across /sys..."
+for ufile in /sys/bus/*/devices/*/uevent /sys/class/*/*/uevent; do
+    [ -f "$ufile" ] && echo "add" > "$ufile" 2>/dev/null || true
+done
+
+# Dynamic sysfs device node creator fallback:
+create_dev_from_sysfs() {
+    local sysfs_dev="$1"
+    local target_node="$2"
+    local type="${3:-c}"
+    if [ -f "$sysfs_dev" ] && [ ! -e "$target_node" ]; then
+        local mm
+        mm=$(cat "$sysfs_dev" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$mm" ] && echo "$mm" | grep -q "^[0-9]\+:[0-9]\+$"; then
+            local maj="${mm%%:*}"
+            local min="${mm##*:}"
+            /system/bin/toybox mkdir -p "$(/system/bin/dirname "$target_node")" 2>/dev/null || true
+            /system/bin/toybox mknod "$target_node" "$type" "$maj" "$min" 2>/dev/null || true
+            /system/bin/toybox chmod 0666 "$target_node" 2>/dev/null || true
+            log_kmsg "[LOADER-PID1] Created device node $target_node ($type $maj:$min) from sysfs"
+        fi
+    fi
+}
+
+# DRM card0 & render nodes (Snapdragon 855 / Adreno 640)
+create_dev_from_sysfs "/sys/class/drm/card0/dev" "/dev/dri/card0" c
+create_dev_from_sysfs "/sys/class/drm/renderD128/dev" "/dev/dri/renderD128" c
+
+# Qualcomm Adreno KGSL 3D0
+create_dev_from_sysfs "/sys/class/misc/kgsl-3d0/dev" "/dev/kgsl-3d0" c
+
+# Framebuffer fb0
+create_dev_from_sysfs "/sys/class/graphics/fb0/dev" "/dev/graphics/fb0" c
+[ -e /dev/graphics/fb0 ] && [ ! -e /dev/fb0 ] && /system/bin/toybox ln -sf /dev/graphics/fb0 /dev/fb0 2>/dev/null || true
+
+# Binder fallback nodes if binderfs was not available
+[ ! -e /dev/binder ] && create_dev_from_sysfs "/sys/class/misc/binder/dev" "/dev/binder" c
+[ ! -e /dev/hwbinder ] && create_dev_from_sysfs "/sys/class/misc/hwbinder/dev" "/dev/hwbinder" c
+[ ! -e /dev/vndbinder ] && create_dev_from_sysfs "/sys/class/misc/vndbinder/dev" "/dev/vndbinder" c
+
+# Input event nodes
+for evsys in /sys/class/input/event*/dev; do
+    [ -f "$evsys" ] || continue
+    evname=$(basename "$(/system/bin/dirname "$evsys")")
+    create_dev_from_sysfs "$evsys" "/dev/input/$evname" c
+done
+
+# 4. Explicit Device Node Diagnostics
+log_kmsg "[LOADER-PID1] Checking critical device nodes for graphics and IPC..."
+if [ -c /dev/dri/card0 ]; then
+    log_kmsg "[LOADER-PID1] DRM graphics device verified: /dev/dri/card0"
+elif [ -d /sys/class/drm/card0 ]; then
+    log_kmsg "[LOADER-PID1 WARNING] /sys/class/drm/card0 exists but /dev/dri/card0 could not be created!"
+else
+    log_kmsg "[LOADER-PID1] Note: Kernel DRM driver /sys/class/drm/card0 not detected (may initialise with display HAL)."
+fi
+
+if [ -c /dev/kgsl-3d0 ]; then
+    log_kmsg "[LOADER-PID1] Adreno 640 GPU device verified: /dev/kgsl-3d0"
+elif [ -d /sys/class/misc/kgsl-3d0 ]; then
+    log_kmsg "[LOADER-PID1 WARNING] /sys/class/misc/kgsl-3d0 exists but /dev/kgsl-3d0 could not be created!"
+else
+    log_kmsg "[LOADER-PID1] Note: Adreno KGSL driver /sys/class/misc/kgsl-3d0 not detected."
+fi
+
+if [ -c /dev/binder ] && [ -c /dev/hwbinder ] && [ -c /dev/vndbinder ]; then
+    log_kmsg "[LOADER-PID1] Binder IPC devices verified: binder, hwbinder, vndbinder."
+else
+    log_kmsg "[LOADER-PID1 WARNING] Binder IPC device nodes incomplete!"
+fi
+
+# Screen backlight power-on for Samsung AMOLED DSI panel
+if [ -f /sys/class/backlight/panel0-backlight/brightness ]; then
+    echo 200 > /sys/class/backlight/panel0-backlight/brightness 2>/dev/null || true
+    log_kmsg "[LOADER-PID1] Screen backlight powered on (panel0-backlight: 200)."
+elif [ -f /sys/class/leds/lcd-backlight/brightness ]; then
+    echo 200 > /sys/class/leds/lcd-backlight/brightness 2>/dev/null || true
+    log_kmsg "[LOADER-PID1] Screen backlight powered on (lcd-backlight: 200)."
+fi
+
 log_kmsg "=========================================================="
 log_kmsg "  STAGE-1 RAM LOADER SUPERVISOR (PID 1) STARTING         "
 log_kmsg "=========================================================="
 
-# 3. Dynamic Physical Storage Discovery & Mandatory Read-Only Verification
+# 5. Dynamic Physical Storage Discovery & Mandatory Read-Only Verification
 log_kmsg "[LOADER-PID1] Discovering physical storage block devices..."
 PHYSICAL_DEV_COUNT=0
 LOCKED_DEV_COUNT=0
@@ -122,12 +229,12 @@ fi
 
 log_kmsg "[LOADER-PID1] Storage verified: $LOCKED_DEV_COUNT/$PHYSICAL_DEV_COUNT physical devices locked strictly read-only."
 
-# 4. Mount RAM Volatile Staging Filesystems
+# 6. Mount RAM Volatile Staging Filesystems
 /system/bin/toybox mount -t tmpfs -o mode=0777,size=6500M tmpfs /mnt
 /system/bin/toybox mount -t tmpfs -o mode=0777,size=512M tmpfs /tmp
 log_kmsg "[LOADER-PID1] RAM staging tmpfs mounted (6500MB available at /mnt)"
 
-# 5. Configure USB Gadget for Root ADB
+# 7. Configure USB Gadget for Root ADB
 log_kmsg "[LOADER-PID1] Configuring USB gadget for ADB..."
 /system/bin/toybox mount -t configfs none /config || true
 /system/bin/toybox mkdir -p /config/usb_gadget/g1
@@ -161,7 +268,7 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
     }
 done
 
-# 6. Active Watchdog Supervisor & Heartbeat Monitor
+# 8. Active Watchdog Supervisor & Heartbeat Monitor
 if [ -x /system/bin/watchdog.sh ]; then
     /system/bin/sh /system/bin/watchdog.sh &
     WATCHDOG_PID=$!
@@ -172,7 +279,7 @@ elif [ -f /scripts/watchdog.sh ]; then
     log_kmsg "[LOADER-PID1] Safety watchdog supervisor active (PID: $WATCHDOG_PID)"
 fi
 
-# 7. Await Boot Trigger (/mnt/boot_now)
+# 9. Await Boot Trigger (/mnt/boot_now)
 log_kmsg "[LOADER-PID1] Staging area ready. Waiting for runner image transfer and /mnt/boot_now trigger..."
 while [ ! -f /mnt/boot_now ] && [ ! -f /tmp/boot_now ]; do
     if [ "$UDC_BOUND" -eq 0 ]; then
@@ -187,7 +294,7 @@ done
 log_kmsg "[LOADER-PID1] Trigger received (/mnt/boot_now)! Handing over execution to Stage-2..."
 /system/bin/toybox rm -f /mnt/boot_now /tmp/boot_now 2>/dev/null || true
 
-# 8. Transfer Execution to Stage-2 Android Bringup (PID 1 preserved)
+# 10. Transfer Execution to Stage-2 Android Bringup (PID 1 preserved)
 if [ -x /system/bin/stage2_init.sh ]; then
     log_kmsg "[LOADER-PID1] Handing over execution to /system/bin/stage2_init.sh as PID 1..."
     exec /system/bin/sh /system/bin/stage2_init.sh

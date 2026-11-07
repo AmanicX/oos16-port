@@ -5,7 +5,7 @@
 [![Device](https://img.shields.io/badge/Device-OnePlus%207T%20(hotdogb)-blue.svg)](https://wiki.lineageos.org/devices/hotdogb/)
 [![SoC](https://img.shields.io/badge/SoC-Snapdragon%20855%2B%20(SM8150--AC)-orange.svg)](https://www.qualcomm.com/)
 [![Storage](https://img.shields.io/badge/Storage-100%25%20Read--Only%20RAM-red.svg)](#non-negotiable-safety-contract)
-[![Tests](https://img.shields.io/badge/Tests-34%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Tests](https://img.shields.io/badge/Tests-64%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
 
 ---
 
@@ -83,46 +83,78 @@ oos16-port/
 
 ---
 
-## 5. Stage 1 vs. Stage 2 Execution Flow
+## 5. Stage 1 vs. Stage 2 Execution Flow & PID 1 Preservation
 
-### Two Supported Stage-1 Ramdisk Architectures:
+### Legitimate PID 1 Architecture:
+Both `loader.img` and `stage1.img` enforce a strict single-process replacement chain (`exec`), ensuring **no competing inits** run simultaneously and that Android's second stage init executes with legitimate `PID == 1`:
+```text
+Kernel Boot (/init as PID 1)
+   │
+   ▼
+Stage-1 RAM Supervisor (PID 1)
+   ├── Dynamic storage discovery & hardware write-locks (blockdev --setro)
+   ├── Kernel filesystem mounts (proc, sys, devtmpfs/tmpfs)
+   ├── Binderfs mount & symlinks (/dev/binder, /dev/hwbinder, /dev/vndbinder)
+   ├── ueventd startup & sysfs coldboot uevent trigger
+   ├── AMOLED backlight initialization (panel0-backlight = 200)
+   ├── Volatile RAM staging (/mnt 6500MB tmpfs, /tmp 512MB tmpfs)
+   ├── Root USB gadget adbd daemon
+   ├── Safety watchdog supervisor (/system/bin/watchdog.sh)
+   └── Await /mnt/boot_now trigger
+   │
+   ▼ (exec /system/bin/sh /system/bin/stage2_init.sh — PID 1 PRESERVED)
+Stage-2 Orchestrator (PID 1)
+   ├── Safety verification (blockdev --getro, 0 writable mounts)
+   ├── Base system EROFS + OverlayFS root (/mnt/sysroot)
+   ├── Child partition mounts (system_ext, product, vendor, odm)
+   ├── Canonical AOSP APEX versioned directories & active symlinks:
+   │     /apex/<mod>@<version> (directory) & /apex/<mod> (symlink)
+   ├── Ephemeral RAM /data (1024MB tmpfs) & Binder / Dev / Proc / Sys bind mounts
+   ├── Display diagnostics (DRM card0, KGSL Adreno 640, SurfaceFlinger, Composer HAL)
+   ├── Watchdog cancellation via /mnt/watchdog_cancel regular file
+   └── Unbind USB gadget & stop Stage-1 adbd
+   │
+   ▼ (exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage — PID 1 PRESERVED)
+OxygenOS 16 Android Init Second Stage (PID 1)
+```
+
+### Two Consistent Stage-1 Ramdisk Implementations:
 1. **Loader Ramdisk (`build/loader.img`)**:
-   * Uses a standalone POSIX shell script as PID 1 (`/init`).
-   * Mounts essential kernel filesystems (`/dev`, `/proc`, `/sys`), volatile RAM staging (`/tmp`, `/mnt`).
-   * Dynamically discovers and write-locks all physical storage (`blockdev --setro`).
-   * Launches `/system/bin/watchdog.sh` in background.
-   * Starts `adbd` with embedded `adbkey.pub` for root debugging.
-   * Awaits `/mnt/boot_now` trigger, consumes it once, and executes `/system/bin/stage2_init.sh`.
+   * Standalone POSIX supervisor script as `/init` (PID 1).
+   * Configures `devtmpfs` with `tmpfs` fallback, mounts `binderfs`, and launches `ueventd`.
+   * Triggers coldboot uevents across `/sys` and scans sysfs for DRM `/dev/dri/card0` and Adreno `/dev/kgsl-3d0`.
+   * Enforces blockdev read-only locks, stages RAM tmpfs, and performs `exec` handover to Stage-2.
 2. **Native Ramdisk (`build/stage1.img`)**:
-   * Uses Android static `init` running with `init.rc`.
-   * Invokes `/system/bin/recovery` as root supervisor.
-   * Dynamically locks physical storage and child partitions, spawns continuous safety guard loop.
-   * Launches `/system/bin/watchdog.sh` in background.
-   * Awaits `/mnt/boot_now` trigger, consumes it once, and executes `/system/bin/stage2_init.sh`.
+   * Uses the identical Stage-1 supervisor as `/init` (PID 1), eliminating intermediate recovery child services.
+   * Ensures `/mnt` has `size=6500M tmpfs` mounted in `init.rc`.
+   * Ensures identical write-lock, `ueventd`, watchdog, and `exec` handover semantics.
 
 ### Host Runner Orchestration (`tools/safe/run_stage2.sh`):
 1. Verifies phone connection via `tools/safe/adb get-state`.
 2. Dynamically queries target physical storage (`/sys/block/*`) and child partitions; confirms `blockdev --getro == 1` across all.
-3. Confirms `/mnt` is mounted as RAM `tmpfs`.
+3. Confirms `/mnt` is mounted as RAM `tmpfs` and verifies $\ge 6000\text{ MB}$ free capacity.
 4. Starts active host safety heartbeat loop (`touch /mnt/watchdog_heartbeat` every 5s).
 5. Validates host images, calculates host SHA-256 hashes, transfers images to RAM (`/mnt/`), and verifies device-side SHA-256 checksums match host calculation:
-   * **Mandatory images**: `system.erofs.img`, `system_ext.erofs.img`, `vendor.erofs.img`, `odm.erofs.img`, `my_product.erofs.img` (or `product.erofs.img`), `runtime_apex.img`, and `runtime_apex.fstype`.
-   * **Bootstrap APEX images**: `art_apex.img`, `i18n_apex.img`, `tzdata_apex.img` (+ metadata).
-   * **Optional images**: `my_region.erofs.img`.
-6. Activates Stage-1 boot supervisor trigger via `touch /mnt/boot_now`.
+   * **Mandatory partition images**: `system.erofs.img`, `system_ext.erofs.img`, `vendor.erofs.img`, `odm.erofs.img`, `my_product.erofs.img` (or `product.erofs.img`).
+   * **Mandatory bootstrap APEX modules**: `runtime_apex.img`, `art_apex.img`, `i18n_apex.img`, `tzdata_apex.img` (+ `.fstype` and `.version` metadata).
+   * **Optional partition images**: `my_region.erofs.img`.
+6. Activates Stage-1 boot supervisor trigger via `touch /mnt/boot_now` and maintains heartbeats until acknowledged.
 
 ### Phone-Side Stage-2 Handover (`scripts/stage2_init.sh`):
-1. Disarms watchdog timer via `touch /mnt/watchdog_cancel`.
-2. Re-verifies all physical block devices are read-only (`ro=1`) and live mounts have zero writable physical partitions.
-3. Sets up OverlayFS mount on `/mnt/sysroot` backed by volatile tmpfs upper layer.
-4. Loop-mounts all staged partition images into `/mnt/sysroot/{system,system_ext,vendor,odm,product,my_product,my_region}`.
-5. Populates and verifies Android 16 APEX bootstrap modules:
-   * `com.android.runtime` (Bionic `linker64`, `libc.so`, `libm.so`, `libdl.so`)
-   * `com.android.art` (`libart.so`, `dalvikvm64`)
-   * `com.android.i18n` (ICU libraries)
-   * `com.android.tzdata` (Timezone data)
-6. Mounts ephemeral `/data` tmpfs (1024 MB in RAM).
-7. Transitions root and executes `/system/bin/init second_stage` as PID 1.
+1. Re-verifies all physical block devices are read-only (`ro=1`) and live mounts have zero writable physical partitions.
+2. Sets up OverlayFS mount on `/mnt/sysroot` backed by volatile tmpfs upper layer.
+3. Loop-mounts all staged partition images into `/mnt/sysroot/{system,system_ext,vendor,odm,product,my_product,my_region}`.
+4. Populates and verifies Android 16 APEX bootstrap modules in canonical versioned structure:
+   * Payload directories: `/mnt/sysroot/apex/${mod_name}@${version}`
+   * Active symlinks: `/mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}`
+   * `com.android.runtime@1` (Bionic `linker64`, `libc.so`, `libm.so`, `libdl.so`)
+   * `com.android.art@361501120` (`libart.so`, `dalvikvm64`)
+   * `com.android.i18n@1` (ICU libraries)
+   * `com.android.tzdata@361157000` (Timezone data)
+5. Mounts ephemeral `/data` tmpfs (1024 MB in RAM) and binds `/dev`, `/dev/pts`, `/proc`, `/sys`.
+6. Performs display diagnostics: confirms DRM card0, KGSL 3D0, SurfaceFlinger binary, Composer HAL, and powers on AMOLED backlight.
+7. Disarms Stage-1 watchdog cleanly by creating regular file `/mnt/watchdog_cancel` only after all mounts succeed. (On any failure, `fatal()` halts without disarming, ensuring safety reboot to bootloader).
+8. Replaces process image via `exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage` (PID 1).
 
 ---
 
@@ -188,8 +220,8 @@ To maintain rigorous engineering honesty, verification states are strictly parti
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (21/21)** | Passed on `build/loader.img` and `build/stage1.img` with zero mandatory unverified checks. |
-| **Tier 3: Host Tests Passed** | Automated Python & Shell unit/integration test suites | **PASSED (34/34)** | 100% pass across ADB proxy, Fastboot proxy, Watchdog protocol, and Stage-2 runner mocks. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (23/23)** | Passed on `build/loader.img` and `build/stage1.img` with zero mandatory unverified checks. |
+| **Tier 3: Host Tests Passed** | Automated Python & Shell unit/integration test suites | **PASSED (64/64)** | 100% pass across ADB proxy (8), Fastboot proxy (3), Watchdog protocol (10), and Stage-2 runner integration mocks (43). |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all 10 Stage-2 images generated with valid SHA256SUMS. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |

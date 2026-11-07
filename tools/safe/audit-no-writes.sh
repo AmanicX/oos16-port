@@ -376,6 +376,38 @@ else
     audit_fail "Safety watchdog" "Missing watchdog monitor in one or more Stage-1 ramdisks"
 fi
 
+# 5. Device Node Management & ueventd
+if grep -q "ueventd" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null && \
+   grep -q "binderfs" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null; then
+    audit_pass "Dynamic device node initialization (ueventd and binderfs) verified in Stage-1 supervisor"
+else
+    audit_fail "Device node initialization" "Missing ueventd or binderfs initialization in Stage-1 supervisor"
+fi
+
+# 6. Memory Staging Sizing (/mnt >= 6000M tmpfs)
+if grep -qE "size=6[0-9]{3}M.* /mnt|size=6[0-9]{3}M.*tmpfs /mnt" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null; then
+    audit_pass "RAM staging directory /mnt sizing verified (>= 6000M tmpfs)"
+else
+    audit_fail "RAM staging capacity" "/mnt does not allocate >= 6000M tmpfs in Stage-1 supervisor"
+fi
+
+# 7. APEX Canonical Versioned Directory & Symlink Structure
+if grep -qE '\$\{mod_name\}@\$\{version\}' "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null && \
+   grep -qE 'ln -sfn' "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null; then
+    audit_pass "Canonical AOSP APEX versioned directories and active symlinks verified in stage2_init"
+else
+    audit_fail "APEX symlink structure" "stage2_init lacks canonical APEX versioned directories or active symlinks"
+fi
+
+# 8. Physical Storage Block Layer Verification before Mount
+FIRST_RO_CHECK=$(grep -n "blockdev --getro" "$PROJECT_ROOT/scripts/stage2_init.sh" | head -n 1 | cut -d: -f1 || echo "999")
+FIRST_MOUNT=$(grep -n "^[[:space:]]*mount_or_fail " "$PROJECT_ROOT/scripts/stage2_init.sh" | head -n 1 | cut -d: -f1 || echo "0")
+if [ "$FIRST_RO_CHECK" -lt "$FIRST_MOUNT" ]; then
+    audit_pass "Physical storage blockdev read-only locks verified prior to filesystem mount"
+else
+    audit_fail "Mount safety sequencing" "Physical storage lock verification ($FIRST_RO_CHECK) does not precede filesystem mounts ($FIRST_MOUNT)"
+fi
+
 # 5. Summary & Disclaimer
 TOTAL_INSPECTED="${#INSPECTED_FILES[@]}"
 echo "==========================================================" | tee -a "$REPORT_FILE"

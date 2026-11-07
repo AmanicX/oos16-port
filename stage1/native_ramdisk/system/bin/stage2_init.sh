@@ -1,9 +1,11 @@
 #!/system/bin/sh
 # ==============================================================================
 # stage2_init.sh - Stage-2 Android 16 Bringup in RAM on OnePlus 7T (HD1901)
+# Target: OnePlus 7T HD1901 (hotdogb), Snapdragon 855+ / SM8150, Adreno 640.
 # 100% Volatile RAM resident, Zero Physical Storage Writes.
 # Handles strict OverlayFS root, mandatory partition verification,
-# strict Bionic runtime APEX validation, and single PID 1 Android init handover.
+# canonical AOSP APEX versioned directories & active symlinks, display
+# diagnostics for 60Hz AMOLED panel, watchdog handover, and single PID 1 handover.
 # ==============================================================================
 
 set -e
@@ -17,10 +19,11 @@ echo "=== STAGE-2 RAM BRINGUP STARTING ===" > /dev/kmsg
 echo 300 > /sys/class/leds/vibrator/duration 2>/dev/null || true
 echo 1 > /sys/class/leds/vibrator/activate 2>/dev/null || true
 
-# Helper for fatal errors - logs to kmsg and halts safely
+# Helper for fatal errors - logs to kmsg and halts safely without disarming watchdog
 fatal() {
     echo "[STAGE2 FATAL] $1" > /dev/kmsg
     echo "[STAGE2 FATAL] $1" >&2
+    echo "[STAGE2 FATAL] System halted in safe RAM state. Safety watchdog will reboot to bootloader." > /dev/kmsg
     while true; do
         /system/bin/toybox sleep 60
     done
@@ -86,6 +89,12 @@ fi
 # Verify /mnt and /tmp are mounted as RAM-backed tmpfs
 if ! /system/bin/toybox mount | grep -q " /mnt type tmpfs "; then
     fatal "CRITICAL SAFETY FAILURE: Staging directory /mnt is not mounted as RAM tmpfs!"
+fi
+
+# Verify /mnt has sufficient capacity for staged images
+MNT_FREE_MB=$(/system/bin/toybox df -m /mnt 2>/dev/null | /system/bin/toybox awk 'NR>1 {print $4}' | /system/bin/toybox tr -d '[:space:]')
+if [ -n "$MNT_FREE_MB" ] && [ "$MNT_FREE_MB" -lt 6000 ] 2>/dev/null; then
+    echo "[STAGE2 WARNING] /mnt has only ${MNT_FREE_MB}MB free space, recommended >= 6000MB." > /dev/kmsg
 fi
 
 echo "[STAGE2] Verified: All $DISCOVERED_PHYSICAL physical storage devices and partitions are strictly locked read-only (ro=1)." > /dev/kmsg
@@ -199,17 +208,34 @@ ODM_IMG=$(get_img "odm.img")
 [ -n "$ODM_IMG" ] || fatal "Mandatory odm.img not found in /mnt/ or /tmp/!"
 mount_partition "odm" "$ODM_IMG" 1
 
-# 7. Strict Android 16 Bootstrap APEX Handling & Validation
+# 7. Strict Android 16 Bootstrap APEX Handling & Canonical Versioned Directories
 echo "[STAGE2] Preparing Android 16 bootstrap APEX environments on tmpfs..." > /dev/kmsg
 mount_or_fail -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/apex
 
 populate_apex() {
     local mod_name="$1"
     local img_name="$2"
-    local target_dir="/mnt/sysroot/apex/$mod_name"
     local mandatory="${3:-1}"
 
-    /system/bin/toybox mkdir -p "$target_dir"
+    # Determine authentic package version code
+    local version="1"
+    if [ -f "/mnt/${img_name%.img}.version" ]; then
+        version=$(cat "/mnt/${img_name%.img}.version" | tr -d '[:space:]')
+    elif [ -f "/tmp/${img_name%.img}.version" ]; then
+        version=$(cat "/tmp/${img_name%.img}.version" | tr -d '[:space:]')
+    elif [ "$mod_name" = "com.android.art" ]; then
+        version="361501120"
+    elif [ "$mod_name" = "com.android.tzdata" ]; then
+        version="361157000"
+    fi
+
+    # Canonical AOSP structure:
+    # Payload directory: /mnt/sysroot/apex/${mod_name}@${version}
+    # Active symlink:    /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
+    local versioned_dir="/mnt/sysroot/apex/${mod_name}@${version}"
+    local active_symlink="/mnt/sysroot/apex/${mod_name}"
+
+    /system/bin/toybox mkdir -p "$versioned_dir"
     /system/bin/toybox mkdir -p "/tmp/apex_stage_${mod_name}"
 
     local img_path=$(get_img "$img_name")
@@ -221,9 +247,9 @@ populate_apex() {
         elif [ -f "/tmp/${img_name%.img}.fstype" ]; then
             fstype=$(cat "/tmp/${img_name%.img}.fstype" | tr -d '[:space:]')
         fi
-        echo "[STAGE2] Staging $mod_name from image $img_path (fstype: $fstype)..." > /dev/kmsg
+        echo "[STAGE2] Staging $mod_name to $versioned_dir from image $img_path (fstype: $fstype)..." > /dev/kmsg
         mount_or_fail -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"
-        /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$target_dir/" || fatal "Failed to copy $mod_name payload!"
+        /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy $mod_name payload!"
         /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
     else
         # Fallback to authentic donor partition packages in /mnt/sysroot/system/apex/
@@ -248,7 +274,7 @@ populate_apex() {
                 local pimg="$unpack_tmp/apex_payload.img"
                 mount_or_fail -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" 2>/dev/null || \
                 mount_or_fail -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"
-                /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$target_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
+                /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
                 /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
             elif /system/bin/unzip -q "$donor_apex" "original_apex" -d "$unpack_tmp" 2>/dev/null; then
                 local orig_apex="$unpack_tmp/original_apex"
@@ -256,7 +282,7 @@ populate_apex() {
                     local pimg="$unpack_tmp/orig/apex_payload.img"
                     mount_or_fail -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" 2>/dev/null || \
                     mount_or_fail -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"
-                    /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$target_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
+                    /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
                     /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
                 fi
             fi
@@ -266,8 +292,15 @@ populate_apex() {
         fi
     fi
 
-    # Create canonical versioned symlink
-    /system/bin/toybox ln -sf "$mod_name" "/mnt/sysroot/apex/${mod_name}@1" 2>/dev/null || true
+    # Establish canonical active symlink pointing to versioned payload directory:
+    # /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
+    /system/bin/toybox rm -rf "$active_symlink" 2>/dev/null || true
+    (cd /mnt/sysroot/apex && /system/bin/toybox ln -sfn "${mod_name}@${version}" "$mod_name")
+
+    # Establish backward-compatibility convenience link @1 if version != 1
+    if [ "$version" != "1" ]; then
+        (cd /mnt/sysroot/apex && /system/bin/toybox ln -sfn "${mod_name}@${version}" "${mod_name}@1" 2>/dev/null || true)
+    fi
 }
 
 # Populate all 4 required Android bootstrap APEX modules
@@ -328,7 +361,36 @@ mount_or_fail -t tmpfs tmpfs /mnt/sysroot/dev/socket
 /system/bin/toybox mkdir -p /mnt/sysroot/dev/graphics
 /system/bin/toybox ln -s /dev/dri/card0 /mnt/sysroot/dev/graphics/fb0 2>/dev/null || true
 
-# 11. Final Mount Layout Verification
+# 11. Display Subsystem Diagnostics & AMOLED Configuration
+echo "[STAGE2] Running display subsystem diagnostics..." > /dev/kmsg
+if [ -c /mnt/sysroot/dev/dri/card0 ] || [ -c /dev/dri/card0 ]; then
+    echo "[STAGE2] DRM display controller verified: /dev/dri/card0 present." > /dev/kmsg
+else
+    echo "[STAGE2 WARNING] DRM /dev/dri/card0 node missing! SurfaceFlinger display composition may fail." > /dev/kmsg
+fi
+
+if [ -c /mnt/sysroot/dev/kgsl-3d0 ] || [ -c /dev/kgsl-3d0 ]; then
+    echo "[STAGE2] Adreno 640 GPU controller verified: /dev/kgsl-3d0 present." > /dev/kmsg
+else
+    echo "[STAGE2 WARNING] Adreno /dev/kgsl-3d0 node missing! 3D GPU acceleration may fall back to swiftshader." > /dev/kmsg
+fi
+
+# AMOLED Backlight status
+if [ -f /sys/class/backlight/panel0-backlight/brightness ]; then
+    echo 200 > /sys/class/backlight/panel0-backlight/brightness 2>/dev/null || true
+    echo "[STAGE2] Samsung AMOLED DSI panel backlight set to 200." > /dev/kmsg
+fi
+
+# Verify SurfaceFlinger binary presence
+if [ -f /mnt/sysroot/system/bin/surfaceflinger ]; then
+    echo "[STAGE2] SurfaceFlinger binary verified: /system/bin/surfaceflinger." > /dev/kmsg
+fi
+if [ -f /mnt/sysroot/vendor/bin/hw/android.hardware.graphics.composer@2.4-service ] || \
+   [ -f /mnt/sysroot/vendor/bin/hw/vendor.qti.hardware.display.composer-service ]; then
+    echo "[STAGE2] Hardware Composer service binary verified in vendor partition." > /dev/kmsg
+fi
+
+# 12. Final Mount Layout Verification
 echo "[STAGE2] Verifying complete mount layout in /proc/mounts..." > /dev/kmsg
 MANDATORY_MOUNTS="/mnt/sysroot /mnt/sysroot/system_ext /mnt/sysroot/vendor /mnt/sysroot/odm /mnt/sysroot/product /mnt/sysroot/apex /mnt/sysroot/data /mnt/sysroot/dev /mnt/sysroot/proc /mnt/sysroot/sys /mnt/sysroot/linkerconfig"
 for target in $MANDATORY_MOUNTS; do
@@ -338,7 +400,13 @@ for target in $MANDATORY_MOUNTS; do
 done
 echo "[STAGE2] All mandatory filesystems verified in /proc/mounts." > /dev/kmsg
 
-# 12. Android Init Handover
+# 13. Watchdog Handover & Cancellation
+echo "[STAGE2] Disarming Stage-1 watchdog supervisor before Android init handover..." > /dev/kmsg
+/system/bin/toybox rm -f /mnt/watchdog_cancel /tmp/watchdog_cancel 2>/dev/null || true
+echo "cancel" > /mnt/watchdog_cancel 2>/dev/null || true
+echo "cancel" > /tmp/watchdog_cancel 2>/dev/null || true
+
+# 14. Android Init Handover (PID 1 preserved via exec)
 echo "[STAGE2] ALL RAM FILESYSTEMS READY. EXECUTING ANDROID 16 INIT SECOND_STAGE AS PID 1..." > /dev/kmsg
 
 # Stop Stage-1 adbd and unbind USB gadget controller cleanly

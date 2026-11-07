@@ -173,13 +173,19 @@ sys.exit(0)
             "odm.erofs.img",
             "my_product.erofs.img",
             "my_region.erofs.img",
-            "runtime_apex.img"
+            "runtime_apex.img",
+            "art_apex.img",
+            "i18n_apex.img",
+            "tzdata_apex.img",
         ]
         for img in images:
             with open(os.path.join(img_dir, img), "wb") as f:
                 f.write(b"MOCK_IMAGE_DATA_" + img.encode())
-        with open(os.path.join(img_dir, "runtime_apex.fstype"), "w") as f:
-            f.write("erofs\n")
+        for apex in ["runtime_apex", "art_apex", "i18n_apex", "tzdata_apex"]:
+            with open(os.path.join(img_dir, f"{apex}.fstype"), "w") as f:
+                f.write("erofs\n")
+            with open(os.path.join(img_dir, f"{apex}.version"), "w") as f:
+                f.write("1\n")
 
     def test_runner_compatibility_and_success(self):
         """
@@ -588,7 +594,52 @@ EOF
 
         res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("Mandatory runtime APEX image (runtime_apex.img) not found", res.stderr + res.stdout)
+        self.assertIn("Mandatory APEX image runtime_apex.img not found", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_missing_art_apex(self):
+        """Verify runner halts if mandatory art_apex.img is missing."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "missing_art_images")
+        self.create_dummy_images(test_images)
+        os.remove(os.path.join(test_images, "art_apex.img"))
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Mandatory APEX image art_apex.img not found", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_missing_i18n_apex(self):
+        """Verify runner halts if mandatory i18n_apex.img is missing."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "missing_i18n_images")
+        self.create_dummy_images(test_images)
+        os.remove(os.path.join(test_images, "i18n_apex.img"))
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Mandatory APEX image i18n_apex.img not found", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_missing_tzdata_apex(self):
+        """Verify runner halts if mandatory tzdata_apex.img is missing."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "missing_tzdata_images")
+        self.create_dummy_images(test_images)
+        os.remove(os.path.join(test_images, "tzdata_apex.img"))
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Mandatory APEX image tzdata_apex.img not found", res.stderr + res.stdout)
 
     def test_runner_aborts_on_empty_apex_metadata(self):
         """Verify runner halts if APEX metadata .fstype file exists but is 0 bytes."""
@@ -708,6 +759,105 @@ exit 1
         self.assertTrue(os.path.exists(valid_sentinel), "Previous valid image was lost during failure!")
         with open(valid_sentinel) as f:
             self.assertEqual(f.read(), "PREVIOUS_VALID_IMAGE_DATA")
+
+    def test_pid1_preservation_architecture(self):
+        """Verify PID 1 preservation across Stage-1 supervisor and Stage-2 handover."""
+        loader_init = os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk/init")
+        native_init = os.path.join(PROJECT_ROOT, "stage1/native_ramdisk/init")
+        stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+
+        with open(loader_init) as f:
+            loader_content = f.read()
+        with open(stage2_script) as f:
+            stage2_content = f.read()
+
+        # Verify Stage-1 supervisor replaces itself via exec to maintain PID 1
+        self.assertIn("exec /system/bin/sh /system/bin/stage2_init.sh", loader_content)
+        # Verify Stage-2 replaces itself with Android init second_stage via exec as PID 1
+        self.assertIn("exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage", stage2_content)
+
+        # Verify native_ramdisk/init is an executable script supervisor, not a recovery init symlink
+        self.assertTrue(os.path.isfile(native_init))
+        self.assertFalse(os.path.islink(native_init))
+        with open(native_init) as f:
+            native_content = f.read()
+        self.assertTrue(native_content.startswith("#!/system/bin/sh"))
+        self.assertIn("exec /system/bin/sh /system/bin/stage2_init.sh", native_content)
+
+    def test_ueventd_and_coldboot_trigger(self):
+        """Verify ueventd startup, ueventd.rc link, and coldboot trigger in Stage-1 init."""
+        loader_init = os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk/init")
+        with open(loader_init) as f:
+            content = f.read()
+
+        self.assertIn("/system/bin/ueventd &", content)
+        self.assertIn("ueventd.rc", content)
+        self.assertIn('echo "add" > "$ufile"', content)
+        self.assertIn("/sys/bus/*/devices/*/uevent", content)
+
+    def test_binderfs_mount_and_symlinks(self):
+        """Verify binderfs initialization and symlink creation in Stage-1 init."""
+        loader_init = os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk/init")
+        with open(loader_init) as f:
+            content = f.read()
+
+        self.assertIn("mount -t binder binder /dev/binderfs", content)
+        self.assertIn("ln -sf /dev/binderfs/binder /dev/binder", content)
+        self.assertIn("ln -sf /dev/binderfs/hwbinder /dev/hwbinder", content)
+        self.assertIn("ln -sf /dev/binderfs/vndbinder /dev/vndbinder", content)
+
+    def test_canonical_apex_versioned_directory_structure(self):
+        """Verify authentic AOSP APEX versioned directory layout and active symlinks."""
+        stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+        with open(stage2_script) as f:
+            content = f.read()
+
+        # Verify versioned payload directory: /mnt/sysroot/apex/${mod_name}@${version}
+        self.assertIn('versioned_dir="/mnt/sysroot/apex/${mod_name}@${version}"', content)
+        # Verify active symlink: /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
+        self.assertIn('ln -sfn "${mod_name}@${version}" "$mod_name"', content)
+        # Verify fallback version codes for authentic packages
+        self.assertIn('version="361501120"', content)
+        self.assertIn('version="361157000"', content)
+
+    def test_watchdog_cancellation_lifecycle(self):
+        """Verify watchdog cancel file creation before Android init handover and preservation on failure."""
+        stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+        with open(stage2_script) as f:
+            content = f.read()
+
+        # Verify regular file creation for cancel
+        self.assertIn('echo "cancel" > /mnt/watchdog_cancel', content)
+        # Verify fatal() halts without creating watchdog_cancel
+        fatal_fn = content.split("fatal() {")[1].split("}")[0]
+        self.assertNotIn("watchdog_cancel", fatal_fn)
+        self.assertIn("Safety watchdog will reboot to bootloader", fatal_fn)
+
+    def test_display_prerequisites_and_60hz_properties(self):
+        """Verify display hardware checks and fixed 60Hz AMOLED properties."""
+        stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+        build_erofs = os.path.join(PROJECT_ROOT, "scripts/build_stage2_erofs.sh")
+
+        with open(stage2_script) as f:
+            s2_content = f.read()
+        with open(build_erofs) as f:
+            erofs_content = f.read()
+
+        # Stage 2 checks DRM card0 and KGSL 3D0
+        self.assertIn("/dev/dri/card0", s2_content)
+        self.assertIn("/dev/kgsl-3d0", s2_content)
+        self.assertIn("panel0-backlight", s2_content)
+
+        # 60Hz display properties configured in vendor build.prop
+        for prop in [
+            "ro.surface_flinger.game_default_frame_rate_override=60",
+            "ro.surface_flinger.enable_frame_rate_override=false",
+            "persist.sys.sf.native_mode=0",
+            "vendor.display.enable_optimize_refresh=1",
+            "debug.sf.frame_rate_multiple_threshold=60",
+            "ro.vendor.display.default_fps=60",
+        ]:
+            self.assertIn(prop, erofs_content)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

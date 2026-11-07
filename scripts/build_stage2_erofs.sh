@@ -207,7 +207,9 @@ if [ -f "$VENDOR_PROP" ]; then
         "ro.surface_flinger.game_default_frame_rate_override=60" \
         "ro.surface_flinger.enable_frame_rate_override=false" \
         "persist.sys.sf.native_mode=0" \
-        "vendor.display.enable_optimize_refresh=1"; do
+        "vendor.display.enable_optimize_refresh=1" \
+        "debug.sf.frame_rate_multiple_threshold=60" \
+        "ro.vendor.display.default_fps=60"; do
         key="${prop%%=*}"
         if grep -q "^$key=" "$VENDOR_PROP"; then
             sed -i "s|^$key=.*|$prop|" "$VENDOR_PROP"
@@ -396,9 +398,62 @@ extract_and_stage_apex() {
         fi
     fi
 
+    # Extract authentic APEX version code from manifest
+    local pkg_version="1"
+    pkg_version=$(python3 -c "
+import zipfile, sys, io
+try:
+    with zipfile.ZipFile('$target_pkg', 'r') as z:
+        pb_data = None
+        if 'apex_manifest.pb' in z.namelist():
+            pb_data = z.read('apex_manifest.pb')
+        elif 'original_apex' in z.namelist():
+            with zipfile.ZipFile(io.BytesIO(z.read('original_apex')), 'r') as oz:
+                if 'apex_manifest.pb' in oz.namelist():
+                    pb_data = oz.read('apex_manifest.pb')
+        if pb_data:
+            idx = 0
+            while idx < len(pb_data):
+                tag_wire = pb_data[idx]
+                tag = tag_wire >> 3
+                wire = tag_wire & 7
+                idx += 1
+                if wire == 0:
+                    val = 0
+                    shift = 0
+                    while idx < len(pb_data):
+                        b = pb_data[idx]
+                        idx += 1
+                        val |= (b & 0x7f) << shift
+                        shift += 7
+                        if (b & 0x80) == 0:
+                            break
+                    if tag == 2:
+                        print(val)
+                        sys.exit(0)
+                elif wire == 2:
+                    length = 0
+                    shift = 0
+                    while idx < len(pb_data):
+                        b = pb_data[idx]
+                        idx += 1
+                        length |= (b & 0x7f) << shift
+                        shift += 7
+                        if (b & 0x80) == 0:
+                            break
+                    idx += length
+                else:
+                    break
+except Exception:
+    pass
+print('1')
+" 2>/dev/null || echo "1")
+    [ -z "$pkg_version" ] && pkg_version="1"
+
     cp "$payload" "$STAGING_DIR/${output_base}.img"
     echo "$fstype" > "$STAGING_DIR/${output_base}.fstype"
-    echo "    Staged ${output_base}.img and ${output_base}.fstype ($fstype)."
+    echo "$pkg_version" > "$STAGING_DIR/${output_base}.version"
+    echo "    Staged ${output_base}.img, ${output_base}.fstype ($fstype), and ${output_base}.version ($pkg_version)."
 }
 
 extract_and_stage_apex "runtime" "runtime_apex" 1
@@ -429,7 +484,7 @@ done
 
 # Generate SHA256 checksums in staging directory
 echo "Generating and verifying SHA256SUMS in staging..."
-(cd "$STAGING_DIR" && sha256sum *.img > SHA256SUMS)
+(cd "$STAGING_DIR" && sha256sum *.img *.fstype *.version > SHA256SUMS)
 (cd "$STAGING_DIR" && sha256sum -c SHA256SUMS >/dev/null 2>&1) || {
     echo "CRITICAL BUILD ERROR: Checksum validation failed in staging!" >&2
     exit 1
