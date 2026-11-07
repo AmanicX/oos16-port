@@ -305,14 +305,23 @@ for s in "${SCRIPTS_TO_AUDIT[@]}"; do
     if [ -f "$s" ]; then
         rel_s="${s#$PROJECT_ROOT/}"
         INSPECTED_FILES+=("$rel_s")
-        # Check for write commands targeting physical disks
-        if grep -E "dd[[:space:]]+of=/dev/block" "$s" 2>/dev/null; then
+        # Extract non-comment executable lines to prevent false matches on documentation/comments
+        non_comment_lines=$(grep -v '^[[:space:]]*#' "$s" | grep -v '^[[:space:]]*echo ' || true)
+
+        # Check for dangerous write / formatting / partitioning commands targeting physical disks
+        if echo "$non_comment_lines" | grep -E "dd[[:space:]]+.*of=/dev/(block|sd|mmcblk)" >/dev/null 2>&1; then
             audit_fail "Dangerous block write" "Script '$rel_s' contains direct dd of=/dev/block command!"
-        elif grep -E "mount[[:space:]]+-o[[:space:]]+rw[[:space:]]+/dev/block" "$s" 2>/dev/null; then
+        elif echo "$non_comment_lines" | grep -E "wipefs[[:space:]]+.*(/dev/|/dev/block)" >/dev/null 2>&1; then
+            audit_fail "Dangerous wipefs command" "Script '$rel_s' contains wipefs targeting block storage!"
+        elif echo "$non_comment_lines" | grep -E "(sgdisk|parted|fdisk)[[:space:]]+.*(/dev/|/dev/block)" >/dev/null 2>&1; then
+            audit_fail "Dangerous partition tool" "Script '$rel_s' contains partitioning tool targeting block storage!"
+        elif echo "$non_comment_lines" | grep -E "(mkfs\.(ext|f2fs|vfat|ntfs)|mke2fs)[[:space:]]+.*(/dev/|/dev/block)" >/dev/null 2>&1; then
+            audit_fail "Dangerous filesystem format" "Script '$rel_s' formats physical block partition!"
+        elif echo "$non_comment_lines" | grep -E "mount[[:space:]]+-o[[:space:]]+.*rw.*/dev/block" >/dev/null 2>&1; then
             audit_fail "Dangerous block mount" "Script '$rel_s' attempts writable mount of physical block device!"
-        elif grep -Fwq "mount_all" "$s" 2>/dev/null; then
+        elif echo "$non_comment_lines" | grep -Fwq "mount_all" >/dev/null 2>&1; then
             audit_fail "Dangerous mount_all" "Script '$rel_s' invokes Android mount_all on physical partitions!"
-        elif grep -E "fastboot[[:space:]]+(flash|erase|format)" "$s" 2>/dev/null; then
+        elif echo "$non_comment_lines" | grep -E "fastboot[[:space:]]+(flash|erase|format)" >/dev/null 2>&1; then
             audit_fail "Dangerous fastboot command" "Script '$rel_s' contains physical partition modification command!"
         else
             audit_pass "Script '$rel_s' is free of physical block write commands"

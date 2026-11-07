@@ -16,6 +16,13 @@ import os
 import re
 import sys
 import zipfile
+import zlib
+
+MAX_VARINT_64 = (1 << 64) - 1
+MAX_APEX_FILE_SIZE = 500 * 1024 * 1024       # 500 MB archive limit
+MAX_ZIP_ENTRIES = 1000                       # Max directory members
+MAX_MANIFEST_BYTES = 10 * 1024 * 1024        # 10 MB manifest limit
+MAX_ORIGINAL_APEX_BYTES = 500 * 1024 * 1024  # 500 MB nested payload limit
 
 
 def parse_manifest_pb(data: bytes):
@@ -33,7 +40,7 @@ def parse_manifest_pb(data: bytes):
     name = None
     version = None
     version_name = None
-    seen_tags = {}
+    seen_tags = set()
 
     while idx < len(data):
         tag_wire = data[idx]
@@ -41,8 +48,8 @@ def parse_manifest_pb(data: bytes):
         tag = tag_wire >> 3
         wire = tag_wire & 7
 
-        if tag == 0:
-            raise ValueError("Invalid protobuf tag 0")
+        if tag == 0 or tag > 536870911:
+            raise ValueError(f"Invalid protobuf tag {tag}")
 
         # Only standard proto3 wire types allowed: 0 (varint), 1 (64-bit), 2 (length-delimited), 5 (32-bit)
         if wire not in (0, 1, 2, 5):
@@ -67,10 +74,13 @@ def parse_manifest_pb(data: bytes):
             if not found_end:
                 raise ValueError(f"Truncated varint in protobuf data for tag {tag}")
 
+            if val > MAX_VARINT_64:
+                raise ValueError(f"Varint value exceeds 64-bit unsigned limit for tag {tag}")
+
             if tag == 2:  # version
-                if tag in seen_tags and seen_tags[tag] != val:
-                    raise ValueError(f"Conflicting duplicate version field: {seen_tags[tag]} vs {val}")
-                seen_tags[tag] = val
+                if tag in seen_tags:
+                    raise ValueError(f"Conflicting duplicate or Duplicate critical field encountered: version (tag {tag})")
+                seen_tags.add(tag)
                 version = val
 
         elif wire == 2:  # length-delimited
@@ -92,6 +102,9 @@ def parse_manifest_pb(data: bytes):
             if not found_end:
                 raise ValueError(f"Truncated varint length for tag {tag}")
 
+            if length > MAX_VARINT_64:
+                raise ValueError(f"Length field exceeds 64-bit unsigned limit for tag {tag}")
+
             if length < 0 or idx + length > len(data):
                 raise ValueError(
                     f"Protobuf length-delimited field exceeds remaining data: {length} > {len(data) - idx} (tag {tag})"
@@ -105,9 +118,9 @@ def parse_manifest_pb(data: bytes):
                     decoded_name = chunk.decode("utf-8")  # strict mode, no replace!
                 except UnicodeDecodeError as e:
                     raise ValueError(f"Malformed UTF-8 in package name for tag {tag}: {e}")
-                if tag in seen_tags and seen_tags[tag] != decoded_name:
-                    raise ValueError(f"Conflicting duplicate package name field: '{seen_tags[tag]}' vs '{decoded_name}'")
-                seen_tags[tag] = decoded_name
+                if tag in seen_tags:
+                    raise ValueError(f"Conflicting duplicate or Duplicate critical field encountered: package name (tag {tag})")
+                seen_tags.add(tag)
                 name = decoded_name
 
             elif tag == 3:  # versionName
@@ -136,55 +149,102 @@ def validate_package_name(name: str):
         raise ValueError(f"Package name '{name}' is not a valid Java/AOSP package identifier")
 
 
+def _validate_json_manifest(j_bytes: bytes):
+    try:
+        j_str = j_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"Malformed UTF-8 in JSON manifest: {e}")
+    try:
+        j_data = json.loads(j_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Malformed JSON syntax in manifest: {e}")
+
+    if not isinstance(j_data, dict):
+        raise ValueError("JSON manifest root must be an object")
+
+    name = j_data.get("name")
+    version = j_data.get("version")
+    if name is None or not isinstance(name, str) or not name.strip():
+        raise ValueError("JSON manifest 'name' must be a non-empty string")
+    if version is None or isinstance(version, bool) or not isinstance(version, int) or version <= 0:
+        raise ValueError(f"JSON manifest 'version' must be a positive integer, got: {version}")
+
+    version_name = j_data.get("versionName", "")
+    if not isinstance(version_name, str):
+        version_name = str(version_name)
+
+    validate_package_name(name)
+    return name, version, version_name
+
+
 def extract_manifest_from_apex(apex_path: str):
     if not os.path.isfile(apex_path):
         raise FileNotFoundError(f"APEX archive not found: {apex_path}")
 
+    file_size = os.path.getsize(apex_path)
+    if file_size > MAX_APEX_FILE_SIZE:
+        raise ValueError(f"APEX archive exceeds maximum size limit ({file_size} > {MAX_APEX_FILE_SIZE} bytes)")
+
     try:
         with zipfile.ZipFile(apex_path, "r") as z:
+            namelist = z.namelist()
+            if len(namelist) > MAX_ZIP_ENTRIES:
+                raise ValueError(f"APEX archive entry count exceeds limit ({len(namelist)} > {MAX_ZIP_ENTRIES})")
+            if len(namelist) != len(set(namelist)):
+                raise ValueError("Suspicious duplicate directory entries detected in APEX archive")
+
             # 1. Direct protobuf manifest
-            if "apex_manifest.pb" in z.namelist():
+            if "apex_manifest.pb" in namelist:
+                info = z.getinfo("apex_manifest.pb")
+                if info.file_size > MAX_MANIFEST_BYTES:
+                    raise ValueError(f"apex_manifest.pb exceeds size limit ({info.file_size} > {MAX_MANIFEST_BYTES})")
                 pb_data = z.read("apex_manifest.pb")
                 name, version, version_name = parse_manifest_pb(pb_data)
                 if name and version is not None:
+                    if version <= 0:
+                        raise ValueError(f"Version code must be positive, got {version}")
                     validate_package_name(name)
                     return name, version, version_name or ""
 
             # 2. Direct JSON manifest
-            if "apex_manifest.json" in z.namelist():
+            if "apex_manifest.json" in namelist:
+                info = z.getinfo("apex_manifest.json")
+                if info.file_size > MAX_MANIFEST_BYTES:
+                    raise ValueError(f"apex_manifest.json exceeds size limit ({info.file_size} > {MAX_MANIFEST_BYTES})")
                 j_bytes = z.read("apex_manifest.json")
-                try:
-                    j_str = j_bytes.decode("utf-8")
-                except UnicodeDecodeError as e:
-                    raise ValueError(f"Malformed UTF-8 in apex_manifest.json: {e}")
-                j_data = json.loads(j_str)
-                name = j_data.get("name")
-                version = j_data.get("version")
-                if name and version is not None:
-                    validate_package_name(name)
-                    return name, version, j_data.get("versionName", "")
+                return _validate_json_manifest(j_bytes)
 
             # 3. Compressed APEX wrapping original_apex
-            if "original_apex" in z.namelist():
+            if "original_apex" in namelist:
+                info = z.getinfo("original_apex")
+                if info.file_size > MAX_ORIGINAL_APEX_BYTES:
+                    raise ValueError(f"original_apex exceeds size limit ({info.file_size} > {MAX_ORIGINAL_APEX_BYTES})")
                 orig_bytes = z.read("original_apex")
                 with zipfile.ZipFile(io.BytesIO(orig_bytes), "r") as oz:
-                    if "apex_manifest.pb" in oz.namelist():
+                    orig_namelist = oz.namelist()
+                    if len(orig_namelist) > MAX_ZIP_ENTRIES:
+                        raise ValueError("Nested original_apex contains excessive entries")
+                    if len(orig_namelist) != len(set(orig_namelist)):
+                        raise ValueError("Suspicious duplicate entries detected in nested original_apex")
+
+                    if "apex_manifest.pb" in orig_namelist:
+                        oinfo = oz.getinfo("apex_manifest.pb")
+                        if oinfo.file_size > MAX_MANIFEST_BYTES:
+                            raise ValueError(f"Nested apex_manifest.pb exceeds size limit")
                         name, version, version_name = parse_manifest_pb(oz.read("apex_manifest.pb"))
                         if name and version is not None:
+                            if version <= 0:
+                                raise ValueError(f"Version code must be positive, got {version}")
                             validate_package_name(name)
                             return name, version, version_name or ""
-                    if "apex_manifest.json" in oz.namelist():
-                        try:
-                            j_str = oz.read("apex_manifest.json").decode("utf-8")
-                        except UnicodeDecodeError as e:
-                            raise ValueError(f"Malformed UTF-8 in nested apex_manifest.json: {e}")
-                        j_data = json.loads(j_str)
-                        name = j_data.get("name")
-                        version = j_data.get("version")
-                        if name and version is not None:
-                            validate_package_name(name)
-                            return name, version, j_data.get("versionName", "")
-    except zipfile.BadZipFile as e:
+
+                    if "apex_manifest.json" in orig_namelist:
+                        oinfo = oz.getinfo("apex_manifest.json")
+                        if oinfo.file_size > MAX_MANIFEST_BYTES:
+                            raise ValueError("Nested apex_manifest.json exceeds size limit")
+                        return _validate_json_manifest(oz.read("apex_manifest.json"))
+
+    except (zipfile.BadZipFile, zlib.error) as e:
         raise ValueError(f"Invalid or corrupted ZIP archive in {apex_path}: {e}")
 
     raise ValueError(f"No valid apex_manifest.pb or apex_manifest.json found in {apex_path}")

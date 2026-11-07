@@ -41,6 +41,9 @@ func mkdev(major, minor uint32) (int, error) {
 	if major > 0xfffff {
 		return 0, fmt.Errorf("major %d exceeds Linux limit (0xfffff)", major)
 	}
+	if minor > 0xfffff {
+		return 0, fmt.Errorf("minor %d exceeds Linux limit (0xfffff)", minor)
+	}
 	dev := (uint64(major&0xfff) << 8) |
 		uint64(minor&0xff) |
 		(uint64(major&^uint32(0xfff)) << 32) |
@@ -70,6 +73,10 @@ func parseSysfsDev(content string) (uint32, uint32, error) {
 	min := uint32(min64)
 	if maj > 0xfffff {
 		return 0, 0, fmt.Errorf("major %d exceeds supported limit (0xfffff)", maj)
+	}
+	// Linux maximum minor on new encoding: 20 bits (0xfffff)
+	if min > 0xfffff {
+		return 0, 0, fmt.Errorf("minor %d exceeds supported limit (0xfffff)", min)
 	}
 	return maj, min, nil
 }
@@ -120,8 +127,15 @@ func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool)
 		if fi.Mode()&os.ModeSymlink != 0 {
 			target, err := os.Readlink(destNode)
 			if err == nil {
-				if tfi, err := os.Stat(target); err == nil && (tfi.Mode()&os.ModeCharDevice != 0) {
-					return nil
+				resolvedTarget := target
+				if !filepath.IsAbs(target) {
+					resolvedTarget = filepath.Join(filepath.Dir(destNode), target)
+				}
+				if tfi, err := os.Stat(resolvedTarget); err == nil && (tfi.Mode()&os.ModeCharDevice != 0) {
+					st, ok := tfi.Sys().(*syscall.Stat_t)
+					if ok && st != nil && st.Rdev == uint64(devNum) {
+						return nil
+					}
 				}
 			}
 			if err := os.Remove(destNode); err != nil {
@@ -129,7 +143,10 @@ func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool)
 			}
 		} else if fi.Mode()&os.ModeCharDevice != 0 {
 			st, ok := fi.Sys().(*syscall.Stat_t)
-			if ok && st != nil && st.Rdev == uint64(devNum) {
+			if !ok || st == nil {
+				return fmt.Errorf("existing character device %s missing Stat_t info; refusing to overwrite", destNode)
+			}
+			if st.Rdev == uint64(devNum) {
 				return os.Chmod(destNode, 0666)
 			}
 			return fmt.Errorf("existing character device %s has conflicting rdev (%d != %d); refusing to overwrite", destNode, st.Rdev, devNum)
@@ -160,6 +177,7 @@ func safeSymlink(srcNode, destNode string) error {
 	if fi.Mode()&os.ModeCharDevice == 0 {
 		return fmt.Errorf("source node %s is not a character device (mode: %s)", srcNode, fi.Mode())
 	}
+	srcStat, srcOk := fi.Sys().(*syscall.Stat_t)
 
 	if lfi, err := os.Lstat(destNode); err == nil {
 		if lfi.Mode()&os.ModeSymlink != 0 {
@@ -169,13 +187,26 @@ func safeSymlink(srcNode, destNode string) error {
 				_ = os.Chmod(srcNode, 0666)
 				return nil
 			}
+			resolved := target
+			if !filepath.IsAbs(target) {
+				resolved = filepath.Join(filepath.Dir(destNode), target)
+			}
+			if tfi, err := os.Stat(resolved); err == nil && (tfi.Mode()&os.ModeCharDevice != 0) {
+				tStat, tOk := tfi.Sys().(*syscall.Stat_t)
+				if srcOk && tOk && srcStat != nil && tStat != nil && srcStat.Rdev == tStat.Rdev {
+					_ = os.Chmod(srcNode, 0666)
+					return nil
+				}
+			}
 			if err := os.Remove(destNode); err != nil {
 				return fmt.Errorf("failed to remove existing symlink %s: %w", destNode, err)
 			}
 		} else if lfi.Mode()&os.ModeCharDevice != 0 {
-			// Direct char device node at destNode
-			_ = os.Chmod(destNode, 0666)
-			return nil
+			dstStat, dstOk := lfi.Sys().(*syscall.Stat_t)
+			if srcOk && dstOk && srcStat != nil && dstStat != nil && srcStat.Rdev == dstStat.Rdev {
+				return os.Chmod(destNode, 0666)
+			}
+			return fmt.Errorf("destination %s is an existing character device with conflicting rdev; refusing to overwrite", destNode)
 		} else {
 			return fmt.Errorf("destination %s exists and is not a symlink/char-device (mode: %s); refusing to overwrite", destNode, lfi.Mode())
 		}
@@ -189,7 +220,7 @@ func safeSymlink(srcNode, destNode string) error {
 	if err := os.Symlink(relPath, destNode); err != nil {
 		return fmt.Errorf("symlink %s -> %s failed: %w", destNode, relPath, err)
 	}
-	if err := os.Chmod(srcNode, 0666); err != nil {
+	if err := os.Chmod(srcNode, 0666); err != nil && !os.IsPermission(err) {
 		return fmt.Errorf("chmod source node %s failed: %w", srcNode, err)
 	}
 	return nil
@@ -220,6 +251,7 @@ func main() {
 	}
 
 	var newlyAllocated []string
+	var newlySymlinked []string
 	controlFd, err := syscall.Open(*controlPath, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
 	controlAvailable := (err == nil)
 	if controlAvailable {
@@ -229,7 +261,7 @@ func main() {
 		for _, name := range devices {
 			targetNode := filepath.Join(*mountPath, name)
 			if fi, err := os.Stat(targetNode); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
-				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Device %s already exists in %s", name, *mountPath))
+				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Device %s already exists in %s (preserving existing node)", name, *mountPath))
 				continue
 			}
 
@@ -252,7 +284,7 @@ func main() {
 
 			if r1 == 0 {
 				newlyAllocated = append(newlyAllocated, targetNode)
-				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Successfully allocated '%s' in binderfs (major: %d, minor: %d)",
+				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Successfully allocated new device '%s' in binderfs (major: %d, minor: %d)",
 					name, req.major, req.minor))
 				if err := os.Chmod(targetNode, 0666); err != nil {
 					logKmsg(fmt.Sprintf("[BINDERFS_INIT WARNING] chmod 0666 failed for %s: %v", targetNode, err))
@@ -274,6 +306,7 @@ func main() {
 			if err := safeSymlink(srcNode, destNode); err != nil {
 				logKmsg(fmt.Sprintf("[BINDERFS_INIT WARNING] safeSymlink failed for %s -> %s: %v", destNode, srcNode, err))
 			} else {
+				newlySymlinked = append(newlySymlinked, destNode)
 				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Symlinked %s -> %s", destNode, srcNode))
 			}
 		} else {
@@ -326,9 +359,12 @@ func main() {
 	}
 
 	if !allOk {
-		// Clean up partial allocations to avoid inconsistent state
+		// Clean up partial allocations and newly created symlinks to avoid inconsistent state
 		for _, node := range newlyAllocated {
 			_ = os.Remove(node)
+		}
+		for _, sym := range newlySymlinked {
+			_ = os.Remove(sym)
 		}
 		logKmsg("[BINDERFS_INIT FATAL] Critical Binder IPC device initialization FAILED! Partial state cleaned up.")
 		os.Exit(1)

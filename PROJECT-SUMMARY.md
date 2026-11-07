@@ -1,6 +1,6 @@
 # OxygenOS 16 Port to OnePlus 7T (HD1901) — Project Summary
 
-> **Document Version**: 2.3.0 (Hardened BinderFS Encoding, 600s Watchdog Health Monitor, Strict APEX Metadata, Fail-Closed RAM Budgeting & 86 Automated Tests)  
+> **Document Version**: 2.4.0 (Product/My_Product Mount Separation, Fail-Closed RAM Validation, Hardened dev_t & BinderFS Edge Cases, Expanded APEX Budgeting, Strengthened Watchdog Lifecycle, Hardened APEX Protobuf & ZIP Limits, and 101 Automated Tests)  
 > **Target Device**: OnePlus 7T (`HD1901` / `hotdogb`, Snapdragon 855+ / SM8150-AC, 8 GB RAM)  
 > **Source ROM**: OxygenOS 16 (Android 16 / SDK 36 / `Baklava` / `BP4A.251205.006`)  
 > **Base OS on Device**: crDroid (Android 16 / LineageOS 23.2 base, FBE Encrypted)  
@@ -175,6 +175,47 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
     * Verified `MemTotal >= 6500MB` (8 GB target verification) and `MemAvailable >= REQUIRED_RAM_MB` (~6,372 MB peak budget).
     * Extended monitoring loop (`OOS16_WAIT_FOR_BOOT=1`) continues petting the safety watchdog heartbeat while awaiting `sys.boot_completed=1` or `watchdog_state=BOOT_COMPLETED`.
 
+### 16. Device-Side Fail-Closed RAM Validation (`scripts/stage2_init.sh`)
+* **Problem**: Previous `/mnt` check warned if free space was below 6000 MB and did not calculate actual image sizes or abort on empty/failed `df` output.
+* **Solution**:
+  * Replaced warning with strict fail-closed validation: verifies `/mnt` and `/tmp` are mounted as `tmpfs`.
+  * Computes `_STAGED_BYTES` by summing exact byte sizes of all staged `.img` files and adding 512 MB OverlayFS upper/work reserve.
+  * Rejects empty or malformed `df -m /mnt` output and aborts immediately before mounting or copying if available capacity cannot be verified.
+  * Reads `/proc/meminfo` to verify `MemAvailable` exceeds the calculated required budget (`_STAGED_MB + _EXP_APEX_MB + 1024 + 512 + 1536 + 256 MB`).
+  * Enforces pre-copy free memory validation on `/mnt/sysroot/apex` before copying each APEX payload.
+
+### 17. Explicit Product and My_Product Mount Selection (`scripts/stage2_init.sh`)
+* **Problem**: `REQUIRED_MOUNTPOINTS` pre-created directory `/mnt/sysroot/my_product`. Later, `if [ -d /mnt/sysroot/my_product ]` was used as a condition to mount, which always evaluated true and resulted in double-mounting `product.img` at `my_product` when no separate image existed.
+* **Solution**:
+  * Eliminated directory presence check as evidence for image presence.
+  * Explicitly checks for distinct file presence (`[ -n "$MY_PROD_IMG" ] && [ "$MY_PROD_IMG" != "$PRODUCT_IMG" ]`).
+  * Mounts `my_product.img` only when independently present; leaves `/mnt/sysroot/my_product` as empty overlay directory otherwise.
+  * Never silently double-mounts single product images into both partitions.
+
+### 18. Hardened BinderFS Device-Number Validation & Syscall Safety (`src/binderfs_init.go`)
+* **Problem**: Minor numbers were not bounded separately from major; nil dereference on `st.Rdev` occurred when `syscall.Stat_t` assertion failed; existing char devices and symlinks were not verified by device number.
+* **Solution**:
+  * Enforced strict minor validation `min <= 0xfffff` (Linux 20-bit limit) in both `mkdev` and `parseSysfsDev`.
+  * Fixed nil dereference by verifying `ok && st != nil` before checking `st.Rdev`.
+  * Compares actual `rdev` against expected major:minor for existing char devices, refusing to overwrite conflicting nodes.
+  * Verifies resolved symlink target is a char device with matching `rdev`.
+  * Tracks newly allocated binderfs nodes and symlinks, rolling them back completely on partial initialization failure.
+  * Added 8 comprehensive Go unit tests covering boundary values, overflow, conflicting char devices, and idempotency.
+
+### 19. Simultaneous Source & Expanded APEX RAM Budget Calculation (`tools/safe/run_stage2.sh` & `scripts/build_stage2_erofs.sh`)
+* **Problem**: Staging counted only compressed image sizes, ignoring that both source APEX images in `/mnt` and expanded payloads in `/mnt/sysroot/apex` reside simultaneously in RAM.
+* **Solution**:
+  * `scripts/build_stage2_erofs.sh` extracts uncompressed payloads and records exact byte counts into `*.expanded_size` metadata files, validated in `SHA256SUMS`.
+  * `tools/safe/run_stage2.sh` aggregates measured expanded APEX payload sizes (`TOTAL_EXPANDED_APEX_MB`) alongside staged partition images, `/data` (1024 MB), overlay (512 MB), kernel reserve (1536 MB), and safety headroom (256 MB).
+  * Validates both `/mnt` tmpfs free space and device-wide `MemAvailable` independently.
+
+### 20. Strengthened Watchdog Lifecycle & Hardened APEX Protobuf/ZIP Limits
+* **Problem**: Watchdog lifecycle lacked dedicated tests for delayed Android property service startup, property service failure, and ADB disconnection. Protobuf parser lacked 64-bit varint limit checking and ZIP archive resource limits.
+* **Solution**:
+  * Added dedicated watchdog tests in `tests/test_watchdog.py`: delayed `sys.boot_completed=1` (clean exit 0), property service failure (triggers safe reboot), ADB disconnect simulation (triggers safe reboot), and symlink rejection for markers.
+  * Hardened `tools/extract_apex_info.py`: rejects varints $> 2^{64}-1$, tag 0, invalid tags $> 536870911$, duplicate critical fields, and enforces ZIP limits (`MAX_APEX_FILE_SIZE = 500MB`, `MAX_ZIP_ENTRIES = 1000`, `MAX_MANIFEST_BYTES = 10MB`).
+  * Hardened safety auditor `tools/safe/audit-no-writes.sh` with comment-stripped command scanning for `dd`, `wipefs`, `sgdisk`, `parted`, `fdisk`, and `mkfs`.
+
 ---
 
 ## 3. Verification Matrix & Current Status
@@ -183,8 +224,8 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
 | **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on `build/loader.img` (31/31), `build/stage1.img` (31/31), and ramdisks (29/29) with zero mandatory unverified checks. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (86/86)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf (9), Watchdog protocol (15), Stage-2 runner integration mocks (46), and Go BinderFS unit tests (5). |
-| **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all 10 Stage-2 images generated with valid SHA256SUMS. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (101/101)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf & ZIP limits (14), Watchdog protocol & lifecycle (19), Stage-2 runner integration mocks (49), and Go BinderFS unit tests (8). |
+| **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
 
@@ -196,5 +237,5 @@ The repository is in a verified, build-clean, and audited state:
 * All host-side safety wrappers (`tools/safe/adb`, `tools/safe/fastboot`, `tools/safe/audit-no-writes.sh`) are active and verified.
 * All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (31/31).
 * All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS`.
-* All 86 automated unit and integration tests pass without error (100% OK).
+* All 101 automated unit and integration tests pass without error (100% OK).
 * **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`).

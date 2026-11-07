@@ -155,6 +155,74 @@ class TestApexInfoParser(unittest.TestCase):
         finally:
             os.unlink(temp_path)
 
+    def test_varint_64bit_overflow_rejected(self):
+        # 10 bytes with all bits set (value > 2^64 - 1)
+        data = bytearray([(2 << 3) | 0])
+        data.extend([0xFF] * 9 + [0x7F])
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes(data))
+        self.assertIn("exceeds 64-bit unsigned limit", str(ctx.exception))
+
+    def test_invalid_protobuf_tag_0_and_huge_tag_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes([0]))
+        self.assertIn("Invalid protobuf tag 0", str(ctx.exception))
+
+    def test_duplicate_critical_field_rejected(self):
+        # Two identical name fields
+        data = bytearray()
+        data.extend(build_manifest_pb("com.android.runtime", 1))
+        data.extend(build_manifest_pb("com.android.runtime", 1))
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes(data))
+        self.assertIn("Duplicate critical field", str(ctx.exception))
+
+    def test_json_manifest_type_validations(self):
+        with tempfile.NamedTemporaryFile(suffix=".apex", delete=False) as f:
+            temp_path = f.name
+        try:
+            # Non-dict root
+            with zipfile.ZipFile(temp_path, "w") as z:
+                z.writestr("apex_manifest.json", json.dumps(["com.android.runtime", 1]))
+            with self.assertRaises(ValueError) as ctx:
+                extract_manifest_from_apex(temp_path)
+            self.assertIn("root must be an object", str(ctx.exception))
+
+            # Non-string name
+            with zipfile.ZipFile(temp_path, "w") as z:
+                z.writestr("apex_manifest.json", json.dumps({"name": 12345, "version": 1}))
+            with self.assertRaises(ValueError) as ctx:
+                extract_manifest_from_apex(temp_path)
+            self.assertIn("'name' must be a non-empty string", str(ctx.exception))
+
+            # Boolean version (bool is subclass of int in Python)
+            with zipfile.ZipFile(temp_path, "w") as z:
+                z.writestr("apex_manifest.json", json.dumps({"name": "com.android.runtime", "version": True}))
+            with self.assertRaises(ValueError) as ctx:
+                extract_manifest_from_apex(temp_path)
+            self.assertIn("'version' must be a positive integer", str(ctx.exception))
+
+            # Zero or negative version
+            with zipfile.ZipFile(temp_path, "w") as z:
+                z.writestr("apex_manifest.json", json.dumps({"name": "com.android.runtime", "version": -5}))
+            with self.assertRaises(ValueError) as ctx:
+                extract_manifest_from_apex(temp_path)
+            self.assertIn("'version' must be a positive integer", str(ctx.exception))
+        finally:
+            os.unlink(temp_path)
+
+    def test_malformed_nested_original_apex_rejected(self):
+        with tempfile.NamedTemporaryFile(suffix=".apex", delete=False) as f:
+            temp_path = f.name
+        try:
+            with zipfile.ZipFile(temp_path, "w") as z:
+                z.writestr("original_apex", b"CORRUPTED_NESTED_NOT_ZIP_DATA")
+            with self.assertRaises(ValueError) as ctx:
+                extract_manifest_from_apex(temp_path)
+            self.assertIn("Invalid or corrupted ZIP", str(ctx.exception))
+        finally:
+            os.unlink(temp_path)
+
 
 if __name__ == "__main__":
     unittest.main()

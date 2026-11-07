@@ -360,5 +360,89 @@ exit 0
         self.assertIn("State at failure: HEALTH_MONITOR", res.stderr)
         self.assertTrue(os.path.exists(self.reboot_log))
 
+    def test_delayed_android_boot_completion_success(self):
+        """Verify watchdog waits for delayed sys.boot_completed=1 and exits cleanly."""
+        with open(self.ack_file, "w") as f:
+            f.write("ack")
+        with open(self.done_file, "w") as f:
+            f.write("done")
+        with open(self.boot_status_file, "w") as f:
+            f.write("0\n")
+
+        # Background thread that flips property to "1" after 50ms
+        def delayed_flip():
+            time.sleep(0.08)
+            with open(self.boot_status_file, "w") as f:
+                f.write("1\n")
+
+        t = threading.Thread(target=delayed_flip)
+        t.start()
+        try:
+            res = self.run_watchdog({
+                "WATCHDOG_TIMEOUT": "2",
+                "WATCHDOG_STAGE2_TIMEOUT": "3",
+                "WATCHDOG_HEALTH_TIMEOUT": "10",
+                "WATCHDOG_SLEEP_INTERVAL": "0.02",
+                "WATCHDOG_MAX_TICKS": "15"
+            })
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("Android boot completed successfully (sys.boot_completed=1)", res.stderr)
+            with open(self.state_file) as f:
+                self.assertEqual(f.read().strip(), "BOOT_COMPLETED")
+        finally:
+            t.join()
+
+    def test_property_service_failure_triggers_reboot(self):
+        """Verify property-service empty or failed responses do not cause false success."""
+        with open(self.ack_file, "w") as f:
+            f.write("ack")
+        with open(self.done_file, "w") as f:
+            f.write("done")
+        with open(self.boot_status_file, "w") as f:
+            f.write("FAILED_PROP_READ\n")
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "2",
+            "WATCHDOG_STAGE2_TIMEOUT": "2",
+            "WATCHDOG_HEALTH_TIMEOUT": "1",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "0"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("State at failure: HEALTH_MONITOR", res.stderr)
+        self.assertTrue(os.path.exists(self.reboot_log))
+
+    def test_symlink_stage1_ack_and_stage2_done_rejected(self):
+        """Verify symlink ack and done markers are rejected without state transition."""
+        dummy = os.path.join(self.test_dir, "dummy_target")
+        with open(dummy, "w") as f:
+            f.write("data")
+        os.symlink(dummy, self.ack_file)
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "5",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "2"
+        })
+        self.assertIn("Acknowledgement file", res.stderr)
+        self.assertIn("is a symlink! Ignoring", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STAGE1_WAIT")
+
+    def test_adb_disconnect_stops_heartbeat_and_reboots(self):
+        """Verify simulating ADB disconnection (heartbeats stop) triggers timeout and reboot."""
+        # Touch heartbeat once, then disconnect (no more heartbeats)
+        with open(self.heartbeat_file, "w") as f:
+            f.write("ping")
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "1",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "0"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Safety heartbeat lost", res.stderr)
+        self.assertTrue(os.path.exists(self.reboot_log))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

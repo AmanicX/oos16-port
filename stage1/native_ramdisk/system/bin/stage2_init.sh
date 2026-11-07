@@ -107,10 +107,69 @@ if ! /system/bin/toybox mount | grep -q " /mnt type tmpfs "; then
     fatal "CRITICAL SAFETY FAILURE: Staging directory /mnt is not mounted as RAM tmpfs!"
 fi
 
-# Verify /mnt has sufficient capacity for staged images
-MNT_FREE_MB=$(/system/bin/toybox df -m /mnt 2>/dev/null | /system/bin/toybox awk 'NR>1 {print $4}' | /system/bin/toybox tr -d '[:space:]')
-if [ -n "$MNT_FREE_MB" ] && [ "$MNT_FREE_MB" -lt 6000 ] 2>/dev/null; then
-    echo "[STAGE2 WARNING] /mnt has only ${MNT_FREE_MB}MB free space, recommended >= 6000MB." > /dev/kmsg
+/system/bin/toybox mkdir -p /tmp 2>/dev/null || true
+if ! /system/bin/toybox mount | grep -q " /tmp type tmpfs "; then
+    /system/bin/toybox mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp 2>/dev/null || true
+    if ! /system/bin/toybox mount | grep -q " /tmp type tmpfs "; then
+        fatal "CRITICAL SAFETY FAILURE: Temporary directory /tmp is not mounted as RAM tmpfs!"
+    fi
+fi
+
+# Strict fail-closed /mnt capacity check: reject missing, malformed, or empty df output.
+# Calculate required space from the actual images staged in /mnt.
+_MNT_DF_OUT=$(/system/bin/toybox df -m /mnt 2>/dev/null || true)
+if [ -z "$_MNT_DF_OUT" ]; then
+    fatal "Device-side RAM check: df -m /mnt returned empty output. Cannot verify tmpfs capacity. Halting."
+fi
+MNT_FREE_MB=$(echo "$_MNT_DF_OUT" | /system/bin/toybox awk 'NR>1 {print $4}')
+MNT_FREE_MB=$(echo "$MNT_FREE_MB" | /system/bin/toybox tr -d '[:space:]')
+case "$MNT_FREE_MB" in
+    ''|*[!0-9]*)
+        fatal "Device-side RAM check: Failed to parse numeric free capacity from df output ('$_MNT_DF_OUT'). Halting." ;;
+esac
+
+# Accumulate actual image bytes staged in /mnt and /tmp to compute required headroom
+_STAGED_BYTES=0
+for _img in /mnt/*.img /tmp/*.img; do
+    [ -f "$_img" ] && [ -s "$_img" ] || continue
+    _sz=$(/system/bin/toybox stat -c%s "$_img" 2>/dev/null || echo "0")
+    case "$_sz" in ''|*[!0-9]*) _sz=0 ;; esac
+    _STAGED_BYTES=$((_STAGED_BYTES + _sz))
+done
+# Round up to whole MB, add 512 MB headroom for OverlayFS upper/work
+_STAGED_MB=$(( (_STAGED_BYTES + 1048575) / 1048576 ))
+REQUIRED_MNT_FREE_MB=$((_STAGED_MB + 512))
+
+if [ "$MNT_FREE_MB" -lt "$REQUIRED_MNT_FREE_MB" ]; then
+    fatal "Device-side RAM check: /mnt has only ${MNT_FREE_MB}MB free; bringup requires at least ${REQUIRED_MNT_FREE_MB}MB (images: ${_STAGED_MB}MB + 512MB overhead). Halting."
+fi
+echo "[STAGE2] Device-side /mnt tmpfs check passed: /mnt has ${MNT_FREE_MB}MB free (required: ${REQUIRED_MNT_FREE_MB}MB, images: ${_STAGED_MB}MB)." > /dev/kmsg
+
+# Device-side MemAvailable verification from /proc/meminfo
+_DEV_MEMINFO=$(cat /proc/meminfo 2>/dev/null || true)
+if [ -n "$_DEV_MEMINFO" ]; then
+    _DEV_MEM_AVAIL_KB=$(echo "$_DEV_MEMINFO" | /system/bin/toybox awk '/MemAvailable:/ {print $2}' | /system/bin/toybox tr -d '[:space:]')
+    case "$_DEV_MEM_AVAIL_KB" in
+        ''|*[!0-9]*)
+            fatal "Device-side RAM check: Failed to parse numeric MemAvailable from /proc/meminfo. Halting." ;;
+        *)
+            _DEV_MEM_AVAIL_MB=$((_DEV_MEM_AVAIL_KB / 1024))
+            _EXP_APEX_BYTES=0
+            for _exp_f in /mnt/*_apex.expanded_size /tmp/*_apex.expanded_size; do
+                if [ -f "$_exp_f" ] && [ -s "$_exp_f" ]; then
+                    _val=$(cat "$_exp_f" | /system/bin/toybox tr -d '[:space:]')
+                    case "$_val" in [0-9]*) _EXP_APEX_BYTES=$((_EXP_APEX_BYTES + _val)) ;; esac
+                fi
+            done
+            _EXP_APEX_MB=$(( (_EXP_APEX_BYTES + 1048575) / 1048576 ))
+            [ "$_EXP_APEX_MB" -lt 100 ] && _EXP_APEX_MB=120
+            _TOTAL_DEV_REQ_MB=$((_STAGED_MB + _EXP_APEX_MB + 1024 + 512 + 1536 + 256))
+            if [ "$_DEV_MEM_AVAIL_MB" -lt "$_TOTAL_DEV_REQ_MB" ]; then
+                fatal "Device-side RAM check: Insufficient device RAM! MemAvailable is ${_DEV_MEM_AVAIL_MB}MB, but peak budget requires ${_TOTAL_DEV_REQ_MB}MB. Halting."
+            fi
+            echo "[STAGE2] Device-side total RAM verified: ${_DEV_MEM_AVAIL_MB}MB available >= ${_TOTAL_DEV_REQ_MB}MB required." > /dev/kmsg
+            ;;
+    esac
 fi
 
 echo "[STAGE2] Verified: All $DISCOVERED_PHYSICAL physical storage devices and partitions are strictly locked read-only (ro=1)." > /dev/kmsg
@@ -205,10 +264,15 @@ PRODUCT_IMG=$(get_img "product.img")
 [ -n "$PRODUCT_IMG" ] || fatal "Mandatory product.img (or my_product.img) not found in /mnt/ or /tmp/!"
 mount_partition "product" "$PRODUCT_IMG" 1
 
-if [ -d /mnt/sysroot/my_product ]; then
-    MY_PROD_IMG=$(get_img "my_product.img")
-    [ -z "$MY_PROD_IMG" ] && MY_PROD_IMG="$PRODUCT_IMG"
+# my_product is an OPTIONAL OxygenOS ColorOS split-partition layer.
+# Mount ONLY if a distinct /mnt/my_product.img image file is present (not shared with product.img).
+# Do NOT use directory existence as the proxy — /mnt/sysroot/my_product is always pre-created above.
+MY_PROD_IMG=$(get_img "my_product.img")
+if [ -n "$MY_PROD_IMG" ] && [ "$MY_PROD_IMG" != "$PRODUCT_IMG" ]; then
+    # A distinct my_product.img exists; mount it at /mnt/sysroot/my_product
     mount_partition "my_product" "$MY_PROD_IMG" 0
+else
+    echo "[STAGE2] my_product image not separately staged; /mnt/sysroot/my_product left as empty overlay dir." > /dev/kmsg
 fi
 
 REGION_IMG=$(get_img "my_region.img")
@@ -292,6 +356,18 @@ populate_apex() {
     if ! try_mount -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"; then
         fatal "Failed to mount $mod_name payload image from $img_path with filesystem $fstype!"
     fi
+
+    # Pre-copy RAM capacity verification for this APEX module
+    local apex_free_mb
+    apex_free_mb=$(/system/bin/toybox df -m /mnt/sysroot/apex 2>/dev/null | /system/bin/toybox awk 'NR>1 {print $4}' | /system/bin/toybox tr -d '[:space:]')
+    case "$apex_free_mb" in
+        ''|*[!0-9]*) ;;
+        *)
+            if [ "$apex_free_mb" -lt 5 ]; then
+                fatal "Device-side RAM check: Insufficient free space on /mnt/sysroot/apex tmpfs (${apex_free_mb}MB free) before staging $mod_name!"
+            fi
+            ;;
+    esac
 
     /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy $mod_name payload to $versioned_dir!"
     /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true

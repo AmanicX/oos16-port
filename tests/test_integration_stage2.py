@@ -1157,5 +1157,37 @@ exit 1
             self.assertIn("CRITICAL: binderfs_init failed", content)
             self.assertIn("/dev/binderfs/binder-control", os.popen("strings '" + loader_bin + "' | grep binder-control").read())
 
+    def test_stage2_init_product_and_my_product_mount_selection(self):
+        """Verify scripts/stage2_init.sh distinguishes product and my_product explicitly."""
+        stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+        with open(stage2_script) as f:
+            content = f.read()
+
+        # Must NOT use directory existence check as proxy for image presence
+        self.assertNotIn("if [ -d /mnt/sysroot/my_product ]; then\n    MY_PROD_IMG=$(get_img \"my_product.img\")\n    [ -z \"$MY_PROD_IMG\" ] && MY_PROD_IMG=\"$PRODUCT_IMG\"", content)
+        # Must explicitly check for separate my_product.img
+        self.assertIn('MY_PROD_IMG=$(get_img "my_product.img")', content)
+        self.assertIn('"$MY_PROD_IMG" != "$PRODUCT_IMG"', content)
+
+    def test_stage2_init_fail_closed_df_capacity(self):
+        """Verify scripts/stage2_init.sh rejects empty/malformed df output fail-closed."""
+        stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+        with open(stage2_script) as f:
+            content = f.read()
+
+        self.assertIn("df -m /mnt returned empty output", content)
+        self.assertIn("Failed to parse numeric free capacity from df output", content)
+        self.assertIn("REQUIRED_MNT_FREE_MB", content)
+
+    def test_runner_apex_expanded_size_budget_accounting(self):
+        """Verify run_stage2.sh accounts for expanded APEX payloads and breakdowns in output."""
+        stage2_runner = os.path.join(PROJECT_ROOT, "tools/safe/run_stage2.sh")
+        with open(stage2_runner) as f:
+            content = f.read()
+
+        self.assertIn("TOTAL_EXPANDED_APEX_MB", content)
+        self.assertIn("Expanded APEX payloads (/apex tmpfs)", content)
+        self.assertIn("expanded_size", content)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

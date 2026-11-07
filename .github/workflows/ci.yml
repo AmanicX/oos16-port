@@ -100,3 +100,29 @@ jobs:
       - name: Run Pre-Boot Static Safety Auditor (loader_ramdisk)
         run: |
           bash tools/safe/audit-no-writes.sh stage1/loader_ramdisk
+
+      - name: Run Boot Image Safety Auditor (loader.img if present)
+        run: |
+          if [ -f "build/loader.img" ]; then
+            echo "Auditing built loader.img..."
+            bash tools/safe/audit-no-writes.sh build/loader.img
+          else
+            echo "build/loader.img not present in CI checkout; skipping boot image audit."
+          fi
+
+      - name: Run Boot Image Safety Auditor (stage1.img if present)
+        run: |
+          if [ -f "build/stage1.img" ]; then
+            echo "Auditing built stage1.img..."
+            bash tools/safe/audit-no-writes.sh build/stage1.img
+          else
+            echo "build/stage1.img not present in CI checkout; skipping boot image audit."
+          fi
+
+      - name: Upload Safety Audit & Execution Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: safety-audit-logs
+          path: logs/
+          if-no-files-found: ignore

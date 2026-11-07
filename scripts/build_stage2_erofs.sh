@@ -419,10 +419,33 @@ extract_and_stage_apex() {
         exit 1
     fi
 
+    # Measure expanded payload uncompressed size for accurate RAM budgeting
+    local exp_size=0
+    local exp_dir="$unpack_dir/expanded_measure"
+    mkdir -p "$exp_dir"
+    if [ "$fstype" = "erofs" ]; then
+        if "$FSCK_EROFS" --extract="$exp_dir" "$payload" >/dev/null 2>&1; then
+            exp_size=$(du -sb "$exp_dir" 2>/dev/null | awk '{print $1}' || echo "0")
+        fi
+    elif [ "$fstype" = "ext4" ]; then
+        if command -v 7z >/dev/null 2>&1 && 7z x -o"$exp_dir" "$payload" >/dev/null 2>&1; then
+            exp_size=$(du -sb "$exp_dir" 2>/dev/null | awk '{print $1}' || echo "0")
+        fi
+    fi
+    rm -rf "$exp_dir"
+
+    # If extraction measurement was 0, fall back to safe conservative bound (2.5x payload size)
+    if [ -z "$exp_size" ] || [ "$exp_size" -le 0 ]; then
+        local raw_sz
+        raw_sz=$(stat -c%s "$payload" 2>/dev/null || stat -f%z "$payload" 2>/dev/null || echo "0")
+        exp_size=$(( raw_sz * 5 / 2 ))
+    fi
+
     cp "$payload" "$STAGING_DIR/${output_base}.img"
     echo "$fstype" > "$STAGING_DIR/${output_base}.fstype"
     echo "$pkg_version" > "$STAGING_DIR/${output_base}.version"
-    echo "    Staged ${output_base}.img, ${output_base}.fstype ($fstype), and ${output_base}.version ($pkg_version)."
+    echo "$exp_size" > "$STAGING_DIR/${output_base}.expanded_size"
+    echo "    Staged ${output_base}.img, ${output_base}.fstype ($fstype), ${output_base}.version ($pkg_version), and expanded_size ($exp_size bytes)."
 }
 
 extract_and_stage_apex "runtime" "runtime_apex" 1
@@ -453,7 +476,7 @@ done
 
 # Generate SHA256 checksums in staging directory
 echo "Generating and verifying SHA256SUMS in staging..."
-(cd "$STAGING_DIR" && sha256sum *.img *.fstype *.version > SHA256SUMS)
+(cd "$STAGING_DIR" && sha256sum *.img *.fstype *.version *.expanded_size > SHA256SUMS)
 (cd "$STAGING_DIR" && sha256sum -c SHA256SUMS >/dev/null 2>&1) || {
     echo "CRITICAL BUILD ERROR: Checksum validation failed in staging!" >&2
     exit 1

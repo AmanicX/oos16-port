@@ -13,11 +13,14 @@ func TestMkdevEncoding(t *testing.T) {
 		min     uint32
 		wantErr bool
 	}{
+		{"zero_zero", 0, 0, false},
 		{"standard_loop", 7, 0, false},
 		{"standard_misc", 10, 237, false},
 		{"high_major_511", 511, 1024, false},
-		{"max_supported_major", 0xfffff, 0xfffff, false},
+		{"max_supported_boundary", 0xfffff, 0xfffff, false},
 		{"overflow_major", 0x100000, 0, true},
+		{"overflow_minor", 0, 0x100000, true},
+		{"overflow_both", 0x100000, 0x100000, true},
 	}
 
 	for _, tc := range tests {
@@ -48,6 +51,7 @@ func TestParseSysfsDev(t *testing.T) {
 		{"10:237\n", 10, 237, false},
 		{"  7:0  ", 7, 0, false},
 		{"0:0", 0, 0, false},
+		{"1048575:1048575", 0xfffff, 0xfffff, false},
 		{"", 0, 0, true},
 		{"invalid", 0, 0, true},
 		{"10", 0, 0, true},
@@ -57,7 +61,8 @@ func TestParseSysfsDev(t *testing.T) {
 		{"abc:237", 0, 0, true},
 		{"10:xyz", 0, 0, true},
 		{"99999999999999999999:1", 0, 0, true},
-		{"1048576:1", 0, 0, true}, // > 0xfffff
+		{"1048576:1", 0, 0, true}, // major > 0xfffff
+		{"10:1048576", 0, 0, true}, // minor > 0xfffff
 	}
 
 	for _, tc := range tests {
@@ -91,6 +96,50 @@ func TestValidateOrCreateLegacyNodeRefuseOverwrite(t *testing.T) {
 	}
 }
 
+func TestValidateOrCreateLegacyNodeExistingDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+	dirPath := filepath.Join(tmpDir, "sub_dir")
+	if err := os.Mkdir(dirPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := validateOrCreateLegacyNode(dirPath, 10, 237, true)
+	if err == nil {
+		t.Fatalf("Expected error when target is directory, got nil")
+	}
+}
+
+func TestValidateOrCreateLegacyNodeConflictingCharDevice(t *testing.T) {
+	// /dev/null is character device 1:3 on Linux
+	if fi, err := os.Stat("/dev/null"); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
+		// Try to validate /dev/null with mismatched maj/min (e.g. 10:237)
+		err := validateOrCreateLegacyNode("/dev/null", 10, 237, true)
+		if err == nil {
+			t.Fatalf("Expected error when validating /dev/null with wrong rdev, got nil")
+		}
+	}
+}
+
+func TestValidateOrCreateLegacyNodeSymlinkHandling(t *testing.T) {
+	tmpDir := t.TempDir()
+	symlinkPath := filepath.Join(tmpDir, "stale_symlink")
+	unrelatedTarget := filepath.Join(tmpDir, "unrelated_target")
+	_ = os.WriteFile(unrelatedTarget, []byte("unrelated"), 0644)
+	if err := os.Symlink(unrelatedTarget, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale symlink to regular file should be removed and recreated in test mode
+	err := validateOrCreateLegacyNode(symlinkPath, 10, 237, true)
+	if err != nil {
+		t.Fatalf("validateOrCreateLegacyNode failed on stale symlink: %v", err)
+	}
+	content, _ := os.ReadFile(symlinkPath)
+	if string(content) != "test-legacy" {
+		t.Errorf("Expected recreated test-legacy node, got %s", string(content))
+	}
+}
+
 func TestSafeSymlinkRefuseOverwrite(t *testing.T) {
 	tmpDir := t.TempDir()
 	destFile := filepath.Join(tmpDir, "unrelated")
@@ -104,11 +153,61 @@ func TestSafeSymlinkRefuseOverwrite(t *testing.T) {
 		t.Fatalf("Expected error when source does not exist, got nil")
 	}
 
-	// Destination is ordinary file: must refuse to overwrite
+	// Source is regular file (not character device)
 	srcMock := filepath.Join(tmpDir, "src_mock")
 	_ = os.WriteFile(srcMock, []byte("mock"), 0666)
 	err = safeSymlink(srcMock, destFile)
 	if err == nil {
-		t.Fatalf("Expected error when destination is ordinary file, got nil")
+		t.Fatalf("Expected error when source is not character device, got nil")
+	}
+}
+
+func TestSafeSymlinkRealCharDevice(t *testing.T) {
+	// On Linux host, /dev/null is character device
+	if fi, err := os.Stat("/dev/null"); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
+		tmpDir := t.TempDir()
+		symlinkDest := filepath.Join(tmpDir, "binder_symlink")
+
+		err := safeSymlink("/dev/null", symlinkDest)
+		if err != nil {
+			t.Fatalf("safeSymlink to /dev/null failed: %v", err)
+		}
+
+		// Calling safeSymlink again on existing identical symlink should be idempotent
+		err = safeSymlink("/dev/null", symlinkDest)
+		if err != nil {
+			t.Fatalf("Idempotent safeSymlink failed: %v", err)
+		}
+
+		// Destination conflicting with /dev/zero (different char device)
+		if zfi, err := os.Stat("/dev/zero"); err == nil && (zfi.Mode()&os.ModeCharDevice != 0) {
+			err = safeSymlink("/dev/null", "/dev/zero")
+			if err == nil {
+				t.Fatalf("Expected error when destination is conflicting char device (/dev/zero), got nil")
+			}
+		}
+	}
+}
+
+func TestProcFilesystemsAndMountsParsing(t *testing.T) {
+	tmpDir := t.TempDir()
+	procDir := filepath.Join(tmpDir, "proc")
+	os.MkdirAll(procDir, 0755)
+
+	filesystemsPath := filepath.Join(procDir, "filesystems")
+	os.WriteFile(filesystemsPath, []byte("nodev\tsysfs\nnodev\ttmpfs\nnodev\tbinder\n"), 0644)
+
+	if !isBinderfsSupported(procDir) {
+		t.Errorf("Expected isBinderfsSupported to return true for proc with binder")
+	}
+
+	mountsPath := filepath.Join(procDir, "mounts")
+	os.WriteFile(mountsPath, []byte("binder /dev/binderfs binder rw,relatime 0 0\n"), 0644)
+
+	if !isBinderfsMounted("/dev/binderfs", procDir) {
+		t.Errorf("Expected isBinderfsMounted to return true for /dev/binderfs")
+	}
+	if isBinderfsMounted("/dev/other", procDir) {
+		t.Errorf("Expected isBinderfsMounted to return false for unmounted path")
 	}
 }
