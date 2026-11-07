@@ -221,6 +221,66 @@ if [ -n "$RAMDISK_DIR" ] && [ -d "$RAMDISK_DIR" ]; then
         else
             audit_fail "Safety watchdog" "Ramdisk does not contain watchdog recovery timer"
         fi
+
+        # Verify embedded Stage-2 script presence and integrity
+        EMBEDDED_STAGE2=""
+        if [ -f "$RAMDISK_DIR/system/bin/stage2_init.sh" ]; then
+            EMBEDDED_STAGE2="$RAMDISK_DIR/system/bin/stage2_init.sh"
+        elif [ -f "$RAMDISK_DIR/scripts/stage2_init.sh" ]; then
+            EMBEDDED_STAGE2="$RAMDISK_DIR/scripts/stage2_init.sh"
+        fi
+
+        if [ -n "$EMBEDDED_STAGE2" ]; then
+            if cmp -s "$EMBEDDED_STAGE2" "$PROJECT_ROOT/scripts/stage2_init.sh"; then
+                audit_pass "Embedded stage2_init.sh exactly matches repository scripts/stage2_init.sh"
+            else
+                audit_fail "Embedded script mismatch" "Embedded stage2_init.sh differs from scripts/stage2_init.sh"
+            fi
+        else
+            audit_fail "Embedded stage2_init.sh" "Stage-2 initialization script missing from target ramdisk"
+        fi
+
+        # Verify embedded Watchdog script presence and integrity
+        EMBEDDED_WATCHDOG=""
+        if [ -f "$RAMDISK_DIR/system/bin/watchdog.sh" ]; then
+            EMBEDDED_WATCHDOG="$RAMDISK_DIR/system/bin/watchdog.sh"
+        elif [ -f "$RAMDISK_DIR/scripts/watchdog.sh" ]; then
+            EMBEDDED_WATCHDOG="$RAMDISK_DIR/scripts/watchdog.sh"
+        fi
+
+        if [ -n "$EMBEDDED_WATCHDOG" ]; then
+            if cmp -s "$EMBEDDED_WATCHDOG" "$PROJECT_ROOT/scripts/watchdog.sh"; then
+                audit_pass "Embedded watchdog.sh exactly matches repository scripts/watchdog.sh"
+            else
+                audit_fail "Embedded script mismatch" "Embedded watchdog.sh differs from scripts/watchdog.sh"
+            fi
+        else
+            audit_fail "Embedded watchdog.sh" "Watchdog supervisor script missing from target ramdisk"
+        fi
+
+        # Verify Stage-1 Entrypoint Supervisor
+        if [ -f "$RAMDISK_DIR/init" ] && file -b "$RAMDISK_DIR/init" 2>/dev/null | grep -qi "script"; then
+            ENTRYPOINT_FILE="$RAMDISK_DIR/init"
+            ENTRY_TYPE="Loader init script"
+        elif [ -f "$RAMDISK_DIR/system/bin/recovery" ] && file -b "$RAMDISK_DIR/system/bin/recovery" 2>/dev/null | grep -qi "script"; then
+            ENTRYPOINT_FILE="$RAMDISK_DIR/system/bin/recovery"
+            ENTRY_TYPE="Native recovery script"
+        else
+            ENTRYPOINT_FILE=""
+            ENTRY_TYPE="unknown"
+        fi
+
+        if [ -n "$ENTRYPOINT_FILE" ]; then
+            if grep -Fq "/mnt/boot_now" "$ENTRYPOINT_FILE" && \
+               grep -Fq "blockdev --setro" "$ENTRYPOINT_FILE" && \
+               grep -Fq "stage2_init.sh" "$ENTRYPOINT_FILE"; then
+                audit_pass "Stage-1 entrypoint supervisor ($ENTRY_TYPE) verified for write locks, trigger, and Stage-2 handover"
+            else
+                audit_fail "Stage-1 supervisor logic" "Entrypoint $ENTRYPOINT_FILE lacks trigger or handover logic"
+            fi
+        else
+            audit_fail "Stage-1 supervisor missing" "Ramdisk lacks a recognized Stage-1 supervisor script (init or system/bin/recovery)"
+        fi
     fi
 else
     audit_unverified "Ramdisk files" "Ramdisk directory was not available for inspection" 1
@@ -230,12 +290,16 @@ fi
 echo "--- 3. Auditing Project Orchestration Scripts (Static Check) ---" | tee -a "$REPORT_FILE"
 SCRIPTS_TO_AUDIT=(
     "$PROJECT_ROOT/scripts/stage2_init.sh"
+    "$PROJECT_ROOT/scripts/watchdog.sh"
     "$PROJECT_ROOT/tools/safe/run_stage2.sh"
     "$PROJECT_ROOT/stage1/loader_ramdisk/init"
-    "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery"
+    "$PROJECT_ROOT/scripts/build_loader.sh"
     "$PROJECT_ROOT/scripts/build_stage1.sh"
     "$PROJECT_ROOT/scripts/build_stage2_erofs.sh"
 )
+if [ -f "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" ]; then
+    SCRIPTS_TO_AUDIT+=("$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery")
+fi
 
 for s in "${SCRIPTS_TO_AUDIT[@]}"; do
     if [ -f "$s" ]; then
@@ -263,9 +327,12 @@ echo "--- 4. Auditing Stage-1/Stage-2 Integration & Handover Consistency ---" | 
 # 1. Consistent boot trigger (/mnt/boot_now)
 TRIGGER_RUNNER=$(grep -F "/mnt/boot_now" "$PROJECT_ROOT/tools/safe/run_stage2.sh" 2>/dev/null || true)
 TRIGGER_LOADER=$(grep -F "/mnt/boot_now" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null || true)
-TRIGGER_RECOVERY=$(grep -F "/mnt/boot_now" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null || true)
+TRIGGER_RECOVERY=""
+if [ -f "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" ]; then
+    TRIGGER_RECOVERY=$(grep -F "/mnt/boot_now" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null || true)
+fi
 
-if [ -n "$TRIGGER_RUNNER" ] && [ -n "$TRIGGER_LOADER" ] && [ -n "$TRIGGER_RECOVERY" ]; then
+if [ -n "$TRIGGER_RUNNER" ] && [ -n "$TRIGGER_LOADER" ] && { [ ! -f "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" ] || [ -n "$TRIGGER_RECOVERY" ]; }; then
     audit_pass "Consistent boot trigger (/mnt/boot_now) verified across runner and ramdisks"
 else
     audit_fail "Boot trigger consistency" "Boot trigger /mnt/boot_now is not recognized across all execution paths"
@@ -280,16 +347,30 @@ else
 fi
 
 # 3. Active hardware write lock enforcement (blockdev --setro)
-if grep -q "blockdev --setro" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null && \
-   grep -q "blockdev --setro" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null; then
+WRITE_LOCK_OK=1
+if ! grep -q "blockdev --setro" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null; then
+    WRITE_LOCK_OK=0
+fi
+if [ -f "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" ] && ! grep -q "blockdev --setro" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null; then
+    WRITE_LOCK_OK=0
+fi
+
+if [ "$WRITE_LOCK_OK" -eq 1 ]; then
     audit_pass "Dynamic hardware write lock (blockdev --setro) enforced in Stage-1 ramdisks"
 else
     audit_fail "Write lock enforcement" "Missing blockdev --setro in one or more Stage-1 ramdisks"
 fi
 
 # 4. Watchdog recovery presence
-if grep -q "watchdog" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null && \
-   grep -q "watchdog" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null; then
+WATCHDOG_OK=1
+if ! grep -q "watchdog" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null; then
+    WATCHDOG_OK=0
+fi
+if [ -f "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" ] && ! grep -q "watchdog" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null; then
+    WATCHDOG_OK=0
+fi
+
+if [ "$WATCHDOG_OK" -eq 1 ]; then
     audit_pass "Active safety watchdog monitor and reboot fallback verified in Stage-1 ramdisks"
 else
     audit_fail "Safety watchdog" "Missing watchdog monitor in one or more Stage-1 ramdisks"

@@ -8,7 +8,7 @@ echo "==========================================================" > /dev/kmsg
 echo "  STAGE-1 SAFE RAM HARNESS STARTING ON ONEPLUS 7T         " > /dev/kmsg
 echo "==========================================================" > /dev/kmsg
 
-# 1. Enforce read-only lock on all physical storage devices dynamically
+# 1. Enforce read-only lock on all physical storage devices and partitions dynamically
 for bdir in /sys/block/*; do
     [ -d "$bdir" ] || continue
     bname=$(basename "$bdir")
@@ -23,56 +23,67 @@ for bdir in /sys/block/*; do
             ro_val=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
             echo "[STAGE1] Physical device $dev_node locked read-only (ro=$ro_val)" > /dev/kmsg
         fi
+
+        # Discover and lock all child partitions
+        for pdir in "$bdir"/"$bname"*; do
+            [ -d "$pdir" ] || continue
+            pname=$(basename "$pdir")
+            part_node="/dev/block/$pname"
+            if [ -b "$part_node" ]; then
+                /system/bin/toybox blockdev --setro "$part_node" 2>/dev/null || true
+                pro_val=$(/system/bin/toybox blockdev --getro "$part_node" 2>/dev/null || echo "0")
+                echo "[STAGE1] Physical partition $part_node locked read-only (ro=$pro_val)" > /dev/kmsg
+            fi
+        done
     fi
 done
 
-# 2. Continuous Safety Guard Loop & Heartbeat Watchdog in background
-WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-60}"
-WATCHDOG_HEARTBEAT_FILE="${WATCHDOG_HEARTBEAT_FILE:-/mnt/watchdog_heartbeat}"
-WATCHDOG_CANCEL_FILE="${WATCHDOG_CANCEL_FILE:-/mnt/watchdog_cancel}"
-REBOOT_BIN="${REBOOT_BIN:-/system/bin/reboot}"
-
+# 2. Continuous Safety Guard Loop in background
 (
-    TIMEOUT="$WATCHDOG_TIMEOUT"
-    REMAINING=$TIMEOUT
-    echo "[STAGE1-GUARD] Continuous hardware RO monitor and ${TIMEOUT}s heartbeat watchdog armed." > /dev/kmsg 2>/dev/null || true
+    echo "[STAGE1-GUARD] Continuous dynamic hardware RO monitor armed." > /dev/kmsg 2>/dev/null || true
     while true; do
-        # A. Guard check: verify all physical UFS disks sda-sdf are strictly read-only
-        for dev in /dev/block/sda /dev/block/sdb /dev/block/sdc /dev/block/sdd /dev/block/sde /dev/block/sdf; do
-            if [ -b "$dev" ]; then
-                ro_status=$(/system/bin/toybox blockdev --getro "$dev" 2>/dev/null)
-                if [ "$ro_status" != "1" ]; then
-                    echo "[GUARD FATAL] Security violation: $dev became writable (ro=$ro_status)! Emergency rebooting to bootloader!" > /dev/kmsg 2>/dev/null || true
-                    /system/bin/toybox blockdev --setro "$dev" 2>/dev/null || true
-                    "$REBOOT_BIN" bootloader || /system/bin/reboot bootloader || true
-                    exit 1
+        # Dynamically verify all physical devices and child partitions remain strictly read-only
+        for bdir in /sys/block/*; do
+            [ -d "$bdir" ] || continue
+            bname=$(basename "$bdir")
+            case "$bname" in loop*|ram*|zram*|dm-*) continue ;; esac
+            if [ -e "$bdir/device" ] || case "$bname" in sd*|mmcblk*) true ;; *) false ;; esac; then
+                dev_node="/dev/block/$bname"
+                if [ -b "$dev_node" ]; then
+                    ro_status=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null)
+                    if [ "$ro_status" != "1" ]; then
+                        echo "[GUARD FATAL] Security violation: $dev_node became writable (ro=$ro_status)! Emergency rebooting!" > /dev/kmsg 2>/dev/null || true
+                        /system/bin/toybox blockdev --setro "$dev_node" 2>/dev/null || true
+                        /system/bin/reboot bootloader 2>/dev/null || true
+                        exit 1
+                    fi
                 fi
+                for pdir in "$bdir"/"$bname"*; do
+                    [ -d "$pdir" ] || continue
+                    pname=$(basename "$pdir")
+                    part_node="/dev/block/$pname"
+                    if [ -b "$part_node" ]; then
+                        pro_status=$(/system/bin/toybox blockdev --getro "$part_node" 2>/dev/null)
+                        if [ "$pro_status" != "1" ]; then
+                            echo "[GUARD FATAL] Security violation: partition $part_node became writable (ro=$pro_status)! Emergency rebooting!" > /dev/kmsg 2>/dev/null || true
+                            /system/bin/toybox blockdev --setro "$part_node" 2>/dev/null || true
+                            /system/bin/reboot bootloader 2>/dev/null || true
+                            exit 1
+                        fi
+                    fi
+                done
             fi
         done
-
-        # B. Heartbeat check: extend watchdog if host sends heartbeat signal or cancelled
-        if [ -f "$WATCHDOG_CANCEL_FILE" ] || [ -f /tmp/watchdog_cancel ]; then
-            REMAINING=86400
-        elif [ -f "$WATCHDOG_HEARTBEAT_FILE" ] && [ -s "$WATCHDOG_HEARTBEAT_FILE" ]; then
-            /system/bin/toybox rm -f "$WATCHDOG_HEARTBEAT_FILE" 2>/dev/null || true
-            REMAINING=$TIMEOUT
-        elif [ -f /tmp/watchdog_heartbeat ] && [ -s /tmp/watchdog_heartbeat ]; then
-            /system/bin/toybox rm -f /tmp/watchdog_heartbeat 2>/dev/null || true
-            REMAINING=$TIMEOUT
-        elif [ -d "$WATCHDOG_HEARTBEAT_FILE" ] || [ -d /tmp/watchdog_heartbeat ]; then
-            echo "[STAGE1-GUARD WARN] Malformed heartbeat: target is a directory!" > /dev/kmsg 2>/dev/null || true
-        fi
-
-        REMAINING=$((REMAINING - 1))
-        if [ "$REMAINING" -le 0 ]; then
-            echo "[WATCHDOG FATAL] Heartbeat lost for ${TIMEOUT}s! Safety timeout reached. Rebooting to bootloader..." > /dev/kmsg 2>/dev/null || true
-            "$REBOOT_BIN" bootloader || /system/bin/reboot bootloader || true
-            exit 1
-        fi
-
-        /system/bin/toybox sleep 1
+        /system/bin/toybox sleep 2
     done
 ) &
+
+# 3. Launch Safety Watchdog Supervisor
+if [ -x /system/bin/watchdog.sh ]; then
+    /system/bin/sh /system/bin/watchdog.sh &
+elif [ -f /scripts/watchdog.sh ]; then
+    /system/bin/sh /scripts/watchdog.sh &
+fi
 
 # 3. Turn on screen backlight
 if [ -f /sys/class/backlight/panel0-backlight/brightness ]; then

@@ -27,7 +27,7 @@ fi
 echo "Phone connected successfully in Stage-1 RAM mode."
 
 # 2. Dynamic Physical Storage Device Detection (Metacharacter-free ADB commands)
-echo "2. Dynamically detecting physical storage devices on target..."
+echo "2. Dynamically detecting physical storage devices and child partitions on target..."
 DISCOVERED_PHYSICAL_DEVS=()
 
 # Query sysfs block devices on target using safe diagnostic 'ls -1 /sys/block'
@@ -41,11 +41,22 @@ for bdev in $BLOCK_ENTRIES; do
     fi
 
     # Check physical hardware device backing node using safe test command
+    IS_PHYSICAL=0
     if "$SAFE_ADB" shell "test -e /sys/block/$bdev/device" >/dev/null 2>&1; then
-        DISCOVERED_PHYSICAL_DEVS+=("/dev/block/$bdev")
+        IS_PHYSICAL=1
     elif [[ "$bdev" =~ ^(sd[a-z]|mmcblk[0-9]) ]]; then
-        # Known physical storage prefix fallback
+        IS_PHYSICAL=1
+    fi
+
+    if [ "$IS_PHYSICAL" -eq 1 ]; then
         DISCOVERED_PHYSICAL_DEVS+=("/dev/block/$bdev")
+        # Query and discover child partitions under this physical disk
+        PART_ENTRIES=$("$SAFE_ADB" shell "ls -1 /sys/block/$bdev" 2>/dev/null | tr -d '\r' || true)
+        for p in $PART_ENTRIES; do
+            if [[ "$p" =~ ^${bdev}[0-9]+ ]] || [[ "$p" =~ ^${bdev}p[0-9]+ ]]; then
+                DISCOVERED_PHYSICAL_DEVS+=("/dev/block/$p")
+            fi
+        done
     fi
 done
 
@@ -55,22 +66,22 @@ if [ "${#DISCOVERED_PHYSICAL_DEVS[@]}" -eq 0 ]; then
     exit 1
 fi
 
-echo "Identified physical storage devices: ${DISCOVERED_PHYSICAL_DEVS[*]}"
+echo "Identified physical storage devices and partitions: ${DISCOVERED_PHYSICAL_DEVS[*]}"
 
-# 3. Verify Block Layer Read-Only Status on All Discovered Physical Devices
-echo "3. Verifying block-layer write-lock (ro=1) on all physical devices..."
+# 3. Verify Block Layer Read-Only Status on All Discovered Physical Devices & Partitions
+echo "3. Verifying block-layer write-lock (ro=1) on all physical devices and partitions..."
 for dev_path in "${DISCOVERED_PHYSICAL_DEVS[@]}"; do
     ro_val=$("$SAFE_ADB" shell "blockdev --getro $dev_path" 2>/dev/null | tr -d '\r\n[:space:]')
     if [ "$ro_val" != "1" ]; then
-        echo "CRITICAL SAFETY VIOLATION: Device $dev_path is NOT read-only (ro=$ro_val)!" >&2
+        echo "CRITICAL SAFETY VIOLATION: Device/partition $dev_path is NOT read-only (ro=$ro_val)!" >&2
         echo "Halting immediately to protect physical internal storage." >&2
         exit 1
     fi
     echo "  Verified: $dev_path is read-only (ro=1)"
 done
 
-# Check live mount table to ensure zero physical block devices are mounted writable
-WRITABLE_MOUNTS=$("$SAFE_ADB" shell "mount" | grep -E "^/dev/block/(sd|mmcblk)" | grep -v "ro," || true)
+# Check live mount table to ensure zero physical block devices or partitions are mounted writable
+WRITABLE_MOUNTS=$("$SAFE_ADB" shell "mount" | grep -E "^/dev/block/(sd|mmcblk)" | grep -E "([ ,(]rw[ ,)]|,rw$)" || true)
 if [ -n "$WRITABLE_MOUNTS" ]; then
     echo "CRITICAL SAFETY VIOLATION: Detected writable physical partition mount:" >&2
     echo "$WRITABLE_MOUNTS" >&2
@@ -78,14 +89,21 @@ if [ -n "$WRITABLE_MOUNTS" ]; then
 fi
 echo "Verified: Zero physical storage devices mounted writable."
 
+# Verify /mnt is mounted as RAM-backed tmpfs on target
+if ! "$SAFE_ADB" shell "mount" | grep -E " /mnt type tmpfs " >/dev/null 2>&1; then
+    echo "CRITICAL SAFETY VIOLATION: /mnt is not mounted as a RAM-backed tmpfs on target device!" >&2
+    exit 1
+fi
+echo "Verified: /mnt is confirmed as volatile RAM tmpfs."
+
 # 4. Start Active Host Heartbeat Loop
 echo "4. Starting active host safety heartbeat loop..."
-# Sends heartbeat signal to /mnt/watchdog_heartbeat every 10 seconds.
-# Stage-1 watchdog resets on each heartbeat. If host disconnects, Stage-1 reboots to bootloader after timeout.
+# Sends regular heartbeat signal to /mnt/watchdog_heartbeat every 5 seconds.
+# Stage-1 watchdog resets countdown on each valid regular heartbeat.
 (
     while true; do
         "$SAFE_ADB" shell "touch /mnt/watchdog_heartbeat" >/dev/null 2>&1 || true
-        sleep 10
+        sleep 5
     done
 ) >/dev/null 2>&1 &
 HEARTBEAT_PID=$!
@@ -98,7 +116,7 @@ echo "5. Checking free volatile RAM on target..."
 
 # 6. Push Partition Images to Phone RAM (/mnt/)
 echo "6. Pushing verified partition images to phone volatile RAM (/mnt/)..."
-# Mandatory images required for Android bringup
+# Mandatory images strictly required for Android bringup
 MANDATORY_IMAGES=(
     "system.erofs.img:/mnt/system.img"
     "system_ext.erofs.img:/mnt/system_ext.img"
@@ -116,17 +134,38 @@ else
     exit 1
 fi
 
-# Optional partition images
+# Runtime APEX image resolution (MANDATORY)
+if [ -f "$IMAGES_DIR/runtime_apex.img" ] && [ -s "$IMAGES_DIR/runtime_apex.img" ]; then
+    MANDATORY_IMAGES+=("runtime_apex.img:/mnt/runtime_apex.img")
+elif [ -f "$IMAGES_DIR/runtime_apex.erofs.img" ] && [ -s "$IMAGES_DIR/runtime_apex.erofs.img" ]; then
+    MANDATORY_IMAGES+=("runtime_apex.erofs.img:/mnt/runtime_apex.img")
+else
+    echo "CRITICAL ERROR: Mandatory runtime APEX image (runtime_apex.img) not found or 0 bytes in $IMAGES_DIR!" >&2
+    exit 1
+fi
+
+# Optional partition and APEX images
 OPTIONAL_IMAGES=()
 if [ -f "$IMAGES_DIR/my_region.erofs.img" ]; then
     OPTIONAL_IMAGES+=("my_region.erofs.img:/mnt/my_region.img")
 fi
-if [ -f "$IMAGES_DIR/runtime_apex.img" ]; then
-    OPTIONAL_IMAGES+=("runtime_apex.img:/mnt/runtime_apex.img")
-fi
 if [ -f "$IMAGES_DIR/runtime_apex.fstype" ]; then
+    if [ ! -s "$IMAGES_DIR/runtime_apex.fstype" ]; then
+        echo "CRITICAL ERROR: APEX metadata $IMAGES_DIR/runtime_apex.fstype is 0 bytes!" >&2
+        exit 1
+    fi
     OPTIONAL_IMAGES+=("runtime_apex.fstype:/mnt/runtime_apex.fstype")
 fi
+
+# Additional bootstrap APEXes if available
+for apex_mod in "art_apex.img" "i18n_apex.img" "tzdata_apex.img"; do
+    if [ -f "$IMAGES_DIR/$apex_mod" ] && [ -s "$IMAGES_DIR/$apex_mod" ]; then
+        OPTIONAL_IMAGES+=("$apex_mod:/mnt/$apex_mod")
+        if [ -f "$IMAGES_DIR/${apex_mod%.img}.fstype" ]; then
+            OPTIONAL_IMAGES+=("${apex_mod%.img}.fstype:/mnt/${apex_mod%.img}.fstype")
+        fi
+    fi
+done
 
 ALL_IMAGES=("${MANDATORY_IMAGES[@]}" "${OPTIONAL_IMAGES[@]}")
 

@@ -123,16 +123,54 @@ def test_diagnostic_state_clearing_blocked():
     print("[PASS] Diagnostic state clearing blocked tests passed.")
 
 def test_real_adb_validation():
-    # 1. Self-reference recursion prevention
+    # 1. Self-reference recursion prevention (tested without test mode)
     code, out, err = run_adb(["get-state"], env_override={"REAL_ADB_BIN": SAFE_ADB})
     assert code == 1, "Expected recursion error when pointing REAL_ADB_BIN to wrapper itself"
-    assert "infinite recursion" in err or "SAFETY ERROR" in err
+    assert "infinite recursion" in err
 
-    # 2. Non-existent binary
-    code, out, err = run_adb(["get-state"], env_override={"REAL_ADB_BIN": "/nonexistent/binary_xyz"})
+    # 2. Arbitrary override rejected in production mode
+    code, out, err = run_adb(["get-state"], env_override={"REAL_ADB_BIN": "/tmp/custom_adb"})
+    assert code == 1, "Expected rejection of arbitrary REAL_ADB_BIN in production"
+    assert "rejected in production" in err
+
+    # 3. Non-existent binary in test mode
+    code, out, err = run_adb(["get-state"], env_override={"REAL_ADB_BIN": "/nonexistent/binary_xyz", "OOS16_TEST_MODE": "1"})
     assert code == 1, "Expected error when pointing REAL_ADB_BIN to nonexistent path"
     assert "does not exist" in err
+
+    # 4. Non-executable file in test mode
+    non_exec = os.path.join(PROJECT_ROOT, "README.md")
+    code, out, err = run_adb(["get-state"], env_override={"REAL_ADB_BIN": non_exec, "OOS16_TEST_MODE": "1"})
+    assert code == 1, "Expected error when pointing REAL_ADB_BIN to non-executable file"
+    assert "is not executable" in err
     print("[PASS] Real ADB executable validation tests passed.")
+
+def test_remote_symlink_escape_rejection():
+    # Create temporary mock adb that simulates symlink escape detection on device
+    import tempfile, stat
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mock_adb = os.path.join(tmpdir, "mock_adb")
+        with open(mock_adb, "w") as f:
+            f.write("""#!/bin/sh
+if [ "$1" = "shell" ] && [ "$2" = "readlink" ]; then
+    echo "/data/escape_target"
+    exit 0
+fi
+exit 0
+""")
+        os.chmod(mock_adb, os.stat(mock_adb).st_mode | stat.S_IEXEC)
+        dummy_file = os.path.join(tmpdir, "test.txt")
+        with open(dummy_file, "w") as f:
+            f.write("test")
+
+        code, out, err = run_adb(["push", dummy_file, "/mnt/escape_link"], env_override={
+            "REAL_ADB_BIN": mock_adb,
+            "OOS16_TEST_MODE": "1"
+        })
+        assert code == 1, f"Expected symlink escape to be rejected, got code {code}"
+        assert "symlink resolving to" in err
+        assert "REJECTED" in err
+    print("[PASS] Remote symlink escape rejection test passed.")
 
 if __name__ == "__main__":
     test_blocked_subcommands()
@@ -142,4 +180,5 @@ if __name__ == "__main__":
     test_toybox_restrictions()
     test_diagnostic_state_clearing_blocked()
     test_real_adb_validation()
+    test_remote_symlink_escape_rejection()
     print("ALL ADB SAFETY WRAPPER TESTS PASSED!")

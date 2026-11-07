@@ -77,7 +77,7 @@ for bdir in /sys/block/*; do
 
         if [ -b "$dev_node" ]; then
             PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
-            # Apply hardware read-only lock
+            # Apply hardware read-only lock to whole disk
             /system/bin/toybox blockdev --setro "$dev_node" 2>/dev/null || true
             ro_status=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
             if [ "$ro_status" = "1" ]; then
@@ -86,6 +86,32 @@ for bdir in /sys/block/*; do
             else
                 fatal_halt "CRITICAL SAFETY FAILURE: Failed to lock $dev_node read-only (ro=$ro_status)!"
             fi
+
+            # Discover and lock all child partitions of this physical device
+            for pdir in "$bdir"/"$bname"*; do
+                [ -d "$pdir" ] || continue
+                pname=$(basename "$pdir")
+                part_node="/dev/block/$pname"
+                if [ ! -b "$part_node" ]; then
+                    if [ -f "$pdir/dev" ]; then
+                        pmaj_min=$(cat "$pdir/dev")
+                        pmaj="${pmaj_min%%:*}"
+                        pmin="${pmaj_min##*:}"
+                        /system/bin/toybox mknod "$part_node" b "$pmaj" "$pmin" 2>/dev/null || true
+                    fi
+                fi
+                if [ -b "$part_node" ]; then
+                    PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
+                    /system/bin/toybox blockdev --setro "$part_node" 2>/dev/null || true
+                    pro_status=$(/system/bin/toybox blockdev --getro "$part_node" 2>/dev/null || echo "0")
+                    if [ "$pro_status" = "1" ]; then
+                        LOCKED_DEV_COUNT=$((LOCKED_DEV_COUNT + 1))
+                        log_kmsg "[LOADER-PID1] Locked physical partition read-only: $part_node (ro=1)"
+                    else
+                        fatal_halt "CRITICAL SAFETY FAILURE: Failed to lock partition $part_node read-only (ro=$pro_status)!"
+                    fi
+                fi
+            done
         fi
     fi
 done
@@ -136,40 +162,15 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 # 6. Active Watchdog Supervisor & Heartbeat Monitor
-# Monitors $WATCHDOG_HEARTBEAT_FILE. If heartbeat stops, triggers fallback reboot.
-WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-60}"
-WATCHDOG_HEARTBEAT_FILE="${WATCHDOG_HEARTBEAT_FILE:-/mnt/watchdog_heartbeat}"
-WATCHDOG_CANCEL_FILE="${WATCHDOG_CANCEL_FILE:-/mnt/watchdog_cancel}"
-REBOOT_BIN="${REBOOT_BIN:-/system/bin/reboot}"
-
-(
-    TIMEOUT="$WATCHDOG_TIMEOUT"
-    REMAINING=$TIMEOUT
-    while true; do
-        if [ -f "$WATCHDOG_CANCEL_FILE" ] || [ -f /tmp/watchdog_cancel ]; then
-            REMAINING=86400
-        elif [ -f "$WATCHDOG_HEARTBEAT_FILE" ] && [ -s "$WATCHDOG_HEARTBEAT_FILE" ]; then
-            /system/bin/toybox rm -f "$WATCHDOG_HEARTBEAT_FILE" 2>/dev/null || true
-            REMAINING=$TIMEOUT
-        elif [ -f /tmp/watchdog_heartbeat ] && [ -s /tmp/watchdog_heartbeat ]; then
-            /system/bin/toybox rm -f /tmp/watchdog_heartbeat 2>/dev/null || true
-            REMAINING=$TIMEOUT
-        elif [ -d "$WATCHDOG_HEARTBEAT_FILE" ] || [ -d /tmp/watchdog_heartbeat ]; then
-            log_kmsg "[WATCHDOG WARN] Malformed heartbeat: target is a directory, not a regular file!"
-        fi
-
-        REMAINING=$((REMAINING - 1))
-        if [ "$REMAINING" -le 0 ]; then
-            log_kmsg "[WATCHDOG FATAL] Safety heartbeat lost for ${TIMEOUT}s! Host connection lost."
-            log_kmsg "[WATCHDOG FATAL] Initiating safe emergency reboot to bootloader..."
-            "$REBOOT_BIN" bootloader || /system/bin/reboot bootloader || true
-            exit 1
-        fi
-        /system/bin/toybox sleep 1
-    done
-) &
-WATCHDOG_PID=$!
-log_kmsg "[LOADER-PID1] Safety watchdog supervisor active (PID: $WATCHDOG_PID, ${WATCHDOG_TIMEOUT}s timeout)"
+if [ -x /system/bin/watchdog.sh ]; then
+    /system/bin/sh /system/bin/watchdog.sh &
+    WATCHDOG_PID=$!
+    log_kmsg "[LOADER-PID1] Safety watchdog supervisor active (PID: $WATCHDOG_PID)"
+elif [ -f /scripts/watchdog.sh ]; then
+    /system/bin/sh /scripts/watchdog.sh &
+    WATCHDOG_PID=$!
+    log_kmsg "[LOADER-PID1] Safety watchdog supervisor active (PID: $WATCHDOG_PID)"
+fi
 
 # 7. Await Boot Trigger (/mnt/boot_now)
 log_kmsg "[LOADER-PID1] Staging area ready. Waiting for runner image transfer and /mnt/boot_now trigger..."

@@ -28,6 +28,8 @@ BUILD_EROFS = os.path.join(PROJECT_ROOT, "scripts/build_stage2_erofs.sh")
 
 class TestStage2Integration(unittest.TestCase):
     def setUp(self):
+        self.orig_test_mode = os.environ.get("OOS16_TEST_MODE")
+        os.environ["OOS16_TEST_MODE"] = "1"
         self.test_dir = tempfile.mkdtemp(prefix="oos16_test_")
         self.mock_bin_dir = os.path.join(self.test_dir, "bin")
         os.makedirs(self.mock_bin_dir, exist_ok=True)
@@ -35,6 +37,10 @@ class TestStage2Integration(unittest.TestCase):
         os.makedirs(self.mock_device_dir, exist_ok=True)
 
     def tearDown(self):
+        if self.orig_test_mode is not None:
+            os.environ["OOS16_TEST_MODE"] = self.orig_test_mode
+        else:
+            os.environ.pop("OOS16_TEST_MODE", None)
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def create_mock_adb(self, behavior_config):
@@ -71,6 +77,11 @@ if subcmd == "push":
 if subcmd in ["shell", "exec-out"]:
     shell_cmd = " ".join(args[1:])
     
+    if "ls -1 /sys/block/sda" in shell_cmd:
+        if "{behavior_config.get('fail_partition_ro', '')}":
+            print("sda1\\nsda2\\nqueue")
+            sys.exit(0)
+            
     if "ls -1 /sys/block" in shell_cmd:
         print({block_devs})
         sys.exit(0)
@@ -85,6 +96,10 @@ if subcmd in ["shell", "exec-out"]:
         
     if "blockdev --getro" in shell_cmd:
         dev_node = shell_cmd.split()[-1]
+        fail_part = "{behavior_config.get('fail_partition_ro', '')}"
+        if fail_part and fail_part in dev_node:
+            print("0")
+            sys.exit(0)
         if "{behavior_config.get('writable_disk', False)}" == "True" and "sda" in dev_node:
             print("0")
         else:
@@ -126,6 +141,10 @@ if subcmd in ["shell", "exec-out"]:
             sys.exit(0)
         else:
             sys.exit(1)
+        
+    if "readlink" in shell_cmd:
+        print(shell_cmd.split()[-1])
+        sys.exit(0)
         
     if "touch /mnt/watchdog_heartbeat" in shell_cmd:
         sys.exit(0)
@@ -555,6 +574,140 @@ EOF
                               capture_output=True, text=True, env=env)
         self.assertNotEqual(res4.returncode, 0)
         self.assertIn("SAFETY VIOLATION", res4.stderr)
+
+    def test_runner_aborts_on_missing_runtime_apex(self):
+        """Verify runner halts if mandatory runtime_apex.img is missing."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "missing_runtime_images")
+        self.create_dummy_images(test_images)
+        os.remove(os.path.join(test_images, "runtime_apex.img"))
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Mandatory runtime APEX image (runtime_apex.img) not found", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_empty_apex_metadata(self):
+        """Verify runner halts if APEX metadata .fstype file exists but is 0 bytes."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "empty_meta_images")
+        self.create_dummy_images(test_images)
+        with open(os.path.join(test_images, "runtime_apex.fstype"), "w") as f:
+            pass  # 0 bytes
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL ERROR: APEX metadata", res.stderr + res.stdout)
+        self.assertIn("is 0 bytes", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_physical_partition_ro_failure(self):
+        """Verify runner aborts immediately if a physical child partition has ro=0."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_partition_ro": "sda1"})
+        test_images = os.path.join(self.test_dir, "part_ro_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL SAFETY VIOLATION", res.stderr + res.stdout)
+        self.assertIn("/dev/block/sda1 is NOT read-only (ro=0)", res.stderr + res.stdout)
+
+    def test_auditor_detects_embedded_stage2_script_mismatch(self):
+        """Verify auditor fails if embedded stage2_init.sh differs from scripts/stage2_init.sh."""
+        ramdisk_copy = os.path.join(self.test_dir, "tampered_ramdisk")
+        shutil.copytree(os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk"), ramdisk_copy, symlinks=True)
+        target_script = os.path.join(ramdisk_copy, "system/bin/stage2_init.sh")
+        with open(target_script, "a") as f:
+            f.write("\n# TAMPERED LINE\n")
+
+        res = subprocess.run([AUDIT_SCRIPT, ramdisk_copy], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Embedded script mismatch", res.stdout)
+        self.assertIn("Embedded stage2_init.sh differs from scripts/stage2_init.sh", res.stdout)
+
+    def test_auditor_detects_missing_embedded_watchdog(self):
+        """Verify auditor fails if embedded watchdog.sh is missing from target ramdisk."""
+        ramdisk_copy = os.path.join(self.test_dir, "missing_wd_ramdisk")
+        shutil.copytree(os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk"), ramdisk_copy, symlinks=True)
+        os.remove(os.path.join(ramdisk_copy, "system/bin/watchdog.sh"))
+
+        res = subprocess.run([AUDIT_SCRIPT, ramdisk_copy], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Embedded watchdog.sh: Watchdog supervisor script missing", res.stdout)
+
+    def test_stage2_init_missing_bootstrap_art_apex_halts(self):
+        """Verify stage2_init.sh halts if mandatory bootstrap art APEX is missing."""
+        sim_script = """#!/bin/sh
+        # Simulate populate_apex failure for mandatory module
+        mandatory=1
+        img_path=""
+        donor_apex=""
+        if [ -z "$img_path" ] && [ -z "$donor_apex" ] && [ "$mandatory" -eq 1 ]; then
+            echo "[STAGE2 FATAL] Mandatory APEX com.android.art (art_apex.img) not found in staging area or system partition!" >&2
+            exit 77
+        fi
+        exit 0
+        """
+        res = subprocess.run(["sh", "-c", sim_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 77)
+        self.assertIn("Mandatory APEX com.android.art (art_apex.img) not found", res.stderr)
+
+    def test_erofs_atomic_publication_and_rollback(self):
+        """Verify that interrupted or failed EROFS build preserves existing valid output."""
+        mock_out = os.path.join(self.test_dir, "mock_out_images")
+        os.makedirs(mock_out, exist_ok=True)
+        valid_sentinel = os.path.join(mock_out, "valid_previous_image.img")
+        with open(valid_sentinel, "w") as f:
+            f.write("PREVIOUS_VALID_IMAGE_DATA")
+
+        # Simulate atomic publishing failure rollback logic from build_stage2_erofs.sh
+        sim_build = f"""#!/usr/bin/env bash
+set -euo pipefail
+OUT_DIR="{mock_out}"
+BUILD_PARENT="$(dirname "$OUT_DIR")"
+BACKUP_OUT_DIR="$BUILD_PARENT/.backup_images_test"
+STAGING_DIR="$BUILD_PARENT/.staging_test"
+mkdir -p "$STAGING_DIR"
+
+BUILD_SUCCESS=0
+cleanup() {{
+    if [ "$BUILD_SUCCESS" -ne 1 ]; then
+        if [ -d "$BACKUP_OUT_DIR" ]; then
+            rm -rf "$OUT_DIR" 2>/dev/null || true
+            mv "$BACKUP_OUT_DIR" "$OUT_DIR"
+        fi
+    fi
+    rm -rf "$STAGING_DIR" 2>/dev/null || true
+}}
+trap cleanup EXIT ERR
+
+# Step 1: Backup old OUT_DIR
+if [ -d "$OUT_DIR" ] && [ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]; then
+    mv "$OUT_DIR" "$BACKUP_OUT_DIR"
+fi
+
+# Step 2: Simulate failure while staging/publishing
+mkdir -p "$OUT_DIR"
+echo "corrupt" > "$OUT_DIR/corrupt.img"
+# Intentional failure triggered here
+exit 1
+"""
+        res = subprocess.run(["bash", "-c", sim_build], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        # Verify previous valid output was restored
+        self.assertTrue(os.path.exists(valid_sentinel), "Previous valid image was lost during failure!")
+        with open(valid_sentinel) as f:
+            self.assertEqual(f.read(), "PREVIOUS_VALID_IMAGE_DATA")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

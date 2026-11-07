@@ -32,13 +32,14 @@ mount_or_fail() {
     /system/bin/toybox mount "$@" || fatal "Failed mandatory mount: mount $*"
 }
 
-# 1. Heartbeat check
-if [ -f /mnt/watchdog_heartbeat ] || [ -f /tmp/watchdog_heartbeat ]; then
+# 1. Heartbeat check (Validates regular file, rejects symlinks and directories)
+if ([ -f /mnt/watchdog_heartbeat ] && [ ! -L /mnt/watchdog_heartbeat ]) || \
+   ([ -f /tmp/watchdog_heartbeat ] && [ ! -L /tmp/watchdog_heartbeat ]); then
     echo "[STAGE2] Active host heartbeat signal verified." > /dev/kmsg
 fi
 
-# 2. Strict read-only verification of physical block devices
-echo "[STAGE2] Verifying physical block devices are write-locked read-only..." > /dev/kmsg
+# 2. Strict read-only verification of physical block devices and child partitions
+echo "[STAGE2] Verifying physical block devices and child partitions are write-locked read-only..." > /dev/kmsg
 DISCOVERED_PHYSICAL=0
 for bdir in /sys/block/*; do
     [ -d "$bdir" ] || continue
@@ -56,13 +57,38 @@ for bdir in /sys/block/*; do
                 fatal "$dev_node is NOT read-only (ro=$ro)! Halting to protect physical storage."
             fi
         fi
+
+        # Verify all child partitions
+        for pdir in "$bdir"/"$bname"*; do
+            [ -d "$pdir" ] || continue
+            pname=$(basename "$pdir")
+            part_node="/dev/block/$pname"
+            if [ -b "$part_node" ]; then
+                DISCOVERED_PHYSICAL=$((DISCOVERED_PHYSICAL + 1))
+                pro=$(/system/bin/toybox blockdev --getro "$part_node" 2>/dev/null || echo "0")
+                if [ "$pro" != "1" ]; then
+                    fatal "Partition $part_node is NOT read-only (ro=$pro)! Halting to protect physical storage."
+                fi
+            fi
+        done
     fi
 done
 
 if [ "$DISCOVERED_PHYSICAL" -eq 0 ]; then
     fatal "No physical block devices detected. Cannot verify physical disk write locks!"
 fi
-echo "[STAGE2] Verified: All physical storage devices are strictly locked read-only (ro=1)." > /dev/kmsg
+
+# Verify no physical devices or partitions are mounted writable
+if /system/bin/toybox mount | grep -E "^/dev/block/(sd|mmcblk)" | grep -E "([ ,(]rw[ ,)]|,rw$)"; then
+    fatal "CRITICAL SAFETY VIOLATION: Detected writable physical partition mount!"
+fi
+
+# Verify /mnt and /tmp are mounted as RAM-backed tmpfs
+if ! /system/bin/toybox mount | grep -q " /mnt type tmpfs "; then
+    fatal "CRITICAL SAFETY FAILURE: Staging directory /mnt is not mounted as RAM tmpfs!"
+fi
+
+echo "[STAGE2] Verified: All $DISCOVERED_PHYSICAL physical storage devices and partitions are strictly locked read-only (ro=1)." > /dev/kmsg
 
 # 3. Clean up any previous mounts
 /system/bin/toybox umount -R /mnt/sysroot 2>/dev/null || true
@@ -173,40 +199,96 @@ ODM_IMG=$(get_img "odm.img")
 [ -n "$ODM_IMG" ] || fatal "Mandatory odm.img not found in /mnt/ or /tmp/!"
 mount_partition "odm" "$ODM_IMG" 1
 
-# 7. Strict Runtime APEX Filesystem Handling & Dynamic Linker Validation
-echo "[STAGE2] Preparing Bionic runtime APEX on tmpfs..." > /dev/kmsg
+# 7. Strict Android 16 Bootstrap APEX Handling & Validation
+echo "[STAGE2] Preparing Android 16 bootstrap APEX environments on tmpfs..." > /dev/kmsg
 mount_or_fail -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/apex
 
-/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime
-/system/bin/toybox mkdir -p /tmp/apex_payload_staging
+populate_apex() {
+    local mod_name="$1"
+    local img_name="$2"
+    local target_dir="/mnt/sysroot/apex/$mod_name"
+    local mandatory="${3:-1}"
 
-RUNTIME_IMG=$(get_img "runtime_apex.img")
-[ -z "$RUNTIME_IMG" ] && RUNTIME_IMG=$(get_img "runtime_apex.erofs.img")
-[ -n "$RUNTIME_IMG" ] || fatal "Mandatory runtime_apex.img not found in /mnt/ or /tmp/!"
+    /system/bin/toybox mkdir -p "$target_dir"
+    /system/bin/toybox mkdir -p "/tmp/apex_stage_${mod_name}"
 
-APEX_FSTYPE="erofs"
-if [ -f /mnt/runtime_apex.fstype ]; then
-    APEX_FSTYPE=$(cat /mnt/runtime_apex.fstype | tr -d '[:space:]')
-elif [ -f /tmp/runtime_apex.fstype ]; then
-    APEX_FSTYPE=$(cat /tmp/runtime_apex.fstype | tr -d '[:space:]')
-fi
+    local img_path=$(get_img "$img_name")
+    local fstype="erofs"
 
-# Loop mount runtime APEX payload without error suppression
-mount_or_fail -t "$APEX_FSTYPE" -o ro,loop "$RUNTIME_IMG" /tmp/apex_payload_staging
+    if [ -n "$img_path" ] && [ -s "$img_path" ]; then
+        if [ -f "/mnt/${img_name%.img}.fstype" ]; then
+            fstype=$(cat "/mnt/${img_name%.img}.fstype" | tr -d '[:space:]')
+        elif [ -f "/tmp/${img_name%.img}.fstype" ]; then
+            fstype=$(cat "/tmp/${img_name%.img}.fstype" | tr -d '[:space:]')
+        fi
+        echo "[STAGE2] Staging $mod_name from image $img_path (fstype: $fstype)..." > /dev/kmsg
+        mount_or_fail -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"
+        /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$target_dir/" || fatal "Failed to copy $mod_name payload!"
+        /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
+    else
+        # Fallback to authentic donor partition packages in /mnt/sysroot/system/apex/
+        local donor_apex=""
+        for candidate in \
+            "/mnt/sysroot/system/apex/${mod_name}.apex" \
+            "/mnt/sysroot/system/apex/${mod_name}_compressed.apex" \
+            "/mnt/sysroot/system/apex/com.google.android.${mod_name#com.android.}_compressed.apex" \
+            "/mnt/sysroot/system/apex/com.google.android.${mod_name#com.android.}.apex" \
+            "/mnt/sysroot/system/apex/com.google.android.tzdata6.apex"; do
+            if [ -f "$candidate" ]; then
+                donor_apex="$candidate"
+                break
+            fi
+        done
 
-# Copy all payload contents into writable runtime APEX hierarchy
-echo "[STAGE2] Populating /mnt/sysroot/apex/com.android.runtime from payload..." > /dev/kmsg
-/system/bin/toybox cp -a /tmp/apex_payload_staging/* /mnt/sysroot/apex/com.android.runtime/ || fatal "Failed to copy runtime APEX payload!"
-/system/bin/toybox umount /tmp/apex_payload_staging || true
+        if [ -n "$donor_apex" ]; then
+            echo "[STAGE2] Extracting authentic donor APEX $donor_apex for $mod_name..." > /dev/kmsg
+            local unpack_tmp="/tmp/unpack_${mod_name}"
+            /system/bin/toybox mkdir -p "$unpack_tmp"
+            if /system/bin/unzip -q "$donor_apex" "apex_payload.img" -d "$unpack_tmp" 2>/dev/null; then
+                local pimg="$unpack_tmp/apex_payload.img"
+                mount_or_fail -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" 2>/dev/null || \
+                mount_or_fail -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"
+                /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$target_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
+                /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
+            elif /system/bin/unzip -q "$donor_apex" "original_apex" -d "$unpack_tmp" 2>/dev/null; then
+                local orig_apex="$unpack_tmp/original_apex"
+                if /system/bin/unzip -q "$orig_apex" "apex_payload.img" -d "$unpack_tmp/orig" 2>/dev/null; then
+                    local pimg="$unpack_tmp/orig/apex_payload.img"
+                    mount_or_fail -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" 2>/dev/null || \
+                    mount_or_fail -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"
+                    /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$target_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
+                    /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
+                fi
+            fi
+            /system/bin/toybox rm -rf "$unpack_tmp" 2>/dev/null || true
+        elif [ "$mandatory" -eq 1 ]; then
+            fatal "Mandatory APEX $mod_name ($img_name) not found in staging area or system partition!"
+        fi
+    fi
 
-# Strict Validation of Authentic Runtime Bionic Binaries & Libraries (No invented placeholders)
+    # Create canonical versioned symlink
+    /system/bin/toybox ln -sf "$mod_name" "/mnt/sysroot/apex/${mod_name}@1" 2>/dev/null || true
+}
+
+# Populate all 4 required Android bootstrap APEX modules
+populate_apex "com.android.runtime" "runtime_apex.img" 1
+populate_apex "com.android.art" "art_apex.img" 1
+populate_apex "com.android.i18n" "i18n_apex.img" 1
+populate_apex "com.android.tzdata" "tzdata_apex.img" 1
+
+# Strict Validation of Authentic Runtime Bionic Binaries & Libraries
 [ -f /mnt/sysroot/apex/com.android.runtime/bin/linker64 ] || fatal "Bionic linker64 is MISSING from runtime APEX!"
 [ -x /mnt/sysroot/apex/com.android.runtime/bin/linker64 ] || fatal "Bionic linker64 is not executable in runtime APEX!"
 [ -f /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libc.so ] || fatal "Bionic libc.so is MISSING from runtime APEX!"
 [ -f /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libm.so ] || fatal "Bionic libm.so is MISSING from runtime APEX!"
 [ -f /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libdl.so ] || fatal "Bionic libdl.so is MISSING from runtime APEX!"
 
-echo "[STAGE2] Strict verification passed: Authentic Bionic runtime APEX and linker64 are ready." > /dev/kmsg
+# Strict Validation of Authentic ART, I18N, and TZDATA Modules
+[ -f /mnt/sysroot/apex/com.android.art/lib64/libart.so ] || fatal "ART libart.so is MISSING from art APEX!"
+[ -f /mnt/sysroot/apex/com.android.i18n/lib64/libandroidicu.so ] || [ -f /mnt/sysroot/apex/com.android.i18n/lib64/libicuuc.so ] || fatal "ICU libraries MISSING from i18n APEX!"
+[ -f /mnt/sysroot/apex/com.android.tzdata/etc/tz/tzdata ] || [ -f /mnt/sysroot/apex/com.android.tzdata/etc/icu/icu_tzdata.dat ] || fatal "Timezone data MISSING from tzdata APEX!"
+
+echo "[STAGE2] Strict verification passed: Authentic Bionic, ART, I18N, and TZDATA APEX environments ready." > /dev/kmsg
 
 # 8. Linker Configuration & Runtime Directories
 mount_or_fail -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/linkerconfig

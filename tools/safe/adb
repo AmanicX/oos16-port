@@ -17,16 +17,27 @@ from datetime import datetime
 LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
 
 # 1. Validated Real ADB Binary Discovery
+ALLOW_MOCK_ENV = "OOS16_TEST_MODE"
+APPROVED_SYSTEM_ADB_DIRS = ("/usr/bin", "/bin", "/usr/local/bin")
+
 if "REAL_ADB_BIN" in os.environ:
     REAL_ADB = os.environ["REAL_ADB_BIN"]
+    if os.path.exists(REAL_ADB) and os.path.realpath(REAL_ADB) == os.path.realpath(__file__):
+        print(f"[ADB SAFETY ERROR] REAL_ADB_BIN points to the safety wrapper itself (infinite recursion rejected).", file=sys.stderr)
+        sys.exit(1)
+
+    is_test_mode = os.environ.get(ALLOW_MOCK_ENV, "").lower() in ["1", "true", "yes"]
+    if not is_test_mode:
+        canon_adb = posixpath.normpath(os.path.realpath(REAL_ADB))
+        if not any(canon_adb.startswith(d + "/") or canon_adb == d for d in APPROVED_SYSTEM_ADB_DIRS):
+            print(f"[ADB SAFETY ERROR] Arbitrary REAL_ADB_BIN override '{REAL_ADB}' is rejected in production (set {ALLOW_MOCK_ENV}=1 for testing).", file=sys.stderr)
+            sys.exit(1)
+
     if not os.path.exists(REAL_ADB):
         print(f"[ADB SAFETY ERROR] REAL_ADB_BIN '{REAL_ADB}' does not exist.", file=sys.stderr)
         sys.exit(1)
     if not os.access(REAL_ADB, os.X_OK):
         print(f"[ADB SAFETY ERROR] REAL_ADB_BIN '{REAL_ADB}' is not executable.", file=sys.stderr)
-        sys.exit(1)
-    if os.path.realpath(REAL_ADB) == os.path.realpath(__file__):
-        print(f"[ADB SAFETY ERROR] REAL_ADB_BIN points to the safety wrapper itself (infinite recursion rejected).", file=sys.stderr)
         sys.exit(1)
 else:
     REAL_ADB = "/usr/bin/adb"
@@ -154,6 +165,18 @@ elif subcmd == "push":
         if not os.path.exists(src):
             abort(f"Local source file '{src}' does not exist on host", raw_args)
 
+    # Remote Symlink Escape Check (Probe target resolution before pushing)
+    try:
+        probe = subprocess.run(
+            [REAL_ADB] + global_flags + ["shell", "readlink", "-f", canonical_dest],
+            capture_output=True, text=True, timeout=2
+        )
+        resolved = probe.stdout.strip()
+        if resolved and not resolved.startswith(("/tmp", "/mnt")):
+            abort(f"Remote destination '{canonical_dest}' is a symlink resolving to '{resolved}' outside approved RAM directories. REJECTED", raw_args)
+    except Exception:
+        pass
+
     log_command(True, raw_args)
     res = subprocess.run([REAL_ADB] + raw_args)
     sys.exit(res.returncode)
@@ -217,14 +240,14 @@ elif subcmd in ["shell", "exec-out"]:
             for x in a
         ),
         "test": lambda a: (
-            len(a) == 2 and a[0] in ["-e", "-b", "-f", "-d", "-c"] and
+            len(a) == 2 and a[0] in ["-e", "-b", "-f", "-d", "-c", "-L"] and
             a[1].startswith(("/sys/block", "/dev/block", "/tmp", "/mnt")) and ".." not in a[1]
         ),
         "readlink": lambda a: len(a) <= 2 and all(x in ["-f", "-m", "-n"] or (x.startswith("/") and ".." not in x) for x in a),
         "file": lambda a: len(a) <= 2 and all(x in ["-b", "-L"] or (x.startswith(("/tmp", "/mnt", "/system", "/vendor", "/apex")) and ".." not in x) for x in a),
         "sha256sum": lambda a: all(x.startswith(("/tmp", "/mnt")) and ".." not in x for x in a),
         "md5sum": lambda a: all(x.startswith(("/tmp", "/mnt")) and ".." not in x for x in a),
-        "blockdev": lambda a: len(a) == 2 and a[0] == "--getro" and (a[1].startswith("/dev/block/sd") or a[1].startswith("/dev/block/mmcblk") or a[1].startswith("/dev/block/loop")),
+        "blockdev": lambda a: len(a) == 2 and a[0] == "--getro" and a[1].startswith("/dev/block/") and ".." not in a[1],
         "touch": lambda a: len(a) == 1 and a[0] in [
             "/tmp/watchdog_cancel", "/tmp/watchdog_heartbeat",
             "/mnt/watchdog_cancel", "/mnt/watchdog_heartbeat",

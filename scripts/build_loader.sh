@@ -18,10 +18,12 @@ if [ ! -d "$LOADER_RAMDISK" ]; then
     exit 1
 fi
 
-echo "1. Embedding Stage-2 bringup script into loader ramdisk..."
+echo "1. Embedding Stage-2 bringup and watchdog scripts into loader ramdisk..."
 mkdir -p "$LOADER_RAMDISK/system/bin"
 cp "$PROJECT_ROOT/scripts/stage2_init.sh" "$LOADER_RAMDISK/system/bin/stage2_init.sh"
 chmod 0755 "$LOADER_RAMDISK/system/bin/stage2_init.sh"
+cp "$PROJECT_ROOT/scripts/watchdog.sh" "$LOADER_RAMDISK/system/bin/watchdog.sh"
+chmod 0755 "$LOADER_RAMDISK/system/bin/watchdog.sh"
 
 echo "2. Packaging Loader Ramdisk with mkbootfs..."
 "$OTATOOLS/mkbootfs" "$LOADER_RAMDISK" | lz4 -l -12 --favor-decSpeed > "$STAGE1_DIR/stage1_loader_ramdisk.cpio.lz4"
