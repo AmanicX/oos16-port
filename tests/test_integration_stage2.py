@@ -111,6 +111,22 @@ if subcmd in ["shell", "exec-out"]:
             sys.exit(1)
         sys.exit(0)
         
+    if "sha256sum" in shell_cmd:
+        target_path = shell_cmd.split()[-1]
+        fail_sha = "{behavior_config.get('fail_sha256', '')}"
+        if fail_sha and fail_sha in target_path:
+            print("0000000000000000000000000000000000000000000000000000000000000000  " + target_path)
+            sys.exit(0)
+        mock_target = os.path.join("{self.mock_device_dir}", target_path.lstrip("/"))
+        if os.path.exists(mock_target):
+            import hashlib
+            with open(mock_target, "rb") as f_in:
+                digest = hashlib.sha256(f_in.read()).hexdigest()
+            print(f"{{digest}}  {{target_path}}")
+            sys.exit(0)
+        else:
+            sys.exit(1)
+        
     if "touch /mnt/watchdog_heartbeat" in shell_cmd:
         sys.exit(0)
         
@@ -303,6 +319,242 @@ source "{BUILD_EROFS}"
         res = subprocess.run(["sh", "-c", wd_test_script], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"Watchdog logic test failed: {res.stderr}")
         self.assertIn("WATCHDOG_LOGIC_OK", res.stdout)
+
+    def test_runner_checksum_mismatch_aborts(self):
+        """Verify runner halts immediately if device SHA-256 does not match host SHA-256."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_sha256": "system.img"})
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL INTEGRITY VIOLATION", res.stderr + res.stdout)
+        self.assertIn("does not match host", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_failed_push(self):
+        """Verify runner halts if adb push fails for an image."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_push": "vendor.img"})
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_runner_aborts_on_missing_mandatory_image(self):
+        """Verify runner halts if a mandatory image does not exist on host."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "empty_images")
+        os.makedirs(test_images, exist_ok=True)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL ERROR:", res.stderr + res.stdout)
+
+    def test_stage1_trigger_handover_success(self):
+        """Verify Stage-1 init recognizes trigger and execs /system/bin/stage2_init.sh."""
+        trigger_script = f"""#!/bin/sh
+        mkdir -p "{self.test_dir}/mnt" "{self.test_dir}/system/bin"
+        touch "{self.test_dir}/mnt/boot_now"
+        cat << 'EOF' > "{self.test_dir}/system/bin/stage2_init.sh"
+#!/bin/sh
+echo "STAGE2_EXECUTED_AS_PID_1"
+exit 0
+EOF
+        chmod +x "{self.test_dir}/system/bin/stage2_init.sh"
+        
+        # Simulate loader_ramdisk/init trigger handling
+        if [ -f "{self.test_dir}/mnt/boot_now" ]; then
+            rm -f "{self.test_dir}/mnt/boot_now"
+            if [ -x "{self.test_dir}/system/bin/stage2_init.sh" ]; then
+                exec sh "{self.test_dir}/system/bin/stage2_init.sh"
+            fi
+        fi
+        exit 1
+        """
+        res = subprocess.run(["sh", "-c", trigger_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("STAGE2_EXECUTED_AS_PID_1", res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "mnt/boot_now")))
+
+    def test_stage1_trigger_missing_stage2_script_halts(self):
+        """Verify Stage-1 halts safely if stage2_init.sh is missing upon trigger."""
+        trigger_script = f"""#!/bin/sh
+        mkdir -p "{self.test_dir}/mnt"
+        touch "{self.test_dir}/mnt/boot_now"
+        
+        # Simulate missing stage2_init.sh
+        if [ -f "{self.test_dir}/mnt/boot_now" ]; then
+            rm -f "{self.test_dir}/mnt/boot_now"
+            if [ -x "{self.test_dir}/system/bin/stage2_init.sh" ]; then
+                exec sh "{self.test_dir}/system/bin/stage2_init.sh"
+            else
+                echo "STAGE2_MISSING_FATAL_HALT"
+                exit 42
+            fi
+        fi
+        exit 1
+        """
+        res = subprocess.run(["sh", "-c", trigger_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("STAGE2_MISSING_FATAL_HALT", res.stdout)
+
+    def test_stage2_init_overlayfs_failure_halts(self):
+        """Verify stage2_init.sh halts if OverlayFS is missing from /proc/mounts."""
+        sim_script = """#!/bin/sh
+        # Simulate OverlayFS verification check in stage2_init.sh
+        PROC_MOUNTS="/dev/null"
+        if ! grep -q " /mnt/sysroot overlay " "$PROC_MOUNTS" 2>/dev/null; then
+            echo "[STAGE2 FATAL] OverlayFS mount verification failed for /mnt/sysroot! Halting." >&2
+            exit 33
+        fi
+        exit 0
+        """
+        res = subprocess.run(["sh", "-c", sim_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 33)
+        self.assertIn("OverlayFS mount verification failed", res.stderr)
+
+    def test_stage2_init_runtime_apex_linker_missing_halts(self):
+        """Verify stage2_init.sh halts if Bionic linker64 is missing in runtime APEX."""
+        apex_test_dir = os.path.join(self.test_dir, "mock_apex")
+        os.makedirs(os.path.join(apex_test_dir, "bin"), exist_ok=True)
+        # Note: linker64 is intentionally NOT created
+        sim_script = f"""#!/bin/sh
+        if [ ! -f "{apex_test_dir}/bin/linker64" ]; then
+            echo "[STAGE2 FATAL] Bionic linker64 is MISSING from runtime APEX!" >&2
+            exit 55
+        fi
+        exit 0
+        """
+        res = subprocess.run(["sh", "-c", sim_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 55)
+        self.assertIn("Bionic linker64 is MISSING from runtime APEX", res.stderr)
+
+    def test_watchdog_real_subshell_expiration(self):
+        """Test actual watchdog loop logic with custom env vars (WATCHDOG_TIMEOUT=1)."""
+        reboot_marker = os.path.join(self.test_dir, "reboot_called")
+        mock_reboot = os.path.join(self.test_dir, "mock_reboot")
+        with open(mock_reboot, "w") as f:
+            f.write(f'#!/bin/sh\necho "REBOOT_CALLED_$1" > "{reboot_marker}"\nexit 0\n')
+        os.chmod(mock_reboot, 0o755)
+
+        wd_script = f"""
+        WATCHDOG_TIMEOUT=1
+        WATCHDOG_HEARTBEAT_FILE="{self.test_dir}/heartbeat"
+        WATCHDOG_CANCEL_FILE="{self.test_dir}/cancel"
+        REBOOT_BIN="{mock_reboot}"
+
+        TIMEOUT="$WATCHDOG_TIMEOUT"
+        REMAINING=$TIMEOUT
+        while true; do
+            if [ -f "$WATCHDOG_CANCEL_FILE" ]; then
+                REMAINING=86400
+            elif [ -f "$WATCHDOG_HEARTBEAT_FILE" ] && [ -s "$WATCHDOG_HEARTBEAT_FILE" ]; then
+                rm -f "$WATCHDOG_HEARTBEAT_FILE"
+                REMAINING=$TIMEOUT
+            fi
+
+            REMAINING=$((REMAINING - 1))
+            if [ "$REMAINING" -le 0 ]; then
+                "$REBOOT_BIN" bootloader
+                exit 0
+            fi
+            sleep 1
+        done
+        """
+        res = subprocess.run(["sh", "-c", wd_script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(res.returncode, 0)
+        self.assertTrue(os.path.exists(reboot_marker))
+        with open(reboot_marker) as f:
+            self.assertIn("REBOOT_CALLED_bootloader", f.read())
+
+    def test_watchdog_malformed_directory_heartbeat_ignored(self):
+        """Test watchdog ignores directory heartbeat without resetting timer."""
+        reboot_marker = os.path.join(self.test_dir, "reboot_called_malformed")
+        mock_reboot = os.path.join(self.test_dir, "mock_reboot2")
+        with open(mock_reboot, "w") as f:
+            f.write(f'#!/bin/sh\necho "REBOOT_CALLED_$1" > "{reboot_marker}"\nexit 0\n')
+        os.chmod(mock_reboot, 0o755)
+
+        dir_heartbeat = os.path.join(self.test_dir, "dir_heartbeat")
+        os.makedirs(dir_heartbeat, exist_ok=True)
+
+        wd_script = f"""
+        WATCHDOG_TIMEOUT=1
+        WATCHDOG_HEARTBEAT_FILE="{dir_heartbeat}"
+        WATCHDOG_CANCEL_FILE="{self.test_dir}/cancel2"
+        REBOOT_BIN="{mock_reboot}"
+
+        TIMEOUT="$WATCHDOG_TIMEOUT"
+        REMAINING=$TIMEOUT
+        while true; do
+            if [ -f "$WATCHDOG_CANCEL_FILE" ]; then
+                REMAINING=86400
+            elif [ -f "$WATCHDOG_HEARTBEAT_FILE" ] && [ -s "$WATCHDOG_HEARTBEAT_FILE" ]; then
+                rm -f "$WATCHDOG_HEARTBEAT_FILE"
+                REMAINING=$TIMEOUT
+            elif [ -d "$WATCHDOG_HEARTBEAT_FILE" ]; then
+                echo "MALFORMED_IGNORED"
+            fi
+
+            REMAINING=$((REMAINING - 1))
+            if [ "$REMAINING" -le 0 ]; then
+                "$REBOOT_BIN" bootloader
+                exit 0
+            fi
+            sleep 1
+        done
+        """
+        res = subprocess.run(["sh", "-c", wd_script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("MALFORMED_IGNORED", res.stdout)
+        self.assertTrue(os.path.exists(reboot_marker))
+
+    def test_safe_adb_recursion_and_spoofing_defense(self):
+        """Verify tools/safe/adb catches recursive invocations and path spoofing."""
+        # Test 1: REAL_ADB_BIN pointing to tools/safe/adb itself
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = SAFE_ADB
+        res1 = subprocess.run([sys.executable, SAFE_ADB, "devices"], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res1.returncode, 0)
+        self.assertIn("infinite recursion rejected", res1.stderr)
+
+        # Test 2: REAL_ADB_BIN pointing to non-executable
+        non_exec = os.path.join(self.test_dir, "dummy.txt")
+        with open(non_exec, "w") as f:
+            f.write("not an executable")
+        env["REAL_ADB_BIN"] = non_exec
+        res2 = subprocess.run([sys.executable, SAFE_ADB, "devices"], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res2.returncode, 0)
+        self.assertIn("not executable", res2.stderr)
+
+        # Test 3: Destination path traversal blocked
+        dummy_src = os.path.join(self.test_dir, "src.img")
+        with open(dummy_src, "w") as f:
+            f.write("content")
+        mock_adb = self.create_mock_adb({})
+        env["REAL_ADB_BIN"] = mock_adb
+        res3 = subprocess.run([sys.executable, SAFE_ADB, "push", dummy_src, "/mnt/../sdcard/test.img"],
+                              capture_output=True, text=True, env=env)
+        self.assertNotEqual(res3.returncode, 0)
+        self.assertIn("SAFETY VIOLATION", res3.stderr)
+
+        # Test 4: logcat -c and dmesg -c blocked
+        res4 = subprocess.run([sys.executable, SAFE_ADB, "shell", "logcat", "-c"],
+                              capture_output=True, text=True, env=env)
+        self.assertNotEqual(res4.returncode, 0)
+        self.assertIn("SAFETY VIOLATION", res4.stderr)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

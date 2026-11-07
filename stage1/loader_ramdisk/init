@@ -136,30 +136,40 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 # 6. Active Watchdog Supervisor & Heartbeat Monitor
-# Monitors /mnt/watchdog_heartbeat. If heartbeat stops for 60s, triggers fallback reboot.
+# Monitors $WATCHDOG_HEARTBEAT_FILE. If heartbeat stops, triggers fallback reboot.
+WATCHDOG_TIMEOUT="${WATCHDOG_TIMEOUT:-60}"
+WATCHDOG_HEARTBEAT_FILE="${WATCHDOG_HEARTBEAT_FILE:-/mnt/watchdog_heartbeat}"
+WATCHDOG_CANCEL_FILE="${WATCHDOG_CANCEL_FILE:-/mnt/watchdog_cancel}"
+REBOOT_BIN="${REBOOT_BIN:-/system/bin/reboot}"
+
 (
-    TIMEOUT=60
+    TIMEOUT="$WATCHDOG_TIMEOUT"
     REMAINING=$TIMEOUT
     while true; do
-        if [ -f /mnt/watchdog_heartbeat ] || [ -f /tmp/watchdog_heartbeat ]; then
-            /system/bin/toybox rm -f /mnt/watchdog_heartbeat /tmp/watchdog_heartbeat 2>/dev/null || true
-            REMAINING=$TIMEOUT
-        elif [ -f /mnt/watchdog_cancel ] || [ -f /tmp/watchdog_cancel ]; then
+        if [ -f "$WATCHDOG_CANCEL_FILE" ] || [ -f /tmp/watchdog_cancel ]; then
             REMAINING=86400
+        elif [ -f "$WATCHDOG_HEARTBEAT_FILE" ] && [ -s "$WATCHDOG_HEARTBEAT_FILE" ]; then
+            /system/bin/toybox rm -f "$WATCHDOG_HEARTBEAT_FILE" 2>/dev/null || true
+            REMAINING=$TIMEOUT
+        elif [ -f /tmp/watchdog_heartbeat ] && [ -s /tmp/watchdog_heartbeat ]; then
+            /system/bin/toybox rm -f /tmp/watchdog_heartbeat 2>/dev/null || true
+            REMAINING=$TIMEOUT
+        elif [ -d "$WATCHDOG_HEARTBEAT_FILE" ] || [ -d /tmp/watchdog_heartbeat ]; then
+            log_kmsg "[WATCHDOG WARN] Malformed heartbeat: target is a directory, not a regular file!"
         fi
 
         REMAINING=$((REMAINING - 1))
         if [ "$REMAINING" -le 0 ]; then
             log_kmsg "[WATCHDOG FATAL] Safety heartbeat lost for ${TIMEOUT}s! Host connection lost."
             log_kmsg "[WATCHDOG FATAL] Initiating safe emergency reboot to bootloader..."
-            /system/bin/reboot bootloader
+            "$REBOOT_BIN" bootloader || /system/bin/reboot bootloader || true
             exit 1
         fi
         /system/bin/toybox sleep 1
     done
 ) &
 WATCHDOG_PID=$!
-log_kmsg "[LOADER-PID1] Safety watchdog supervisor active (PID: $WATCHDOG_PID, 60s timeout)"
+log_kmsg "[LOADER-PID1] Safety watchdog supervisor active (PID: $WATCHDOG_PID, ${WATCHDOG_TIMEOUT}s timeout)"
 
 # 7. Await Boot Trigger (/mnt/boot_now)
 log_kmsg "[LOADER-PID1] Staging area ready. Waiting for runner image transfer and /mnt/boot_now trigger..."
@@ -173,208 +183,16 @@ while [ ! -f /mnt/boot_now ] && [ ! -f /tmp/boot_now ]; do
     /system/bin/toybox sleep 1
 done
 
-log_kmsg "[LOADER-PID1] Trigger received (/mnt/boot_now)! Validating staged images..."
+log_kmsg "[LOADER-PID1] Trigger received (/mnt/boot_now)! Handing over execution to Stage-2..."
 /system/bin/toybox rm -f /mnt/boot_now /tmp/boot_now 2>/dev/null || true
 
-# 8. Mandatory Image Verification in RAM (/mnt/)
-MANDATORY_IMAGES="system.img system_ext.img vendor.img odm.img"
-for img in $MANDATORY_IMAGES; do
-    if [ ! -f "/mnt/$img" ] || [ ! -s "/mnt/$img" ]; then
-        fatal_halt "Mandatory image /mnt/$img is missing or 0 bytes!"
-    fi
-    log_kmsg "[LOADER-PID1] Verified /mnt/$img ($(ls -lh "/mnt/$img" | awk '{print $5}'))"
-done
-
-# Product / my_product resolution
-if [ -f "/mnt/my_product.img" ] && [ ! -f "/mnt/product.img" ]; then
-    /system/bin/toybox ln -sf /mnt/my_product.img /mnt/product.img
-elif [ -f "/mnt/product.img" ] && [ ! -f "/mnt/my_product.img" ]; then
-    /system/bin/toybox ln -sf /mnt/product.img /mnt/my_product.img
-fi
-
-if [ ! -f "/mnt/product.img" ] || [ ! -s "/mnt/product.img" ]; then
-    fatal_halt "Missing /mnt/product.img (or /mnt/my_product.img)!"
-fi
-log_kmsg "[LOADER-PID1] Verified product partition image."
-
-# 9. Pre-Create All Mountpoints & Mount Root Filesystem (with OverlayFS Support)
-log_kmsg "[LOADER-PID1] Preparing sysroot directory structure..."
-/system/bin/toybox umount -R /mnt/sysroot 2>/dev/null || true
-/system/bin/toybox mkdir -p /mnt/sysroot /mnt/system_ro /mnt/overlay_upper /mnt/overlay_work
-
-# Mount base system image to /mnt/system_ro
-log_kmsg "[LOADER-PID1] Mounting root filesystem (/mnt/system.img -> /mnt/system_ro)..."
-/system/bin/toybox mount -t erofs -o ro,loop /mnt/system.img /mnt/system_ro || fatal_halt "Failed to mount /mnt/system.img on /mnt/system_ro!"
-
-# Mount OverlayFS on /mnt/sysroot so child mountpoints and runtime directories can be created cleanly
-OVERLAY_MOUNTED=0
-if /system/bin/toybox mount -t overlay overlay -o lowerdir=/mnt/system_ro,upperdir=/mnt/overlay_upper,workdir=/mnt/overlay_work /mnt/sysroot 2>/dev/null; then
-    OVERLAY_MOUNTED=1
-    log_kmsg "[LOADER-PID1] Mounted writable OverlayFS root at /mnt/sysroot"
+# 8. Transfer Execution to Stage-2 Android Bringup (PID 1 preserved)
+if [ -x /system/bin/stage2_init.sh ]; then
+    log_kmsg "[LOADER-PID1] Handing over execution to /system/bin/stage2_init.sh as PID 1..."
+    exec /system/bin/sh /system/bin/stage2_init.sh
+elif [ -f /scripts/stage2_init.sh ]; then
+    log_kmsg "[LOADER-PID1] Handing over execution to /scripts/stage2_init.sh as PID 1..."
+    exec /system/bin/sh /scripts/stage2_init.sh
 else
-    log_kmsg "[LOADER-PID1 WARN] OverlayFS mount unavailable; falling back to direct root mount"
-    /system/bin/toybox umount /mnt/system_ro 2>/dev/null || true
-    /system/bin/toybox mount -t erofs -o ro,loop /mnt/system.img /mnt/sysroot || fatal_halt "Failed to mount /mnt/system.img on /mnt/sysroot!"
+    fatal_halt "Stage-2 initialization script (stage2_init.sh) is missing from ramdisk!"
 fi
-
-# Pre-create all required child mountpoints
-REQUIRED_MOUNTPOINTS="system_ext vendor odm product my_product my_region apex data dev proc sys linkerconfig mnt"
-for mp in $REQUIRED_MOUNTPOINTS; do
-    if [ "$OVERLAY_MOUNTED" -eq 1 ]; then
-        /system/bin/toybox mkdir -p "/mnt/sysroot/$mp" 2>/dev/null || true
-    fi
-    if [ ! -d "/mnt/sysroot/$mp" ]; then
-        fatal_halt "Required mountpoint directory /mnt/sysroot/$mp does not exist on rootfs!"
-    fi
-done
-
-# 10. Mount Partition Images with Validation
-mount_partition() {
-    local name="$1"
-    local src="$2"
-    local target="/mnt/sysroot/$name"
-    local is_mandatory="${3:-1}"
-
-    if [ ! -f "$src" ] || [ ! -s "$src" ]; then
-        if [ "$is_mandatory" -eq 1 ]; then
-            fatal_halt "Mandatory partition image $src does not exist or is 0 bytes!"
-        else
-            log_kmsg "[LOADER-PID1] Optional image $src not present, skipping."
-            return 0
-        fi
-    fi
-
-    if [ ! -d "$target" ]; then
-        if [ "$is_mandatory" -eq 1 ]; then
-            fatal_halt "Mountpoint target $target does not exist as a directory!"
-        else
-            log_kmsg "[LOADER-PID1] Optional mountpoint $target missing, skipping."
-            return 0
-        fi
-    fi
-
-    /system/bin/toybox mount -t erofs -o ro,loop "$src" "$target" || {
-        if [ "$is_mandatory" -eq 1 ]; then
-            fatal_halt "Failed to mount mandatory partition $src at $target!"
-        else
-            log_kmsg "[LOADER-PID1 WARN] Failed to mount optional partition $src at $target"
-            return 0
-        fi
-    }
-
-    # Verify the actual mounted source and filesystem type in /proc/mounts
-    if ! /system/bin/toybox grep -q " $target erofs " /proc/mounts 2>/dev/null; then
-        if [ "$is_mandatory" -eq 1 ]; then
-            fatal_halt "Mount verification failed for $target (not present as erofs in /proc/mounts)!"
-        fi
-    fi
-
-    log_kmsg "[LOADER-PID1] Mounted and verified $name at $target successfully."
-}
-
-mount_partition "system_ext" "/mnt/system_ext.img" 1
-mount_partition "vendor" "/mnt/vendor.img" 1
-mount_partition "odm" "/mnt/odm.img" 1
-mount_partition "product" "/mnt/product.img" 1
-if [ -d "/mnt/sysroot/my_product" ]; then
-    mount_partition "my_product" "/mnt/product.img" 0
-fi
-if [ -f "/mnt/my_region.img" ] && [ -d "/mnt/sysroot/my_region" ]; then
-    mount_partition "my_region" "/mnt/my_region.img" 0
-fi
-
-# 11. Staging Runtime APEX on Writable tmpfs
-log_kmsg "[LOADER-PID1] Preparing Bionic runtime APEX on tmpfs..."
-/system/bin/toybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/apex || fatal_halt "Failed to mount tmpfs on /mnt/sysroot/apex!"
-/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime
-/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime/bin
-/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime/lib64/bionic
-/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime/lib/bionic
-
-if [ -f "/mnt/runtime_apex.img" ]; then
-    APEX_FS="erofs"
-    [ -f "/mnt/runtime_apex.fstype" ] && APEX_FS=$(cat /mnt/runtime_apex.fstype | tr -d '[:space:]')
-    /system/bin/toybox mkdir -p /tmp/apex_payload_staging
-    if /system/bin/toybox mount -t "$APEX_FS" -o ro,loop /mnt/runtime_apex.img /tmp/apex_payload_staging 2>/dev/null; then
-        /system/bin/toybox cp -a /tmp/apex_payload_staging/* /mnt/sysroot/apex/com.android.runtime/ 2>/dev/null || true
-        /system/bin/toybox umount /tmp/apex_payload_staging 2>/dev/null || true
-    fi
-fi
-
-# Ensure 64-bit dynamic linker exists at /apex/com.android.runtime/bin/linker64
-if [ ! -f /mnt/sysroot/apex/com.android.runtime/bin/linker64 ]; then
-    /system/bin/toybox ln -sf /system/bin/bootstrap/linker64 /mnt/sysroot/apex/com.android.runtime/bin/linker64
-fi
-if [ ! -f /mnt/sysroot/apex/com.android.runtime/bin/linker ]; then
-    /system/bin/toybox ln -sf /system/bin/bootstrap/linker /mnt/sysroot/apex/com.android.runtime/bin/linker
-fi
-
-for lib in libc.so libm.so libdl.so; do
-    if [ ! -f "/mnt/sysroot/apex/com.android.runtime/lib64/bionic/$lib" ]; then
-        /system/bin/toybox ln -sf "/system/lib64/bootstrap/$lib" "/mnt/sysroot/apex/com.android.runtime/lib64/bionic/$lib"
-    fi
-    if [ ! -f "/mnt/sysroot/apex/com.android.runtime/lib/bionic/$lib" ]; then
-        /system/bin/toybox ln -sf "/system/lib/bootstrap/$lib" "/mnt/sysroot/apex/com.android.runtime/lib/bionic/$lib"
-    fi
-done
-
-[ -f /mnt/sysroot/apex/com.android.runtime/bin/linker64 ] || fatal_halt "Bionic linker64 is MISSING from runtime APEX!"
-log_kmsg "[LOADER-PID1] Runtime APEX and Bionic linker64 verified."
-
-# 12. Linker Configuration & Directories
-/system/bin/toybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/linkerconfig || fatal_halt "Failed to mount tmpfs on linkerconfig!"
-/system/bin/toybox mkdir -p /mnt/sysroot/linkerconfig/bootstrap /mnt/sysroot/linkerconfig/default
-echo "#" > /mnt/sysroot/linkerconfig/bootstrap/ld.config.txt
-echo "#" > /mnt/sysroot/linkerconfig/default/ld.config.txt
-echo "#" > /mnt/sysroot/linkerconfig/ld.config.txt
-/system/bin/toybox chmod 644 /mnt/sysroot/linkerconfig/bootstrap/ld.config.txt
-/system/bin/toybox chmod 644 /mnt/sysroot/linkerconfig/default/ld.config.txt
-/system/bin/toybox chmod 644 /mnt/sysroot/linkerconfig/ld.config.txt
-
-/system/bin/toybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/mnt
-/system/bin/toybox mkdir -p /mnt/sysroot/mnt/vendor/persist
-
-# 13. Ephemeral RAM /data (1024 MB tmpfs)
-log_kmsg "[LOADER-PID1] Initializing ephemeral RAM /data (1024 MB)..."
-/system/bin/toybox mount -t tmpfs -o rw,nosuid,nodev,noatime,mode=0771,size=1024M tmpfs /mnt/sysroot/data || fatal_halt "Failed to mount /data tmpfs!"
-/system/bin/toybox mkdir -p /mnt/sysroot/data/system /mnt/sysroot/data/misc /mnt/sysroot/data/user /mnt/sysroot/data/user_de /mnt/sysroot/data/local /mnt/sysroot/data/local/tmp /mnt/sysroot/data/media /mnt/sysroot/data/persist_log
-/system/bin/toybox chmod 0775 /mnt/sysroot/data/local/tmp
-/system/bin/toybox chmod 0700 /mnt/sysroot/data/system
-/system/bin/toybox chmod 01771 /mnt/sysroot/data/misc
-
-# 14. Bind Kernel Interfaces
-/system/bin/toybox mount --bind /dev /mnt/sysroot/dev
-/system/bin/toybox mount -t devpts devpts /mnt/sysroot/dev/pts || true
-/system/bin/toybox mount -t proc proc /mnt/sysroot/proc
-/system/bin/toybox mount --bind /sys /mnt/sysroot/sys
-/system/bin/toybox mkdir -p /mnt/sysroot/sys/fs/selinux
-/system/bin/toybox mount -t selinuxfs selinuxfs /mnt/sysroot/sys/fs/selinux || true
-
-# Isolate property workspace and socket dirs
-/system/bin/toybox mkdir -p /mnt/sysroot/dev/__properties__ /mnt/sysroot/dev/socket
-/system/bin/toybox mount -t tmpfs tmpfs /mnt/sysroot/dev/__properties__
-/system/bin/toybox mount -t tmpfs tmpfs /mnt/sysroot/dev/socket
-
-# Graphics compatibility node
-/system/bin/toybox mkdir -p /mnt/sysroot/dev/graphics
-/system/bin/toybox ln -s /dev/dri/card0 /mnt/sysroot/dev/graphics/fb0 2>/dev/null || true
-
-# Note: The recursive bind mount /mnt/sysroot/mnt/sysroot has been completely removed.
-
-log_kmsg "[LOADER-PID1] ALL RAM FILESYSTEMS READY. EXECUTING SECOND STAGE INIT AS PID 1..."
-
-# Stop loader adbd so Android 16 init second stage can configure USB cleanly
-kill $ADBD_PID 2>/dev/null || true
-echo "" > /config/usb_gadget/g1/UDC 2>/dev/null || true
-/system/bin/toybox umount /dev/usb-ffs/adb 2>/dev/null || true
-
-# 15. Hand over PID 1 directly to Android 16 init
-export PATH=/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin
-export ANDROID_ROOT=/system
-export ANDROID_DATA=/data
-export ANDROID_STORAGE=/storage
-export ANDROID_ART_ROOT=/apex/com.android.art
-export ANDROID_I18N_ROOT=/apex/com.android.i18n
-export ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
-
-exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage

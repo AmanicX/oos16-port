@@ -3,7 +3,7 @@
 tools/safe/adb - Hardened Safety Interceptor Proxy for Android Debug Bridge
 Enforces strict zero-storage-write guarantees for OxygenOS 16 RAM Bringup.
 All destructive commands, shell metacharacters, path traversal, executable spoofing,
-and non-RAM targets are strictly rejected.
+state-clearing diagnostics, and non-RAM targets are strictly rejected.
 """
 
 import sys
@@ -15,25 +15,47 @@ import re
 from datetime import datetime
 
 LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
-REAL_ADB = os.environ.get("REAL_ADB_BIN", "/usr/bin/adb")
 
-if not os.path.exists(REAL_ADB) and "REAL_ADB_BIN" not in os.environ:
-    for p in os.environ.get("PATH", "").split(os.path.pathsep):
-        candidate = os.path.join(p, "adb")
-        if os.path.exists(candidate) and os.path.abspath(candidate) != os.path.abspath(__file__):
-            REAL_ADB = candidate
-            break
+# 1. Validated Real ADB Binary Discovery
+if "REAL_ADB_BIN" in os.environ:
+    REAL_ADB = os.environ["REAL_ADB_BIN"]
+    if not os.path.exists(REAL_ADB):
+        print(f"[ADB SAFETY ERROR] REAL_ADB_BIN '{REAL_ADB}' does not exist.", file=sys.stderr)
+        sys.exit(1)
+    if not os.access(REAL_ADB, os.X_OK):
+        print(f"[ADB SAFETY ERROR] REAL_ADB_BIN '{REAL_ADB}' is not executable.", file=sys.stderr)
+        sys.exit(1)
+    if os.path.realpath(REAL_ADB) == os.path.realpath(__file__):
+        print(f"[ADB SAFETY ERROR] REAL_ADB_BIN points to the safety wrapper itself (infinite recursion rejected).", file=sys.stderr)
+        sys.exit(1)
+else:
+    REAL_ADB = "/usr/bin/adb"
+    if not os.path.exists(REAL_ADB):
+        for p in os.environ.get("PATH", "").split(os.path.pathsep):
+            candidate = os.path.join(p, "adb")
+            if os.path.exists(candidate) and os.path.abspath(candidate) != os.path.abspath(__file__):
+                REAL_ADB = candidate
+                break
 
 def log_command(allowed, args, reason=""):
-    try:
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        with open(LOG_FILE, "a") as f:
-            timestamp = datetime.now().isoformat()
-            status = "ALLOWED" if allowed else "BLOCKED"
-            extra = f" [{reason}]" if reason else ""
-            f.write(f"[{timestamp}] [ADB] [{status}]{extra} {' '.join(args)}\n")
-    except Exception:
-        pass
+    timestamp = datetime.now().isoformat()
+    status = "ALLOWED" if allowed else "BLOCKED"
+    extra = f" [{reason}]" if reason else ""
+    log_line = f"[{timestamp}] [ADB] [{status}]{extra} {' '.join(args)}\n"
+    
+    logged = False
+    for target in [LOG_FILE, "/tmp/phone-commands.log"]:
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "a") as f:
+                f.write(log_line)
+            logged = True
+            break
+        except Exception:
+            continue
+            
+    if not logged:
+        print(f"[ADB SAFETY LOGGING ERROR] Failed to record audit log for command: {' '.join(args)}", file=sys.stderr)
 
 def abort(msg, args):
     log_command(False, args, msg)
@@ -45,7 +67,7 @@ if not raw_args:
     res = subprocess.run([REAL_ADB])
     sys.exit(res.returncode)
 
-# 1. Parse global adb flags (-s <serial>, -d, -e, -t <id>, -H <host>, -P <port>)
+# 2. Parse global adb flags (-s <serial>, -d, -e, -t <id>, -H <host>, -P <port>)
 idx = 0
 global_flags = []
 while idx < len(raw_args):
@@ -70,7 +92,7 @@ if idx >= len(raw_args):
 subcmd = raw_args[idx]
 subargs = raw_args[idx + 1:]
 
-# 2. Strict Whitelist of Safe ADB Subcommands
+# 3. Strict Whitelist of Safe ADB Subcommands
 SAFE_NOARG_CMDS = {"devices", "get-state", "version", "help", "--help", "wait-for-device", "root"}
 
 if subcmd in SAFE_NOARG_CMDS:
@@ -111,7 +133,7 @@ elif subcmd == "push":
     
     raw_dest = subargs[-1]
     
-    # Path traversal check: reject any explicit '..' in destination
+    # Path traversal check: reject any explicit '..' or '.' in destination
     dest_parts = raw_dest.split("/")
     if ".." in dest_parts or "." in dest_parts:
         abort(f"Path traversal detected in destination '{raw_dest}'. Refused", raw_args)
@@ -122,13 +144,9 @@ elif subcmd == "push":
     if any(canonical_dest == r or canonical_dest.startswith(r + "/") for r in ["/sdcard", "/storage", "/data"]):
         abort(f"Push destination '{raw_dest}' targets physical storage. REJECTED", raw_args)
 
-    # Allow strictly /tmp or /mnt hierarchy
-    is_valid_ram = (
-        canonical_dest == "/tmp" or canonical_dest.startswith("/tmp/") or
-        canonical_dest == "/mnt" or canonical_dest.startswith("/mnt/")
-    )
-    if not is_valid_ram:
-        abort(f"Push destination '{raw_dest}' is not within approved RAM directories (/tmp/, /mnt/). Refused", raw_args)
+    # Allow strictly /tmp or /mnt hierarchy with alphanumeric, dash, dot, underscore elements
+    if not re.match(r"^/(tmp|mnt)(/[a-zA-Z0-9_.-]+)*$", canonical_dest):
+        abort(f"Push destination '{raw_dest}' contains illegal characters or is outside approved RAM directories (/tmp/, /mnt/). Refused", raw_args)
 
     # Verify all local sources exist on host
     sources = subargs[:-1]
@@ -163,7 +181,6 @@ elif subcmd in ["shell", "exec-out"]:
     cmd_args = tokens[1:]
 
     # Executable Path Validation (Prevents executable path spoofing)
-    # Binary must be a bare command name or reside strictly in approved system directories.
     APPROVED_SYSTEM_BIN_DIRS = {"/system/bin", "/system/xbin", "/bin", "/vendor/bin", "/odm/bin"}
 
     if "/" in raw_binary:
@@ -177,8 +194,12 @@ elif subcmd in ["shell", "exec-out"]:
     # Whitelist of approved diagnostic tools and strict argument validators
     ALLOWED_DIAGNOSTIC_COMMANDS = {
         "getprop": lambda a: all(re.match(r"^[a-zA-Z0-9_.-]+$", x) for x in a) and len(a) <= 1,
-        "dmesg": lambda a: all(x in ["-c", "-s", "-r", "-n", "-l"] or re.match(r"^[0-9]+$", x) for x in a),
-        "logcat": lambda a: all(x in ["-d", "-c", "-b", "all", "main", "system", "crash", "events", "-v", "threadtime", "brief", "time", "-s"] or re.match(r"^[a-zA-Z0-9_:*.-]+$", x) for x in a),
+        "dmesg": lambda a: all(x in ["-s", "-r", "-n", "-l"] or (not x.startswith("-") and re.match(r"^[0-9]+$", x)) for x in a),  # State-modifying -c BLOCKED
+        "logcat": lambda a: all(
+            (x in ["-d", "-b", "all", "main", "system", "crash", "events", "-v", "threadtime", "brief", "time", "-s"]) or
+            (not x.startswith("-") and re.match(r"^[a-zA-Z0-9_:*.-]+$", x))
+            for x in a
+        ),  # State-modifying -c BLOCKED
         "ps": lambda a: all(x in ["-ef", "-A", "-e", "-f", "-l", "-T", "-o"] or re.match(r"^[a-zA-Z0-9_,]+$", x) for x in a),
         "df": lambda a: all(x in ["-h", "-k", "-m", "-a"] or (x.startswith("/") and ".." not in x) for x in a),
         "free": lambda a: all(x in ["-m", "-k", "-h", "-b"] for x in a),

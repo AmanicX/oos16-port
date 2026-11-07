@@ -231,7 +231,10 @@ echo "--- 3. Auditing Project Orchestration Scripts (Static Check) ---" | tee -a
 SCRIPTS_TO_AUDIT=(
     "$PROJECT_ROOT/scripts/stage2_init.sh"
     "$PROJECT_ROOT/tools/safe/run_stage2.sh"
+    "$PROJECT_ROOT/stage1/loader_ramdisk/init"
+    "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery"
     "$PROJECT_ROOT/scripts/build_stage1.sh"
+    "$PROJECT_ROOT/scripts/build_stage2_erofs.sh"
 )
 
 for s in "${SCRIPTS_TO_AUDIT[@]}"; do
@@ -243,6 +246,10 @@ for s in "${SCRIPTS_TO_AUDIT[@]}"; do
             audit_fail "Dangerous block write" "Script '$rel_s' contains direct dd of=/dev/block command!"
         elif grep -E "mount[[:space:]]+-o[[:space:]]+rw[[:space:]]+/dev/block" "$s" 2>/dev/null; then
             audit_fail "Dangerous block mount" "Script '$rel_s' attempts writable mount of physical block device!"
+        elif grep -Fwq "mount_all" "$s" 2>/dev/null; then
+            audit_fail "Dangerous mount_all" "Script '$rel_s' invokes Android mount_all on physical partitions!"
+        elif grep -E "fastboot[[:space:]]+(flash|erase|format)" "$s" 2>/dev/null; then
+            audit_fail "Dangerous fastboot command" "Script '$rel_s' contains physical partition modification command!"
         else
             audit_pass "Script '$rel_s' is free of physical block write commands"
         fi
@@ -250,6 +257,43 @@ for s in "${SCRIPTS_TO_AUDIT[@]}"; do
         audit_unverified "Script audit" "File $s does not exist to audit" 1
     fi
 done
+
+# Check Stage-1 to Stage-2 handover consistency across scripts
+echo "--- 4. Auditing Stage-1/Stage-2 Integration & Handover Consistency ---" | tee -a "$REPORT_FILE"
+# 1. Consistent boot trigger (/mnt/boot_now)
+TRIGGER_RUNNER=$(grep -F "/mnt/boot_now" "$PROJECT_ROOT/tools/safe/run_stage2.sh" 2>/dev/null || true)
+TRIGGER_LOADER=$(grep -F "/mnt/boot_now" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null || true)
+TRIGGER_RECOVERY=$(grep -F "/mnt/boot_now" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null || true)
+
+if [ -n "$TRIGGER_RUNNER" ] && [ -n "$TRIGGER_LOADER" ] && [ -n "$TRIGGER_RECOVERY" ]; then
+    audit_pass "Consistent boot trigger (/mnt/boot_now) verified across runner and ramdisks"
+else
+    audit_fail "Boot trigger consistency" "Boot trigger /mnt/boot_now is not recognized across all execution paths"
+fi
+
+# 2. Consistent image staging paths (/mnt/)
+if grep -q ":/mnt/" "$PROJECT_ROOT/tools/safe/run_stage2.sh" 2>/dev/null && \
+   grep -q 'SYSTEM_IMG="/mnt/system.img"' "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null; then
+    audit_pass "Consistent RAM image staging path (/mnt/) verified between runner and stage2_init"
+else
+    audit_fail "Image path consistency" "Image staging paths between runner and stage2_init diverge"
+fi
+
+# 3. Active hardware write lock enforcement (blockdev --setro)
+if grep -q "blockdev --setro" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null && \
+   grep -q "blockdev --setro" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null; then
+    audit_pass "Dynamic hardware write lock (blockdev --setro) enforced in Stage-1 ramdisks"
+else
+    audit_fail "Write lock enforcement" "Missing blockdev --setro in one or more Stage-1 ramdisks"
+fi
+
+# 4. Watchdog recovery presence
+if grep -q "watchdog" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null && \
+   grep -q "watchdog" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/recovery" 2>/dev/null; then
+    audit_pass "Active safety watchdog monitor and reboot fallback verified in Stage-1 ramdisks"
+else
+    audit_fail "Safety watchdog" "Missing watchdog monitor in one or more Stage-1 ramdisks"
+fi
 
 # 5. Summary & Disclaimer
 TOTAL_INSPECTED="${#INSPECTED_FILES[@]}"

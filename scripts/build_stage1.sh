@@ -99,7 +99,13 @@ if [ -f "$HOME/.android/adbkey.pub" ]; then
     chmod 644 "$NATIVE_RAMDISK/adb_keys"
 fi
 
-# 4. Packaging Native Stage-1 Ramdisk
+# 4. Embed Stage-2 Bringup Script into Native Ramdisk
+echo "Embedding Stage-2 bringup script into native ramdisk..."
+mkdir -p "$NATIVE_RAMDISK/system/bin"
+cp "$PROJECT_ROOT/scripts/stage2_init.sh" "$NATIVE_RAMDISK/system/bin/stage2_init.sh"
+chmod 0755 "$NATIVE_RAMDISK/system/bin/stage2_init.sh"
+
+# 5. Packaging Native Stage-1 Ramdisk
 echo "3. Packaging Native Stage-1 Ramdisk with mkbootfs..."
 RAMDISK_ARCHIVE="$STAGE1_DIR/stage1_native_ramdisk.cpio.lz4"
 "$MKBOOTFS_BIN" "$NATIVE_RAMDISK" | lz4 -l -12 --favor-decSpeed > "$RAMDISK_ARCHIVE"

@@ -130,12 +130,17 @@ fi
 
 ALL_IMAGES=("${MANDATORY_IMAGES[@]}" "${OPTIONAL_IMAGES[@]}")
 
-# Validate mandatory image sources exist and are non-empty before pushing anything
+# Validate mandatory image sources exist, are non-empty, and calculate host SHA-256
 for pair in "${MANDATORY_IMAGES[@]}"; do
     SRC="${pair%%:*}"
     SRC_PATH="$IMAGES_DIR/$SRC"
     if [ ! -f "$SRC_PATH" ] || [ ! -s "$SRC_PATH" ]; then
         echo "CRITICAL ERROR: Mandatory image $SRC_PATH does not exist or is 0 bytes!" >&2
+        exit 1
+    fi
+    SIZE_BYTES=$(stat -c%s "$SRC_PATH" 2>/dev/null || stat -f%z "$SRC_PATH")
+    if [ "$SIZE_BYTES" -le 0 ]; then
+        echo "CRITICAL ERROR: Image $SRC_PATH has invalid size ($SIZE_BYTES bytes)!" >&2
         exit 1
     fi
 done
@@ -145,20 +150,37 @@ for pair in "${ALL_IMAGES[@]}"; do
     DST="${pair##*:}"
     SRC_PATH="$IMAGES_DIR/$SRC"
     SIZE=$(ls -lh "$SRC_PATH" | awk '{print $5}')
-    echo " -> Pushing $SRC ($SIZE) to $DST..."
+    HOST_SHA=$(sha256sum "$SRC_PATH" | awk '{print $1}')
+    echo " -> Pushing $SRC ($SIZE, SHA: ${HOST_SHA:0:12}...) to $DST..."
     "$SAFE_ADB" push "$SRC_PATH" "$DST"
 
-    # Verify image transfer completed successfully on target
+    # Verify device-side file existence
     if ! "$SAFE_ADB" shell "test -f $DST" >/dev/null 2>&1; then
-        echo "CRITICAL ERROR: Failed to verify staged image $DST on target device!" >&2
+        echo "CRITICAL ERROR: Failed to verify staged image $DST exists on target device!" >&2
         exit 1
     fi
+
+    # Verify device-side SHA-256 checksum against host calculation
+    DEV_SHA=$("$SAFE_ADB" shell "sha256sum $DST" | awk '{print $1}' | tr -d '\r\n[:space:]')
+    if [ "$HOST_SHA" != "$DEV_SHA" ]; then
+        echo "CRITICAL INTEGRITY VIOLATION: Device SHA-256 for $DST does not match host!" >&2
+        echo "  Host SHA-256:   $HOST_SHA" >&2
+        echo "  Device SHA-256: $DEV_SHA" >&2
+        exit 1
+    fi
+    echo "    Integrity verified: $DST matches host SHA-256."
 done
 
 # If my_product image was staged as /mnt/product.img, also stage /mnt/my_product.img
 if [ -f "$IMAGES_DIR/my_product.erofs.img" ]; then
     echo " -> Staging /mnt/my_product.img for ColorOS/OxygenOS compatibility..."
+    PROD_SHA=$(sha256sum "$IMAGES_DIR/my_product.erofs.img" | awk '{print $1}')
     "$SAFE_ADB" push "$IMAGES_DIR/my_product.erofs.img" "/mnt/my_product.img"
+    DEV_PROD_SHA=$("$SAFE_ADB" shell "sha256sum /mnt/my_product.img" | awk '{print $1}' | tr -d '\r\n[:space:]')
+    if [ "$PROD_SHA" != "$DEV_PROD_SHA" ]; then
+        echo "CRITICAL INTEGRITY VIOLATION: Device SHA-256 for /mnt/my_product.img mismatch!" >&2
+        exit 1
+    fi
 fi
 
 echo "All required images successfully staged in target volatile RAM."
