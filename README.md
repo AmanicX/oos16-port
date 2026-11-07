@@ -5,7 +5,7 @@
 [![Device](https://img.shields.io/badge/Device-OnePlus%207T%20(hotdogb)-blue.svg)](https://wiki.lineageos.org/devices/hotdogb/)
 [![SoC](https://img.shields.io/badge/SoC-Snapdragon%20855%2B%20(SM8150--AC)-orange.svg)](https://www.qualcomm.com/)
 [![Storage](https://img.shields.io/badge/Storage-100%25%20Read--Only%20RAM-red.svg)](#non-negotiable-safety-contract)
-[![Tests](https://img.shields.io/badge/Tests-66%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Tests](https://img.shields.io/badge/Tests-86%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
 [![Audit](https://img.shields.io/badge/Audit-31%2F31%20Passed-brightgreen.svg)](#7-verification-status--test-matrix)
 
 ---
@@ -167,26 +167,45 @@ OxygenOS 16 Android Init Second Stage (PID 1)
 In fresh Linux BinderFS instances, mounting `none /dev/binderfs binder` creates only the control device `/dev/binderfs/binder-control`. IPC nodes (`binder`, `hwbinder`, `vndbinder`) do **not** appear automatically and must be allocated dynamically:
 * The native helper `src/binderfs_init` opens `/dev/binderfs/binder-control` and invokes `ioctl(ctl_fd, BINDER_CTL_ADD, &dev)` with `struct binderfs_device` for `binder`, `hwbinder`, and `vndbinder`.
 * On older kernels lacking dynamic BinderFS ioctls, it provides automatic fallback to legacy sysfs major:minor nodes (`/sys/class/misc/<name>/dev`).
-* Validates device nodes are character devices (`S_ISCHR`), checks `O_RDWR` read/write accessibility, creates symlinks in `/dev/`, and sets `0666` permissions.
-* Halts boot execution with a clear diagnostic message if required IPC nodes cannot be created.
+* Standard Linux 64-bit `dev_t` device-number encoding is implemented according to glibc/sysmacros ABI:
+  ```go
+  devNum := (maj & 0xfff) << 8 | (min & 0xff) | (uint64(maj &^ 0xfff) << 32) | (uint64(min &^ 0xff) << 12)
+  ```
+* Sysfs device numbers are strictly validated against numeric boundaries (`major <= 0xfffff`), rejecting empty, negative, or malformed strings.
+* Safe syscall handling validates that all `Mknod`, `Chmod`, `Symlink`, and `Remove` calls succeed, and strictly refuses to overwrite unrelated character devices, regular files, or directories.
+* Built reproducibly into static ARM64 ELF via `src/Makefile` with Go unit tests (`go test -v ./...`) and strict C compiler verification (`gcc -Wall -Wextra -Werror -pedantic -std=gnu11`).
 
 ### Watchdog 4-State Lifecycle Protocol:
-The watchdog supervisor (`scripts/watchdog.sh`) implements a 4-state state machine guarding every phase of volatile execution:
+The watchdog supervisor (`scripts/watchdog.sh`) implements an atomic 4-state state machine guarding every phase of volatile execution:
 1. **`STAGE1_WAIT`** (Timeout: 60s): Monitors host heartbeats (`/mnt/watchdog_heartbeat`) while waiting for the Stage-1 supervisor to consume `/mnt/boot_now` and issue `/mnt/stage1_ack`.
 2. **`STAGE2_RUNNING`** (Timeout: 120s): Monitors Stage-2 bringup in RAM, accepting either device-side (`/mnt/stage2_heartbeat`) or host-side heartbeats until Stage-2 finishes and touches `/mnt/stage2_done`.
-3. **`HEALTH_MONITOR`** (Timeout: 180s): Monitors Android init bringup after `exec init second_stage`. Continuously polls Android property `sys.boot_completed=1` via `getprop`. Upon successful boot completion, logs `BOOT_COMPLETED` and exits cleanly (exit code 0). If boot fails to complete within 180s, triggers emergency reboot to bootloader.
+3. **`HEALTH_MONITOR`** (Configurable Timeout: 600s default for first boot): Monitors Android init bringup after `exec init second_stage`. Continuously queries Android property service (`sys.boot_completed=1`) across chroot `/mnt/sysroot /system/bin/getprop` and root namespace property bind-mounts. Upon successful boot completion, logs `BOOT_COMPLETED` and exits cleanly (exit code 0). If boot fails to complete within timeout, triggers emergency reboot to bootloader.
 4. **`DISARMED`**: If manual cancellation is requested via regular file `/mnt/watchdog_cancel`, logs `DISARMED` and exits cleanly (exit code 0).
+* State transitions are written atomically (`set_state`) to `/mnt/watchdog_state` to prevent partial reads by host runners.
+
+### Device-Side APEX Metadata Enforcement & Protobuf Parser:
+* **No Silent Fallbacks**: Hardcoded fallbacks to `version="1"` or synthetic versions are completely eliminated.
+* **Strict Validation**: `.version` metadata files must exist and match regex `^[1-9][0-9]*$`; `.fstype` must exist and match `erofs` or `ext4`. If missing or invalid for mandatory APEX modules, Stage 2 halts closed immediately.
+* **Hardened Protobuf Parser (`tools/extract_apex_info.py`)**:
+  * Validates protobuf tags (tag 0 rejected) and wire types (only 0, 1, 2, 5 permitted).
+  * Validates varint bounds (rejects truncated varints and lengths $> 10$ bytes).
+  * Validates length-delimited payload boundaries, rejecting out-of-bounds field lengths.
+  * Enforces strict UTF-8 decoding without replacement characters.
+  * Validates package identifier syntax (`validate_package_name`).
+  * Safely handles compressed APEX payloads (`original_apex`) with `BadZipFile` recovery.
 
 ### Volatile RAM Capacity & Peak-Memory Budgeting:
 Running an entire mobile operating system purely from RAM requires strict memory budgeting:
 * Target device: OnePlus 7T (`hotdogb`), 8 GB LPDDR4X physical RAM.
 * Staged partition images (`system`, `system_ext`, `vendor`, `odm`, `my_product`, APEXes): ~3,300 MB.
+* Exact upward integer rounding: `TOTAL_STAGED_MB=$(((TOTAL_STAGED_BYTES + 1048575) / 1048576))`.
 * Memory reservations:
   * Ephemeral `/data` tmpfs: 1,024 MB
   * Volatile staging `/tmp` & OverlayFS upper layers: 512 MB
   * Kernel, base drivers, display buffers & Android runtime headroom: 1,536 MB
   * **Total Peak Budget**: ~6,372 MB ($\approx 6.4\text{ GB}$).
-* In `tools/safe/run_stage2.sh`, target `/proc/meminfo` is parsed for `MemTotal` and `MemAvailable`. The runner verifies `MemAvailable >= REQUIRED_RAM_MB` before initiating image transfer and halts closed immediately if memory is insufficient or cannot be read.
+* In `tools/safe/run_stage2.sh`, `/mnt` tmpfs mount is verified via `/proc/mounts`, and `df -m /mnt` is parsed strictly with numeric validation. The runner verifies `MemTotal >= 6500MB` and `MemAvailable >= REQUIRED_RAM_MB` before initiating image transfer and fails closed immediately if capacity is insufficient or unreadable.
+* Extended monitoring loop (`OOS16_WAIT_FOR_BOOT=1`) continues petting the safety watchdog heartbeat while awaiting `sys.boot_completed=1` or `watchdog_state=BOOT_COMPLETED`.
 
 ### OnePlus 7T Display & Graphics Bringup Technical Analysis:
 * **Display Hardware**: OnePlus 7T (`hotdogb`) features a 6.55" 2400x1080 Fluid AMOLED display driven by Qualcomm Snapdragon 855 (SM8150) Mobile Display Subsystem (MDSS) and Display Processing Unit (DPU).
@@ -261,8 +280,8 @@ To maintain rigorous engineering honesty, verification states are strictly parti
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on `build/loader.img` and `build/stage1.img` with zero mandatory unverified checks. |
-| **Tier 3: Host Tests Passed** | Automated Python & Shell unit/integration test suites | **PASSED (66/66)** | 100% pass across ADB proxy (8), Fastboot proxy (3), Watchdog protocol (15), and Stage-2 runner integration mocks (40). |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on `build/loader.img` (31/31), `build/stage1.img` (31/31), and ramdisks (29/29) with zero mandatory unverified checks. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (86/86)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf (9), Watchdog protocol (15), Stage-2 runner integration mocks (46), and Go BinderFS unit tests (5). |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all 10 Stage-2 images generated with valid SHA256SUMS. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |

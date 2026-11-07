@@ -233,19 +233,53 @@ populate_apex() {
     local img_name="$2"
     local mandatory="${3:-1}"
 
-    # Determine authentic package version code
-    local version="1"
+    # 1. Resolve image path
+    local img_path=$(get_img "$img_name")
+    if [ "$mandatory" -eq 1 ]; then
+        if [ -z "$img_path" ] || [ ! -s "$img_path" ]; then
+            fatal "Mandatory APEX image $img_name is missing or 0 bytes!"
+        fi
+    fi
+
+    # 2. Extract and strictly validate version code
+    local version=""
     if [ -f "/mnt/${img_name%.img}.version" ]; then
         version=$(cat "/mnt/${img_name%.img}.version" | tr -d '[:space:]')
     elif [ -f "/tmp/${img_name%.img}.version" ]; then
         version=$(cat "/tmp/${img_name%.img}.version" | tr -d '[:space:]')
-    elif [ "$mod_name" = "com.android.art" ]; then
-        version="361501120"
-    elif [ "$mod_name" = "com.android.tzdata" ]; then
-        version="361157000"
     fi
 
-    # Canonical AOSP structure:
+    if [ "$mandatory" -eq 1 ]; then
+        if [ -z "$version" ]; then
+            fatal "Mandatory APEX metadata .version for $mod_name ($img_name) is missing or empty!"
+        fi
+        if ! echo "$version" | grep -qE '^[1-9][0-9]*$'; then
+            fatal "Mandatory APEX $mod_name has invalid non-numeric or non-positive version code: '$version'!"
+        fi
+    else
+        [ -z "$version" ] && version="1"
+    fi
+
+    # 3. Extract and strictly validate filesystem type
+    local fstype=""
+    if [ -f "/mnt/${img_name%.img}.fstype" ]; then
+        fstype=$(cat "/mnt/${img_name%.img}.fstype" | tr -d '[:space:]')
+    elif [ -f "/tmp/${img_name%.img}.fstype" ]; then
+        fstype=$(cat "/tmp/${img_name%.img}.fstype" | tr -d '[:space:]')
+    fi
+
+    if [ "$mandatory" -eq 1 ]; then
+        if [ -z "$fstype" ]; then
+            fatal "Mandatory APEX metadata .fstype for $mod_name ($img_name) is missing or empty!"
+        fi
+        if [ "$fstype" != "erofs" ] && [ "$fstype" != "ext4" ]; then
+            fatal "Mandatory APEX $mod_name has unsupported filesystem type '$fstype' (must be erofs or ext4)!"
+        fi
+    else
+        [ -z "$fstype" ] && fstype="erofs"
+    fi
+
+    # 4. Canonical AOSP structure:
     # Payload directory: /mnt/sysroot/apex/${mod_name}@${version}
     # Active symlink:    /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
     local versioned_dir="/mnt/sysroot/apex/${mod_name}@${version}"
@@ -254,73 +288,27 @@ populate_apex() {
     /system/bin/toybox mkdir -p "$versioned_dir"
     /system/bin/toybox mkdir -p "/tmp/apex_stage_${mod_name}"
 
-    local img_path=$(get_img "$img_name")
-    local fstype="erofs"
-
-    if [ -n "$img_path" ] && [ -s "$img_path" ]; then
-        if [ -f "/mnt/${img_name%.img}.fstype" ]; then
-            fstype=$(cat "/mnt/${img_name%.img}.fstype" | tr -d '[:space:]')
-        elif [ -f "/tmp/${img_name%.img}.fstype" ]; then
-            fstype=$(cat "/tmp/${img_name%.img}.fstype" | tr -d '[:space:]')
-        fi
-        echo "[STAGE2] Staging $mod_name to $versioned_dir from image $img_path (fstype: $fstype)..." > /dev/kmsg
-        if ! try_mount -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"; then
-            local alt_fstype="ext4"
-            [ "$fstype" = "ext4" ] && alt_fstype="erofs"
-            try_mount -t "$alt_fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}" || \
-                fatal "Failed to mount $mod_name payload image from $img_path (attempted $fstype and $alt_fstype)!"
-        fi
-        /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy $mod_name payload!"
-        /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
-    else
-        # Fallback to authentic donor partition packages in /mnt/sysroot/system/apex/
-        local donor_apex=""
-        for candidate in \
-            "/mnt/sysroot/system/apex/${mod_name}.apex" \
-            "/mnt/sysroot/system/apex/${mod_name}_compressed.apex" \
-            "/mnt/sysroot/system/apex/com.google.android.${mod_name#com.android.}_compressed.apex" \
-            "/mnt/sysroot/system/apex/com.google.android.${mod_name#com.android.}.apex" \
-            "/mnt/sysroot/system/apex/com.google.android.tzdata6.apex"; do
-            if [ -f "$candidate" ]; then
-                donor_apex="$candidate"
-                break
-            fi
-        done
-
-        if [ -n "$donor_apex" ]; then
-            echo "[STAGE2] Extracting authentic donor APEX $donor_apex for $mod_name..." > /dev/kmsg
-            local unpack_tmp="/tmp/unpack_${mod_name}"
-            /system/bin/toybox mkdir -p "$unpack_tmp"
-            if /system/bin/unzip -q "$donor_apex" "apex_payload.img" -d "$unpack_tmp" 2>/dev/null; then
-                local pimg="$unpack_tmp/apex_payload.img"
-                if ! try_mount -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"; then
-                    try_mount -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" || \
-                        fatal "Failed to mount unpacked $mod_name payload image (attempted ext4 and erofs)!"
-                fi
-                /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
-                /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
-            elif /system/bin/unzip -q "$donor_apex" "original_apex" -d "$unpack_tmp" 2>/dev/null; then
-                local orig_apex="$unpack_tmp/original_apex"
-                if /system/bin/unzip -q "$orig_apex" "apex_payload.img" -d "$unpack_tmp/orig" 2>/dev/null; then
-                    local pimg="$unpack_tmp/orig/apex_payload.img"
-                    if ! try_mount -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"; then
-                        try_mount -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" || \
-                            fatal "Failed to mount unpacked $mod_name payload image (attempted ext4 and erofs)!"
-                    fi
-                    /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
-                    /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
-                fi
-            fi
-            /system/bin/toybox rm -rf "$unpack_tmp" 2>/dev/null || true
-        elif [ "$mandatory" -eq 1 ]; then
-            fatal "Mandatory APEX $mod_name ($img_name) not found in staging area or system partition!"
-        fi
+    echo "[STAGE2] Staging $mod_name to $versioned_dir from image $img_path (fstype: $fstype, version: $version)..." > /dev/kmsg
+    if ! try_mount -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"; then
+        fatal "Failed to mount $mod_name payload image from $img_path with filesystem $fstype!"
     fi
 
-    # Establish canonical active symlink pointing to versioned payload directory:
-    # /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
+    /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy $mod_name payload to $versioned_dir!"
+    /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
+
+    # 5. Establish canonical active symlink pointing to versioned payload directory
     /system/bin/toybox rm -rf "$active_symlink" 2>/dev/null || true
     (cd /mnt/sysroot/apex && /system/bin/toybox ln -sfn "${mod_name}@${version}" "$mod_name")
+
+    # Verify active symlink points to actual versioned directory
+    local symlink_target
+    symlink_target=$(readlink "$active_symlink" 2>/dev/null || true)
+    if [ "$symlink_target" != "${mod_name}@${version}" ]; then
+        fatal "Active symlink $active_symlink does not point to ${mod_name}@${version} (points to '$symlink_target')!"
+    fi
+    if [ ! -d "$active_symlink" ]; then
+        fatal "Active symlink $active_symlink does not resolve to a directory!"
+    fi
 
     # Establish backward-compatibility convenience link @1 if version != 1
     if [ "$version" != "1" ]; then
@@ -381,6 +369,11 @@ mount_or_fail --bind /sys /mnt/sysroot/sys
 /system/bin/toybox mkdir -p /mnt/sysroot/dev/__properties__ /mnt/sysroot/dev/socket
 mount_or_fail -t tmpfs tmpfs /mnt/sysroot/dev/__properties__
 mount_or_fail -t tmpfs tmpfs /mnt/sysroot/dev/socket
+
+# Ensure property workspace is accessible to root-namespace watchdog and diagnostics
+/system/bin/toybox mkdir -p /dev/__properties__ /dev/socket
+/system/bin/toybox mount --bind /mnt/sysroot/dev/__properties__ /dev/__properties__ 2>/dev/null || true
+/system/bin/toybox mount --bind /mnt/sysroot/dev/socket /dev/socket 2>/dev/null || true
 
 # Graphics compatibility node
 /system/bin/toybox mkdir -p /mnt/sysroot/dev/graphics

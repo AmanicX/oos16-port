@@ -1,6 +1,6 @@
 # OxygenOS 16 Port to OnePlus 7T (HD1901) — Project Summary
 
-> **Document Version**: 2.2.0 (Dynamic BinderFS Allocation, Watchdog 4-State Lifecycle, Protobuf APEX Metadata & RAM Budgeting)  
+> **Document Version**: 2.3.0 (Hardened BinderFS Encoding, 600s Watchdog Health Monitor, Strict APEX Metadata, Fail-Closed RAM Budgeting & 86 Automated Tests)  
 > **Target Device**: OnePlus 7T (`HD1901` / `hotdogb`, Snapdragon 855+ / SM8150-AC, 8 GB RAM)  
 > **Source ROM**: OxygenOS 16 (Android 16 / SDK 36 / `Baklava` / `BP4A.251205.006`)  
 > **Base OS on Device**: crDroid (Android 16 / LineageOS 23.2 base, FBE Encrypted)  
@@ -131,37 +131,49 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
   * `stage2_init.sh` disarms watchdog via regular file `/mnt/watchdog_cancel` only upon successful mounting and preparation immediately prior to Android init handover.
   * On any failure, `fatal()` halts without creating `watchdog_cancel`, guaranteeing automated reboot to bootloader.
 
-### 12. Dynamic BinderFS Device Allocation (`binderfs_init`)
-* **Problem**: Fresh BinderFS mount points only create `/dev/binderfs/binder-control`. IPC devices (`binder`, `hwbinder`, `vndbinder`) do not exist automatically, causing Binder-dependent services to crash.
+### 12. Dynamic BinderFS Device Allocation (`binderfs_init`) & Standard Linux `dev_t` Encoding
+* **Problem**: Fresh BinderFS mount points only create `/dev/binderfs/binder-control`. IPC devices (`binder`, `hwbinder`, `vndbinder`) do not exist automatically, causing Binder-dependent services to crash. Furthermore, naive bitshift `(maj << 8) | min` fails for major or minor device numbers $> 255$.
 * **Solution**:
   * Implemented static ARM64 executable `src/binderfs_init` (with Go and C implementations in `src/`).
-  * Uses `ioctl(ctl_fd, BINDER_CTL_ADD, &dev)` with `struct binderfs_device` to allocate `binder`, `hwbinder`, and `vndbinder`.
-  * Logs allocated major:minor device numbers, chmods to `0666`, creates `/dev/<name>` symlinks, and verifies `O_RDWR` accessibility.
+  * Implemented standard Linux 64-bit `dev_t` encoding matching glibc/sysmacros ABI:
+    `(maj & 0xfff) << 8 | (min & 0xff) | ((maj & ~0xfff) << 32) | ((min & ~0xff) << 12)`.
+  * Validated major and minor boundaries (`maj <= 0xfffff`), rejecting empty, non-numeric, or malformed sysfs device strings.
+  * Checked every syscall return value (`Mknod`, `Chmod`, `Symlink`, `Remove`), refusing to overwrite existing unrelated files or directories.
   * Embedded into both `stage1/loader_ramdisk` and `stage1/native_ramdisk` at `/system/bin/binderfs_init`.
 
 ### 13. Watchdog 4-State Lifecycle Protocol & Health Monitoring
-* **Problem**: Two-tier watchdog did not actively guard Stage 2 in RAM or monitor whether Android completed booting after `exec init second_stage`.
+* **Problem**: Two-tier watchdog did not actively guard Stage 2 in RAM or monitor whether Android completed booting after `exec init second_stage`. Additionally, the 180s static timeout was insufficient for first-boot optimization.
 * **Solution**:
-  * Implemented 4-state state machine in `scripts/watchdog.sh`:
+  * Implemented atomic 4-state state machine in `scripts/watchdog.sh`:
     * `STAGE1_WAIT` (60s): Monitors host heartbeats until Stage-1 consumes `/mnt/boot_now` and touches `/mnt/stage1_ack`.
     * `STAGE2_RUNNING` (120s): Monitors RAM staging, accepting either device `/mnt/stage2_heartbeat` or host heartbeats until Stage 2 touches `/mnt/stage2_done`.
-    * `HEALTH_MONITOR` (180s): Monitors Android second-stage init; polls Android property `sys.boot_completed=1` via `getprop`. Exits cleanly (code 0) on success; triggers emergency reboot on timeout.
+    * `HEALTH_MONITOR` (Configurable 600s default for first boot): Monitors Android second-stage init; polls Android property `sys.boot_completed=1` via chroot `/mnt/sysroot /system/bin/getprop` and root property bind-mounts. Exits cleanly (code 0) on success; triggers emergency reboot on timeout.
     * `DISARMED`: Atomic cancellation via regular file `/mnt/watchdog_cancel`.
+  * State transitions are written atomically via temporary file and `mv -f` to prevent partial state reads.
 
-### 14. Protobuf APEX Manifest Metadata Extraction & Non-Fatal Mounting
-* **Problem**: `com.google.android.art_compressed.apex` and `com.google.android.tzdata6.apex` encode metadata in protobuf `apex_manifest.pb`. Fallbacks to version 1 broke canonical `@version` paths, and candidate mount failures aborted Stage 2.
+### 14. Hardened Protobuf APEX Manifest Extraction & Strict Device-Side Validation
+* **Problem**: Silent fallbacks to `version="1"` masked corrupted or missing APEX packages. Protobuf parsing without varint length bounds or strict UTF-8 checking risked parsing errors on compressed packages.
 * **Solution**:
-  * Created `tools/extract_apex_info.py` with protobuf varint/tag decoder and JSON fallback.
-  * Extracts authentic versions (`com.android.art` -> 361501120, `com.android.tzdata` -> 361157000).
-  * Enforces positive integer version codes and validates package names.
-  * In `scripts/stage2_init.sh`, implemented non-fatal `try_mount()` helper, allowing candidate filesystem evaluation without aborting.
+  * Hardened `tools/extract_apex_info.py` with protobuf varint/tag decoder:
+    * Rejects tag 0, varints $> 10$ bytes, and invalid wire types.
+    * Rejects length-delimited payloads that exceed buffer bounds.
+    * Enforces strict UTF-8 decoding and package identifier syntax validation.
+    * Safely unpacks compressed APEX packages (`original_apex`) with `BadZipFile` handling.
+  * In `scripts/stage2_init.sh`:
+    * Eliminated all silent fallback versions.
+    * Validates that `.version` exists and matches `^[1-9][0-9]*$`.
+    * Validates that `.fstype` exists and matches `erofs` or `ext4`.
+    * Staged in authentic versioned directories `/mnt/sysroot/apex/${mod_name}@${version}` and active symlinks.
 
-### 15. Volatile RAM Peak-Memory Budgeting
-* **Problem**: Pushing 3.3 GB of disk images into RAM tmpfs without verifying available system RAM risked out-of-memory kernel panics.
+### 15. Volatile RAM Peak-Memory Budgeting (Fail-Closed)
+* **Problem**: Staging 3.3 GB of disk images in RAM tmpfs without reliable `df` parsing risked out-of-memory kernel panics or false passes on empty output.
 * **Solution**:
-  * In `tools/safe/run_stage2.sh`, dynamically inspects target `/proc/meminfo` (`MemTotal` and `MemAvailable`).
-  * Calculates total size of staged images + reservations (1024 MB data + 512 MB tmp/overlay + 1536 MB kernel/runtime = ~6,372 MB peak).
-  * Fails closed immediately if `/proc/meminfo` cannot be read or if `MemAvailable < REQUIRED_RAM_MB`.
+  * In `tools/safe/run_stage2.sh`:
+    * Sized staged images with exact upward integer rounding: `TOTAL_STAGED_MB=$(((TOTAL_STAGED_BYTES + 1048575) / 1048576))`.
+    * Verified `/mnt` is tmpfs using `/proc/mounts`.
+    * Reliably parsed and validated numeric free space from `df -m /mnt`, failing closed on empty or invalid output.
+    * Verified `MemTotal >= 6500MB` (8 GB target verification) and `MemAvailable >= REQUIRED_RAM_MB` (~6,372 MB peak budget).
+    * Extended monitoring loop (`OOS16_WAIT_FOR_BOOT=1`) continues petting the safety watchdog heartbeat while awaiting `sys.boot_completed=1` or `watchdog_state=BOOT_COMPLETED`.
 
 ---
 
@@ -170,8 +182,8 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on `build/loader.img` and `build/stage1.img` with zero mandatory unverified checks. |
-| **Tier 3: Host Tests Passed** | Automated Python & Shell unit/integration test suites | **PASSED (66/66)** | 100% pass across ADB proxy (8), Fastboot proxy (3), Watchdog protocol (15), and Stage-2 runner integration mocks (40). |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on `build/loader.img` (31/31), `build/stage1.img` (31/31), and ramdisks (29/29) with zero mandatory unverified checks. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (86/86)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf (9), Watchdog protocol (15), Stage-2 runner integration mocks (46), and Go BinderFS unit tests (5). |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all 10 Stage-2 images generated with valid SHA256SUMS. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
@@ -184,5 +196,5 @@ The repository is in a verified, build-clean, and audited state:
 * All host-side safety wrappers (`tools/safe/adb`, `tools/safe/fastboot`, `tools/safe/audit-no-writes.sh`) are active and verified.
 * All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (31/31).
 * All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS`.
-* All 66 automated unit and integration tests pass without error.
+* All 86 automated unit and integration tests pass without error (100% OK).
 * **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`).

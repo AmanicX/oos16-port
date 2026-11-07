@@ -8,12 +8,17 @@ on:
 
 jobs:
   test:
-    name: Safety Audit & Test Suite
+    name: Safety Audit, Build & Test Suite
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,20 +28,69 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bash lz4 bsdextrautils
+          sudo apt-get install -y bash lz4 bsdextrautils file gcc
 
-      - name: Validate Shell & Init Scripts Syntax (bash -n)
+      - name: Validate Shell & Init Scripts Syntax (bash -n per script)
         run: |
-          echo "Checking syntax of all shell and init scripts..."
-          bash -n scripts/*.sh
-          bash -n tools/safe/*.sh
-          bash -n stage1/loader_ramdisk/init
-          bash -n stage1/native_ramdisk/init
-          bash -n stage1/native_ramdisk/system/bin/recovery
+          echo "Independently validating syntax for each shell and init script..."
+          SCRIPTS=(
+            scripts/build_loader.sh
+            scripts/build_stage1.sh
+            scripts/build_stage2_erofs.sh
+            scripts/stage2_init.sh
+            scripts/watchdog.sh
+            tools/safe/run_stage2.sh
+            tools/safe/audit-no-writes.sh
+            stage1/loader_ramdisk/init
+            stage1/loader_ramdisk/system/bin/stage2_init.sh
+            stage1/loader_ramdisk/system/bin/watchdog.sh
+            stage1/native_ramdisk/init
+            stage1/native_ramdisk/system/bin/stage2_init.sh
+            stage1/native_ramdisk/system/bin/watchdog.sh
+            stage1/native_ramdisk/system/bin/recovery
+          )
+          for s in "${SCRIPTS[@]}"; do
+            echo "Checking: $s"
+            bash -n "$s" || { echo "ERROR: Syntax check failed on $s"; exit 1; }
+          done
           echo "All script syntax validated successfully."
 
-      - name: Run Python Unit & Integration Tests
+      - name: Verify Strict Non-Destructive Invariants (Static Scan)
         run: |
+          echo "Auditing repository for forbidden physical flash write patterns..."
+          ! grep -rn "fastboot[[:space:]]\+flash" scripts tools stage1
+          ! grep -rn "fastboot[[:space:]]\+erase" scripts tools stage1
+          ! grep -rn "fastboot[[:space:]]\+format" scripts tools stage1
+          ! grep -rn "mkfs\.ext4[[:space:]]\+/dev/block" scripts tools stage1
+          echo "Non-destructive invariants verified."
+
+      - name: Compile and Test Go Binder Helper (Host & ARM64)
+        run: |
+          echo "Building host and ARM64 binderfs_init from source..."
+          cd src
+          make clean
+          make test
+          make host
+          make arm64
+          make verify
+          make c_test
+          make install
+
+      - name: Verify Embedded Binary & Script Consistency Across Ramdisks
+        run: |
+          echo "Checking embedded binary and script equality..."
+          cmp -s src/binderfs_init_arm64 stage1/loader_ramdisk/system/bin/binderfs_init
+          cmp -s src/binderfs_init_arm64 stage1/native_ramdisk/system/bin/binderfs_init
+          cmp -s scripts/stage2_init.sh stage1/loader_ramdisk/system/bin/stage2_init.sh
+          cmp -s scripts/stage2_init.sh stage1/native_ramdisk/system/bin/stage2_init.sh
+          cmp -s scripts/watchdog.sh stage1/loader_ramdisk/system/bin/watchdog.sh
+          cmp -s scripts/watchdog.sh stage1/native_ramdisk/system/bin/watchdog.sh
+          cmp -s stage1/loader_ramdisk/init stage1/native_ramdisk/init
+          echo "All embedded binaries and scripts are byte-identical."
+
+      - name: Run Python Unit & Integration Test Suites
+        run: |
+          echo "Running full automated test suite..."
           python3 -m unittest discover -s tests -p "test_*.py"
 
       - name: Run Pre-Boot Static Safety Auditor (native_ramdisk)

@@ -99,17 +99,30 @@ if [ -f "$HOME/.android/adbkey.pub" ]; then
     chmod 644 "$NATIVE_RAMDISK/adb_keys"
 fi
 
-# 4. Embed Stage-2 Bringup and Watchdog Scripts into Native Ramdisk
+# 4. Build Reproducible ARM64 Helper & Embed Scripts into Native Ramdisk
+echo "4. Building reproducible static ARM64 binderfs_init from source..."
+if ! command -v go >/dev/null 2>&1; then
+    echo "ERROR: 'go' compiler is required to build binderfs_init ARM64 binary!" >&2
+    exit 1
+fi
+(cd "$PROJECT_ROOT/src" && make clean && make arm64 verify install)
+
 echo "Embedding Stage-2 bringup and watchdog scripts into native ramdisk..."
 mkdir -p "$NATIVE_RAMDISK/system/bin"
 cp "$PROJECT_ROOT/scripts/stage2_init.sh" "$NATIVE_RAMDISK/system/bin/stage2_init.sh"
 chmod 0755 "$NATIVE_RAMDISK/system/bin/stage2_init.sh"
 cp "$PROJECT_ROOT/scripts/watchdog.sh" "$NATIVE_RAMDISK/system/bin/watchdog.sh"
 chmod 0755 "$NATIVE_RAMDISK/system/bin/watchdog.sh"
-if [ -f "$PROJECT_ROOT/src/binderfs_init_arm64" ]; then
-    cp "$PROJECT_ROOT/src/binderfs_init_arm64" "$NATIVE_RAMDISK/system/bin/binderfs_init"
-    chmod 0755 "$NATIVE_RAMDISK/system/bin/binderfs_init"
+
+# Verify embedded binary presence, executability, and byte-equality with source build
+if [ ! -x "$NATIVE_RAMDISK/system/bin/binderfs_init" ]; then
+    echo "ERROR: $NATIVE_RAMDISK/system/bin/binderfs_init is missing or not executable!" >&2
+    exit 1
 fi
+cmp -s "$PROJECT_ROOT/src/binderfs_init_arm64" "$NATIVE_RAMDISK/system/bin/binderfs_init" || {
+    echo "ERROR: Embedded binderfs_init does not match freshly built source binary!" >&2
+    exit 1
+}
 
 # 5. Packaging Native Stage-1 Ramdisk
 echo "3. Packaging Native Stage-1 Ramdisk with mkbootfs..."

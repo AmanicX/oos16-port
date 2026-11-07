@@ -59,6 +59,10 @@ if not args:
 
 subcmd = args[0]
 if subcmd == "get-state":
+    dev_state = "{behavior_config.get('device_state', '')}"
+    if dev_state:
+        print(dev_state)
+        sys.exit(0)
     print("device")
     sys.exit(0)
 
@@ -66,7 +70,11 @@ if subcmd == "push":
     src = args[1]
     dest = args[2]
     fail_push = "{behavior_config.get('fail_push', '')}"
-    if fail_push and fail_push in dest:
+    if fail_push and (fail_push in dest or fail_push in src):
+        sys.exit(1)
+    disconnect_push = "{behavior_config.get('disconnect_during_push', '')}"
+    if disconnect_push and (disconnect_push in dest or disconnect_push in src):
+        sys.stderr.write("error: device disconnected during transfer\\n")
         sys.exit(1)
     mock_dest = os.path.join("{self.mock_device_dir}", dest.lstrip("/"))
     os.makedirs(os.path.dirname(mock_dest), exist_ok=True)
@@ -76,16 +84,16 @@ if subcmd == "push":
 
 if subcmd in ["shell", "exec-out"]:
     shell_cmd = " ".join(args[1:])
-    
+
     if "ls -1 /sys/block/sda" in shell_cmd:
         if "{behavior_config.get('fail_partition_ro', '')}":
             print("sda1\\nsda2\\nqueue")
             sys.exit(0)
-            
+
     if "ls -1 /sys/block" in shell_cmd:
         print({block_devs})
         sys.exit(0)
-    
+
     if "test -e /sys/block" in shell_cmd:
         dev = shell_cmd.split()[2].split("/")[3]
         if "{behavior_config.get('no_physical', False)}" == "True":
@@ -93,7 +101,7 @@ if subcmd in ["shell", "exec-out"]:
         if dev in ["sda", "sdb"]:
             sys.exit(0)
         sys.exit(1)
-        
+
     if "blockdev --getro" in shell_cmd:
         dev_node = shell_cmd.split()[-1]
         fail_part = "{behavior_config.get('fail_partition_ro', '')}"
@@ -105,8 +113,8 @@ if subcmd in ["shell", "exec-out"]:
         else:
             print("{behavior_config.get('ro_status', '1')}")
         sys.exit(0)
-        
-    if shell_cmd == "mount":
+
+    if "mount" in shell_cmd or "cat /proc/mounts" in shell_cmd:
         if "{behavior_config.get('writable_mount', False)}" == "True":
             print("/dev/block/sda1 on /data type ext4 (rw,seclabel,nosuid,nodev)")
         else:
@@ -128,9 +136,56 @@ if subcmd in ["shell", "exec-out"]:
             print("MemTotal:        7628800 kB\\nMemFree:         6500000 kB\\nMemAvailable:    7100000 kB")
         sys.exit(0)
 
+    if "df" in shell_cmd:
+        fail_df = "{behavior_config.get('fail_df', '')}"
+        if fail_df == "missing":
+            sys.exit(1)
+        elif fail_df == "corrupt":
+            print("invalid_df_output")
+            sys.exit(0)
+        elif fail_df == "low":
+            print("Filesystem           1M-blocks      Used Available Use% Mounted on")
+            print("tmpfs                     6500      6400       100  98% /mnt")
+            sys.exit(0)
+        else:
+            print("Filesystem           1M-blocks      Used Available Use% Mounted on")
+            print("tmpfs                     6500       100      6400   2% /mnt")
+            sys.exit(0)
+
     if "free -m" in shell_cmd:
         print("               total        used        free      shared     buffers")
         print("Mem:            7450        1200        6250           0          10")
+        sys.exit(0)
+
+    if "getprop" in shell_cmd:
+        prop = shell_cmd.split()[-1]
+        boot_completed_val = "{behavior_config.get('boot_completed', '')}"
+        if prop == "sys.boot_completed" and boot_completed_val:
+            print(boot_completed_val)
+            sys.exit(0)
+        print("")
+        sys.exit(0)
+
+    if "watchdog_state" in shell_cmd:
+        wd_state_val = "{behavior_config.get('watchdog_state', '')}"
+        if wd_state_val:
+            print(wd_state_val)
+            sys.exit(0)
+        print("")
+        sys.exit(0)
+
+    if "touch /mnt/watchdog_heartbeat" in shell_cmd:
+        sys.exit(0)
+
+    if "touch /mnt/boot_now" in shell_cmd:
+        touch_dest = os.path.join("{self.mock_device_dir}", "mnt/boot_now")
+        os.makedirs(os.path.dirname(touch_dest), exist_ok=True)
+        with open(touch_dest, "w") as f:
+            f.write("boot")
+        if "{behavior_config.get('auto_ack_on_trigger', True)}" == "True" and "{behavior_config.get('fail_ack', '')}" not in ["timeout", "transport_error"] and not "{behavior_config.get('ack_delayed', 0)}":
+            ack_path = os.path.join("{self.mock_device_dir}", "mnt/stage1_ack")
+            with open(ack_path, "w") as af:
+                af.write("ack")
         sys.exit(0)
 
     if "stage1_ack" in shell_cmd:
@@ -140,16 +195,37 @@ if subcmd in ["shell", "exec-out"]:
             sys.exit(255)
         elif fail_ack == "timeout":
             sys.exit(1)
+        elif "{behavior_config.get('ack_delayed', 0)}":
+            delay_count = int("{behavior_config.get('ack_delayed', 0)}")
+            cnt_file = os.path.join("{self.mock_device_dir}", ".ack_check_count")
+            c = 0
+            if os.path.exists(cnt_file):
+                try:
+                    with open(cnt_file, "r") as cf:
+                        c = int(cf.read().strip())
+                except:
+                    c = 0
+            c += 1
+            with open(cnt_file, "w") as cf:
+                cf.write(str(c))
+            if c >= delay_count:
+                ack_path = os.path.join("{self.mock_device_dir}", "mnt/stage1_ack")
+                os.makedirs(os.path.dirname(ack_path), exist_ok=True)
+                with open(ack_path, "w") as af:
+                    af.write("ack")
+                sys.exit(0)
+            else:
+                sys.exit(1)
         else:
+            ack_path = os.path.join("{self.mock_device_dir}", "mnt/stage1_ack")
+            if os.path.exists(ack_path):
+                sys.exit(0)
+            if "{behavior_config.get('no_auto_ack', False)}" == "True":
+                sys.exit(1)
+            with open(ack_path, "w") as af:
+                af.write("ack")
             sys.exit(0)
 
-    if "test -f" in shell_cmd:
-        target_path = shell_cmd.split()[-1]
-        fail_verify = "{behavior_config.get('fail_verify', '')}"
-        if fail_verify and fail_verify in target_path:
-            sys.exit(1)
-        sys.exit(0)
-        
     if "sha256sum" in shell_cmd:
         target_path = shell_cmd.split()[-1]
         fail_sha = "{behavior_config.get('fail_sha256', '')}"
@@ -165,20 +241,27 @@ if subcmd in ["shell", "exec-out"]:
             sys.exit(0)
         else:
             sys.exit(1)
-        
+
     if "readlink" in shell_cmd:
         print(shell_cmd.split()[-1])
         sys.exit(0)
-        
-    if "touch /mnt/watchdog_heartbeat" in shell_cmd:
-        sys.exit(0)
-        
-    if "touch /mnt/boot_now" in shell_cmd:
-        touch_dest = os.path.join("{self.mock_device_dir}", "mnt/boot_now")
-        os.makedirs(os.path.dirname(touch_dest), exist_ok=True)
-        with open(touch_dest, "w") as f:
-            f.write("boot")
-        sys.exit(0)
+
+    if "test -f" in shell_cmd:
+        target_path = shell_cmd.split()[-1]
+        fail_verify = "{behavior_config.get('fail_verify', '')}"
+        if fail_verify and fail_verify in target_path:
+            sys.exit(1)
+        mock_file = os.path.join("{self.mock_device_dir}", target_path.lstrip("/"))
+        if os.path.isfile(mock_file):
+            sys.exit(0)
+        sys.exit(1)
+
+    if "test -e" in shell_cmd or "test -d" in shell_cmd:
+        target_path = shell_cmd.split()[-1]
+        mock_file = os.path.join("{self.mock_device_dir}", target_path.lstrip("/"))
+        if os.path.exists(mock_file):
+            sys.exit(0)
+        sys.exit(1)
 
 sys.exit(0)
 """
@@ -820,15 +903,13 @@ exit 1
         self.assertIn("/sys/bus/*/devices/*/uevent", content)
 
     def test_binderfs_mount_and_symlinks(self):
-        """Verify binderfs initialization and symlink creation in Stage-1 init."""
+        """Verify binderfs initialization and helper invocation in Stage-1 init."""
         loader_init = os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk/init")
         with open(loader_init) as f:
             content = f.read()
 
         self.assertIn("mount -t binder binder /dev/binderfs", content)
-        self.assertIn("ln -sf /dev/binderfs/binder /dev/binder", content)
-        self.assertIn("ln -sf /dev/binderfs/hwbinder /dev/hwbinder", content)
-        self.assertIn("ln -sf /dev/binderfs/vndbinder /dev/vndbinder", content)
+        self.assertIn("/system/bin/binderfs_init", content)
 
     def test_canonical_apex_versioned_directory_structure(self):
         """Verify authentic AOSP APEX versioned directory layout and active symlinks."""
@@ -840,9 +921,9 @@ exit 1
         self.assertIn('versioned_dir="/mnt/sysroot/apex/${mod_name}@${version}"', content)
         # Verify active symlink: /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
         self.assertIn('ln -sfn "${mod_name}@${version}" "$mod_name"', content)
-        # Verify fallback version codes for authentic packages
-        self.assertIn('version="361501120"', content)
-        self.assertIn('version="361157000"', content)
+        # Verify strict version validation without silent fallbacks
+        self.assertIn("grep -qE '^[1-9][0-9]*$'", content)
+        self.assertIn('Mandatory APEX metadata .version for $mod_name', content)
 
     def test_watchdog_cancellation_lifecycle(self):
         """Verify watchdog cancel file creation before Android init handover and preservation on failure."""
@@ -960,14 +1041,99 @@ exit 1
         self.assertIn("Invalid APEX version code '0'", res.stderr + res.stdout)
 
     def test_stage2_init_try_mount_fallback(self):
-        """Verify scripts/stage2_init.sh defines try_mount and uses it for fallback."""
+        """Verify scripts/stage2_init.sh defines try_mount and uses it for verified fstype mount."""
         stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
         with open(stage2_script) as f:
             content = f.read()
 
         self.assertIn("try_mount()", content)
-        self.assertIn("if ! try_mount -t ext4", content)
-        self.assertIn("try_mount -t erofs", content)
+        self.assertIn('try_mount -t "$fstype"', content)
+
+    def test_runner_delayed_acknowledgement_success(self):
+        """Verify runner waits through pending checks and succeeds when delayed ack appears."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "ack_delayed": 2})
+        test_images = os.path.join(self.test_dir, "delayed_ack_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0, f"Expected success with delayed ack, got:\n{res.stdout}\n{res.stderr}")
+        self.assertIn("Stage-1 supervisor explicitly acknowledged trigger", res.stdout)
+
+    def test_runner_aborts_on_missing_ack_timeout(self):
+        """Verify runner aborts with timeout when stage1_ack never appears."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_ack": "timeout"})
+        test_images = os.path.join(self.test_dir, "timeout_ack_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Stage-1 PID 1 supervisor did not acknowledge trigger with /mnt/stage1_ack within timeout", res.stderr)
+
+    def test_runner_aborts_on_device_disconnect_during_transfer(self):
+        """Verify runner aborts immediately if device disconnects during image push."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "disconnect_during_push": "vendor.erofs.img"})
+        test_images = os.path.join(self.test_dir, "disconnect_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+
+    def test_runner_trigger_still_pending_wait(self):
+        """Verify runner logs pending trigger consumption when boot_now remains unconsumed."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "ack_delayed": 2})
+        test_images = os.path.join(self.test_dir, "pending_trigger_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Stage-1 supervisor pending trigger consumption", res.stdout)
+
+    def test_runner_aborts_on_missing_df(self):
+        """Verify runner fails closed if df command fails or returns empty output."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_df": "missing"})
+        test_images = os.path.join(self.test_dir, "missing_df_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL SAFETY ERROR: df command failed or returned empty output", res.stderr + res.stdout)
+
+    def test_runner_extended_boot_monitor_completion_success(self):
+        """Verify runner extended monitoring detects sys.boot_completed=1 and exits 0."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "boot_completed": "1", "watchdog_state": "BOOT_COMPLETED"})
+        test_images = os.path.join(self.test_dir, "boot_complete_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+        env["OOS16_WAIT_FOR_BOOT"] = "1"
+        env["OOS16_BOOT_MONITOR_TIMEOUT"] = "5"
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("SUCCESS: OxygenOS 16 boot completed successfully!", res.stdout)
+        self.assertIn("sys.boot_completed=1 verified", res.stdout)
 
     def test_binderfs_init_execution_and_verification(self):
         """Verify binderfs_init helper binary and its invocation in loader and native init."""

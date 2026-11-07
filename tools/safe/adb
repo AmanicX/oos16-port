@@ -233,7 +233,7 @@ elif subcmd in ["shell", "exec-out"]:
         "mount": lambda a: len(a) == 0,  # Read-only mount table inspection ONLY
         "lshal": lambda a: all(x in ["--types=all", "--types=b", "--types=c", "-v"] for x in a),
         "dumpsys": lambda a: all(re.match(r"^[a-zA-Z0-9_.-]+$", x) for x in a) and len(a) <= 2,
-        "cat": lambda a: len(a) == 1 and (a[0].startswith("/proc/") or a[0].startswith("/sys/")) and ".." not in a[0],
+        "cat": lambda a: len(a) == 1 and a[0].startswith(("/proc/", "/sys/", "/mnt/", "/tmp/")) and ".." not in a[0],
         "ls": lambda a: all(
             x in ["-l", "-a", "-d", "-1", "-F", "-la", "-lh", "-ld"] or
             (x.startswith(("/sys/block", "/dev/block", "/tmp", "/mnt", "/proc", "/sys", "/dev", "/system", "/vendor", "/apex", "/linkerconfig")) and ".." not in x)

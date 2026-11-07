@@ -18,18 +18,31 @@ if [ ! -d "$LOADER_RAMDISK" ]; then
     exit 1
 fi
 
-echo "1. Embedding Stage-2 bringup and watchdog scripts into loader ramdisk..."
+echo "1. Building reproducible static ARM64 binderfs_init from source..."
+if ! command -v go >/dev/null 2>&1; then
+    echo "ERROR: 'go' compiler is required to build binderfs_init ARM64 binary!" >&2
+    exit 1
+fi
+(cd "$PROJECT_ROOT/src" && make clean && make arm64 verify install)
+
+echo "2. Embedding Stage-2 bringup and watchdog scripts into loader ramdisk..."
 mkdir -p "$LOADER_RAMDISK/system/bin"
 cp "$PROJECT_ROOT/scripts/stage2_init.sh" "$LOADER_RAMDISK/system/bin/stage2_init.sh"
 chmod 0755 "$LOADER_RAMDISK/system/bin/stage2_init.sh"
 cp "$PROJECT_ROOT/scripts/watchdog.sh" "$LOADER_RAMDISK/system/bin/watchdog.sh"
 chmod 0755 "$LOADER_RAMDISK/system/bin/watchdog.sh"
-if [ -f "$PROJECT_ROOT/src/binderfs_init_arm64" ]; then
-    cp "$PROJECT_ROOT/src/binderfs_init_arm64" "$LOADER_RAMDISK/system/bin/binderfs_init"
-    chmod 0755 "$LOADER_RAMDISK/system/bin/binderfs_init"
-fi
 
-echo "2. Packaging Loader Ramdisk with mkbootfs..."
+# Verify embedded binary presence, executability, and byte-equality with source build
+if [ ! -x "$LOADER_RAMDISK/system/bin/binderfs_init" ]; then
+    echo "ERROR: $LOADER_RAMDISK/system/bin/binderfs_init is missing or not executable!" >&2
+    exit 1
+fi
+cmp -s "$PROJECT_ROOT/src/binderfs_init_arm64" "$LOADER_RAMDISK/system/bin/binderfs_init" || {
+    echo "ERROR: Embedded binderfs_init does not match freshly built source binary!" >&2
+    exit 1
+}
+
+echo "3. Packaging Loader Ramdisk with mkbootfs..."
 "$OTATOOLS/mkbootfs" "$LOADER_RAMDISK" | lz4 -l -12 --favor-decSpeed > "$STAGE1_DIR/stage1_loader_ramdisk.cpio.lz4"
 
 echo "3. Assembling Loader Boot Image with mkbootimg..."

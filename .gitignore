@@ -28,3 +28,5 @@ stage1/*.lz4
 logs/*.log
 __pycache__/
 *.pyc
+src/binderfs_init_arm64
+src/binderfs_init_host

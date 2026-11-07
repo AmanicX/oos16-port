@@ -50,12 +50,7 @@ if [ -x /system/bin/binderfs_init ]; then
         fatal_halt "CRITICAL: binderfs_init failed to allocate and verify required Binder IPC devices!"
     fi
 else
-    # Fallback legacy dynamic symlink creator if helper binary is absent
-    [ -e /dev/binderfs/binder ] && /system/bin/toybox ln -sf /dev/binderfs/binder /dev/binder
-    [ -e /dev/binderfs/hwbinder ] && /system/bin/toybox ln -sf /dev/binderfs/hwbinder /dev/hwbinder
-    [ -e /dev/binderfs/vndbinder ] && /system/bin/toybox ln -sf /dev/binderfs/vndbinder /dev/vndbinder
-    /system/bin/toybox chmod 0666 /dev/binderfs/* /dev/binder /dev/hwbinder /dev/vndbinder 2>/dev/null || true
-    log_kmsg "[LOADER-PID1] Binderfs fallback links established."
+    fatal_halt "CRITICAL: Required helper /system/bin/binderfs_init is missing from ramdisk!"
 fi
 
 # 2. Create Essential Device Nodes
