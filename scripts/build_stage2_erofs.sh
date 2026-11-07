@@ -17,8 +17,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-WORK_DIR="$PROJECT_ROOT/work"
-OUT_DIR="$PROJECT_ROOT/build/images"
+WORK_DIR="${WORK_DIR:-$PROJECT_ROOT/work}"
+OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/build/images}"
 
 # Safe temporary build directory with cleanup trap
 TMP_BUILD_DIR="$(mktemp -d /tmp/erofs_build.XXXXXX)"
@@ -27,13 +27,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+STAGING_DIR="$TMP_BUILD_DIR/staged_images"
+mkdir -p "$STAGING_DIR"
 mkdir -p "$OUT_DIR"
 
 echo "=========================================================="
 echo "      STAGE-2 EROFS PARTITION REPACK & FEATURE INJECTION   "
 echo "=========================================================="
 
-# Tool Discovery & Validation
+# 0. Tool Discovery & Validation
 MKFS_EROFS=""
 FSCK_EROFS=""
 
@@ -66,7 +68,41 @@ echo "Using fsck.erofs: $FSCK_EROFS"
 "$MKFS_EROFS" -V >/dev/null 2>&1 || { echo "ERROR: mkfs.erofs failed verification test" >&2; exit 1; }
 "$FSCK_EROFS" -V >/dev/null 2>&1 || { echo "ERROR: fsck.erofs failed verification test" >&2; exit 1; }
 
-# 1. Apply Feature Injections
+# 1. Validate Mandatory Inputs
+echo "Validating mandatory input directories and assets..."
+MANDATORY_DIRS=(
+    "system:$WORK_DIR/system"
+    "system_ext:$WORK_DIR/system_ext"
+    "vendor:$WORK_DIR/vendor"
+    "odm:$WORK_DIR/odm"
+    "my_product:$WORK_DIR/my_product"
+)
+
+MISSING_MANDATORY=()
+for m in "${MANDATORY_DIRS[@]}"; do
+    NAME="${m%%:*}"
+    SRC="${m##*:}"
+    if [ ! -d "$SRC" ]; then
+        MISSING_MANDATORY+=("$NAME ($SRC)")
+    fi
+done
+
+APEX_SRC="$WORK_DIR/system/system/apex/com.android.runtime.apex"
+if [ ! -f "$APEX_SRC" ] || [ ! -s "$APEX_SRC" ]; then
+    MISSING_MANDATORY+=("runtime_apex ($APEX_SRC)")
+fi
+
+if [ "${#MISSING_MANDATORY[@]}" -gt 0 ]; then
+    echo "CRITICAL BUILD ERROR: Missing mandatory inputs for Stage-2 build:" >&2
+    for item in "${MISSING_MANDATORY[@]}"; do
+        echo "  - $item" >&2
+    done
+    echo "Halting immediately to prevent stale or incomplete image generation." >&2
+    exit 1
+fi
+echo "All mandatory source directories and runtime APEX verified."
+
+# 2. Apply Feature Injections
 echo "[1/6] Injecting Google Photos Unlimited Backup and PIF..."
 CONFIGS_DIR="$PROJECT_ROOT/configs"
 
@@ -86,7 +122,7 @@ if [ -f "$CONFIGS_DIR/pif.json" ]; then
     done
 fi
 
-# 2. Targeted Permission Corrections (Preserve existing permissions)
+# 3. Targeted Permission Corrections
 echo "[2/6] Applying targeted execute permission corrections..."
 fix_executable_permissions() {
     local dir="$1"
@@ -112,7 +148,7 @@ fix_executable_permissions() {
 fix_executable_permissions "$WORK_DIR/vendor/vendor/bin"
 fix_executable_permissions "$WORK_DIR/odm/bin"
 
-# 3. Configure Display Properties for 60Hz Replacement AMOLED Panel
+# 4. Configure Display Properties for 60Hz Replacement AMOLED Panel
 echo "[3/6] Setting fixed 60Hz display properties in vendor build.prop..."
 VENDOR_PROP="$WORK_DIR/vendor/vendor/build.prop"
 if [ -f "$VENDOR_PROP" ]; then
@@ -130,7 +166,7 @@ if [ -f "$VENDOR_PROP" ]; then
     done
 fi
 
-# 4. Resolve SELinux Property Context Prefix Conflicts
+# 5. Resolve SELinux Property Context Prefix Conflicts
 echo "[4/6] Verifying SELinux system_ext_property_contexts..."
 PROP_CTX="$WORK_DIR/system_ext/etc/selinux/system_ext_property_contexts"
 if [ -f "$PROP_CTX" ]; then
@@ -157,91 +193,123 @@ if [ -f "$PROP_CTX" ]; then
     done
 fi
 
-# 5. Build and Strictly Validate EROFS Partition Images
-echo "[5/6] Building high-compression EROFS partition images..."
+# 6. Build and Strictly Validate EROFS Partition Images into Temporary Staging
+echo "[5/6] Building high-compression EROFS partition images in clean staging area..."
 PARTITIONS=(
-    "odm:$WORK_DIR/odm"
-    "vendor:$WORK_DIR/vendor"
-    "my_region:$WORK_DIR/my_region"
-    "system:$WORK_DIR/system"
-    "system_ext:$WORK_DIR/system_ext"
-    "my_product:$WORK_DIR/my_product"
+    "odm:$WORK_DIR/odm:1"
+    "vendor:$WORK_DIR/vendor:1"
+    "my_region:$WORK_DIR/my_region:0"
+    "system:$WORK_DIR/system:1"
+    "system_ext:$WORK_DIR/system_ext:1"
+    "my_product:$WORK_DIR/my_product:1"
 )
 
 for part_def in "${PARTITIONS[@]}"; do
-    NAME="${part_def%%:*}"
-    SRC="${part_def##*:}"
-    OUT_IMG="$OUT_DIR/$NAME.erofs.img"
+    NAME=$(echo "$part_def" | cut -d: -f1)
+    SRC=$(echo "$part_def" | cut -d: -f2)
+    MANDATORY=$(echo "$part_def" | cut -d: -f3)
+    STAGE_IMG="$STAGING_DIR/$NAME.erofs.img"
 
     if [ ! -d "$SRC" ]; then
-        echo "Warning: Source directory $SRC not found, skipping $NAME."
-        continue
+        if [ "$MANDATORY" -eq 1 ]; then
+            echo "ERROR: Mandatory source directory $SRC missing!" >&2
+            exit 1
+        else
+            echo "Note: Optional source directory $SRC not found, skipping $NAME."
+            continue
+        fi
     fi
 
     echo " -> Packaging $NAME.erofs.img from $SRC..."
-    "$MKFS_EROFS" -z lz4 -x -1 "$OUT_IMG" "$SRC"
+    "$MKFS_EROFS" -z lz4 -x -1 "$STAGE_IMG" "$SRC"
 
     # Mandatory fsck verification: stop immediately on error
     echo "    Verifying integrity with fsck.erofs..."
-    if ! "$FSCK_EROFS" "$OUT_IMG"; then
-        echo "ERROR: fsck.erofs reported integrity failure for $OUT_IMG!" >&2
+    if ! "$FSCK_EROFS" "$STAGE_IMG"; then
+        echo "ERROR: fsck.erofs reported integrity failure for $STAGE_IMG!" >&2
         exit 1
     fi
 
-    # Verify generated image is valid EROFS
-    magic=$(od -j 1024 -N 4 -t x4 -An "$OUT_IMG" 2>/dev/null | tr -d ' ' || true)
+    # Verify generated image has valid EROFS magic bytes (0xe0f5e1e2 at offset 1024)
+    magic=$(od -j 1024 -N 4 -t x4 -An "$STAGE_IMG" 2>/dev/null | tr -d ' ' || true)
     if [ "$magic" != "e0f5e1e2" ]; then
-        echo "ERROR: $OUT_IMG does not have valid EROFS magic bytes ($magic)!" >&2
+        echo "ERROR: $STAGE_IMG does not have valid EROFS magic bytes ($magic)!" >&2
         exit 1
     fi
     echo "    Integrity verified: $NAME.erofs.img is valid EROFS."
 done
 
-# 6. Extract and Detect Runtime APEX Payload Filesystem Type
+# 7. Extract and Detect Runtime APEX Payload
 echo "[6/6] Packaging Bionic runtime APEX payload..."
-APEX_SRC="$WORK_DIR/system/system/apex/com.android.runtime.apex"
-if [ -f "$APEX_SRC" ]; then
-    UNZIP_TMP="$TMP_BUILD_DIR/runtime_apex_unpack"
-    mkdir -p "$UNZIP_TMP"
-    unzip -q "$APEX_SRC" "apex_payload.img" -d "$UNZIP_TMP"
+UNZIP_TMP="$TMP_BUILD_DIR/runtime_apex_unpack"
+mkdir -p "$UNZIP_TMP"
+if ! unzip -q "$APEX_SRC" "apex_payload.img" -d "$UNZIP_TMP"; then
+    echo "CRITICAL ERROR: Failed to unpack apex_payload.img from $APEX_SRC!" >&2
+    exit 1
+fi
 
-    PAYLOAD="$UNZIP_TMP/apex_payload.img"
-    if [ -f "$PAYLOAD" ]; then
-        # Detect filesystem type dynamically via magic numbers
-        PAYLOAD_FSTYPE="unknown"
-        magic_erofs=$(od -j 1024 -N 4 -t x4 -An "$PAYLOAD" 2>/dev/null | tr -d ' ' || true)
-        magic_ext4=$(od -j 1080 -N 2 -t x2 -An "$PAYLOAD" 2>/dev/null | tr -d ' ' || true)
+PAYLOAD="$UNZIP_TMP/apex_payload.img"
+if [ ! -f "$PAYLOAD" ] || [ ! -s "$PAYLOAD" ]; then
+    echo "CRITICAL ERROR: Extracted apex_payload.img is missing or 0 bytes!" >&2
+    exit 1
+fi
 
-        if [ "$magic_erofs" = "e0f5e1e2" ]; then
-            PAYLOAD_FSTYPE="erofs"
-        elif [ "$magic_ext4" = "ef53" ]; then
-            PAYLOAD_FSTYPE="ext4"
-        else
-            # Fallback to file command
-            f_out=$(file -b "$PAYLOAD" 2>/dev/null || true)
-            if echo "$f_out" | grep -qi "erofs"; then
-                PAYLOAD_FSTYPE="erofs"
-            elif echo "$f_out" | grep -qi "ext4"; then
-                PAYLOAD_FSTYPE="ext4"
-            fi
-        fi
+# Detect filesystem type dynamically via magic numbers
+PAYLOAD_FSTYPE="unknown"
+magic_erofs=$(od -j 1024 -N 4 -t x4 -An "$PAYLOAD" 2>/dev/null | tr -d ' ' || true)
+magic_ext4=$(od -j 1080 -N 2 -t x2 -An "$PAYLOAD" 2>/dev/null | tr -d ' ' || true)
 
-        echo "Detected runtime APEX payload filesystem: $PAYLOAD_FSTYPE"
-        if [ "$PAYLOAD_FSTYPE" = "unknown" ]; then
-            echo "ERROR: Unable to detect filesystem type of $PAYLOAD" >&2
-            exit 1
-        fi
+if [ "$magic_erofs" = "e0f5e1e2" ]; then
+    PAYLOAD_FSTYPE="erofs"
+elif [ "$magic_ext4" = "ef53" ]; then
+    PAYLOAD_FSTYPE="ext4"
+else
+    f_out=$(file -b "$PAYLOAD" 2>/dev/null || true)
+    if echo "$f_out" | grep -qi "erofs"; then
+        PAYLOAD_FSTYPE="erofs"
+    elif echo "$f_out" | grep -qi "ext4"; then
+        PAYLOAD_FSTYPE="ext4"
+    fi
+fi
 
-        cp "$PAYLOAD" "$OUT_DIR/runtime_apex.img"
-        echo "$PAYLOAD_FSTYPE" > "$OUT_DIR/runtime_apex.fstype"
-        echo "Runtime APEX payload staged as $OUT_DIR/runtime_apex.img (fstype: $PAYLOAD_FSTYPE)"
-    else
-        echo "ERROR: apex_payload.img not found inside $APEX_SRC" >&2
+echo "Detected runtime APEX payload filesystem: $PAYLOAD_FSTYPE"
+if [ "$PAYLOAD_FSTYPE" = "unknown" ]; then
+    echo "CRITICAL ERROR: Unable to detect filesystem type of $PAYLOAD" >&2
+    exit 1
+fi
+
+# If EROFS, verify with fsck.erofs
+if [ "$PAYLOAD_FSTYPE" = "erofs" ]; then
+    if ! "$FSCK_EROFS" "$PAYLOAD"; then
+        echo "CRITICAL ERROR: fsck.erofs failed on runtime APEX payload!" >&2
         exit 1
     fi
 fi
 
+cp "$PAYLOAD" "$STAGING_DIR/runtime_apex.img"
+echo "$PAYLOAD_FSTYPE" > "$STAGING_DIR/runtime_apex.fstype"
+echo "Runtime APEX payload verified and staged (fstype: $PAYLOAD_FSTYPE)."
+
+# 8. Atomically Publish Verified Images (Prevents Stale Image Reuse)
+echo "Atomically publishing newly verified images to $OUT_DIR..."
+# Remove old build artifacts so no stale images remain
+rm -f "$OUT_DIR"/*.erofs.img "$OUT_DIR"/runtime_apex.* "$OUT_DIR"/SHA256SUMS
+
+cp "$STAGING_DIR"/* "$OUT_DIR/"
+
+# Generate SHA256 checksums
+(cd "$OUT_DIR" && sha256sum *.img > SHA256SUMS)
+
+# Verify all mandatory output images exist
+MANDATORY_OUTPUTS=("system.erofs.img" "system_ext.erofs.img" "vendor.erofs.img" "odm.erofs.img" "my_product.erofs.img" "runtime_apex.img")
+for out in "${MANDATORY_OUTPUTS[@]}"; do
+    if [ ! -f "$OUT_DIR/$out" ] || [ ! -s "$OUT_DIR/$out" ]; then
+        echo "CRITICAL BUILD ERROR: Expected output image $OUT_DIR/$out was not generated!" >&2
+        exit 1
+    fi
+done
+
 echo "=========================================================="
-echo "Stage-2 images successfully generated and verified in:"
+echo "Stage-2 images successfully generated, verified, and published in:"
 echo "$OUT_DIR"
-ls -lh "$OUT_DIR"/*.img
+cat "$OUT_DIR/SHA256SUMS"

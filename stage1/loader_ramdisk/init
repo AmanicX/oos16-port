@@ -1,58 +1,108 @@
 #!/system/bin/sh
-# Stage-1 RAM Boot Loader - PID 1 Supervisor
+# ==============================================================================
+# stage1/loader_ramdisk/init - Stage-1 RAM Boot Supervisor (PID 1)
 # Strictly volatile RAM resident. Zero writes to physical flash.
+# Discovers physical storage, enforces block-level read-only locks,
+# manages watchdog heartbeat, stages images in RAM, and hands over PID 1 to Android init.
+# ==============================================================================
 
 set +e
 
 export PATH=/system/bin:/bin
 
-# Mount core kernel pseudo-filesystems
+# Helper to log messages to kernel log buffer
+log_kmsg() {
+    echo "$1" > /dev/kmsg 2>/dev/null || true
+    echo "$1"
+}
+
+fatal_halt() {
+    log_kmsg "[LOADER-PID1 FATAL] $1"
+    log_kmsg "[LOADER-PID1 FATAL] System halted in safe RAM state to protect hardware."
+    while true; do
+        /system/bin/toybox sleep 60
+    done
+}
+
+# 1. Mount Core Kernel Pseudo-Filesystems
 /system/bin/toybox mount -t proc proc /proc
 /system/bin/toybox mount -t sysfs sysfs /sys
 /system/bin/toybox mount -t tmpfs -o mode=0755,nosuid tmpfs /dev
 /system/bin/toybox mkdir -p /dev/pts /dev/block /dev/socket /dev/usb-ffs /dev/usb-ffs/adb
 /system/bin/toybox mount -t devpts devpts /dev/pts
 
-# Create essential static character device nodes if not present
+# 2. Create Essential Device Nodes
 [ ! -c /dev/null ] && /system/bin/toybox mknod /dev/null c 1 3
 [ ! -c /dev/zero ] && /system/bin/toybox mknod /dev/zero c 1 5
 [ ! -c /dev/kmsg ] && /system/bin/toybox mknod /dev/kmsg c 1 11
-[ ! -c /dev/console ] && /system/bin/toybox mknod /dev/console c 5 1
+[ ! -c /dev/urandom ] && /system/bin/toybox mknod /dev/urandom c 1 9
 [ ! -c /dev/ptmx ] && /system/bin/toybox mknod /dev/ptmx c 5 2
 [ ! -c /dev/loop-control ] && /system/bin/toybox mknod /dev/loop-control c 10 237
 
-# Create loop block nodes in both /dev and /dev/block
 for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     [ ! -b /dev/block/loop$i ] && /system/bin/toybox mknod /dev/block/loop$i b 7 $i
     [ ! -b /dev/loop$i ] && /system/bin/toybox mknod /dev/loop$i b 7 $i
 done
 
-# Hardware safety: lock physical UFS block devices strictly read-only
-# UFS LUNs sda through sdf
-/system/bin/toybox mknod /dev/block/sda b 8 0 2>/dev/null || true
-/system/bin/toybox mknod /dev/block/sdb b 8 16 2>/dev/null || true
-/system/bin/toybox mknod /dev/block/sdc b 8 32 2>/dev/null || true
-/system/bin/toybox mknod /dev/block/sdd b 8 48 2>/dev/null || true
-/system/bin/toybox mknod /dev/block/sde b 8 64 2>/dev/null || true
-/system/bin/toybox mknod /dev/block/sdf b 8 80 2>/dev/null || true
+log_kmsg "=========================================================="
+log_kmsg "  STAGE-1 RAM LOADER SUPERVISOR (PID 1) STARTING         "
+log_kmsg "=========================================================="
 
-for lun in /dev/block/sda /dev/block/sdb /dev/block/sdc /dev/block/sdd /dev/block/sde /dev/block/sdf; do
-    if [ -b "$lun" ]; then
-        /system/bin/toybox blockdev --setro "$lun"
-        ro=$(/system/bin/toybox blockdev --getro "$lun")
-        echo "[LOADER-PID1] Hardware lock: $lun set read-only (ro=$ro)" > /dev/kmsg
+# 3. Dynamic Physical Storage Discovery & Mandatory Read-Only Verification
+log_kmsg "[LOADER-PID1] Discovering physical storage block devices..."
+PHYSICAL_DEV_COUNT=0
+LOCKED_DEV_COUNT=0
+
+for bdir in /sys/block/*; do
+    [ -d "$bdir" ] || continue
+    bname=$(basename "$bdir")
+
+    # Skip virtual loop devices, zram, and RAM disks
+    case "$bname" in
+        loop*|ram*|zram*|dm-*) continue ;;
+    esac
+
+    # Physical devices have a sysfs hardware device backing node
+    if [ -e "$bdir/device" ] || case "$bname" in sd*|mmcblk*) true ;; *) false ;; esac; then
+        dev_node="/dev/block/$bname"
+        if [ ! -b "$dev_node" ]; then
+            # Read major:minor from sysfs dev file
+            if [ -f "$bdir/dev" ]; then
+                maj_min=$(cat "$bdir/dev")
+                maj="${maj_min%%:*}"
+                min="${maj_min##*:}"
+                /system/bin/toybox mknod "$dev_node" b "$maj" "$min" 2>/dev/null || true
+            fi
+        fi
+
+        if [ -b "$dev_node" ]; then
+            PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
+            # Apply hardware read-only lock
+            /system/bin/toybox blockdev --setro "$dev_node" 2>/dev/null || true
+            ro_status=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
+            if [ "$ro_status" = "1" ]; then
+                LOCKED_DEV_COUNT=$((LOCKED_DEV_COUNT + 1))
+                log_kmsg "[LOADER-PID1] Locked physical device read-only: $dev_node (ro=1)"
+            else
+                fatal_halt "CRITICAL SAFETY FAILURE: Failed to lock $dev_node read-only (ro=$ro_status)!"
+            fi
+        fi
     fi
 done
 
-# Initialize RAM staging mounts
-/system/bin/toybox mkdir -p /tmp /mnt
+if [ "$PHYSICAL_DEV_COUNT" -eq 0 ]; then
+    fatal_halt "CRITICAL SAFETY FAILURE: No physical storage block devices discovered!"
+fi
+
+log_kmsg "[LOADER-PID1] Storage verified: $LOCKED_DEV_COUNT/$PHYSICAL_DEV_COUNT physical devices locked strictly read-only."
+
+# 4. Mount RAM Volatile Staging Filesystems
 /system/bin/toybox mount -t tmpfs -o mode=0777,size=6500M tmpfs /mnt
-/system/bin/toybox mount -t tmpfs -o mode=0777 tmpfs /tmp
+/system/bin/toybox mount -t tmpfs -o mode=0777,size=512M tmpfs /tmp
+log_kmsg "[LOADER-PID1] RAM staging tmpfs mounted (6500MB available at /mnt)"
 
-echo "[LOADER-PID1] RAM staging tmpfs mounted (6500MB available at /mnt)" > /dev/kmsg
-
-# Setup USB gadget for ADB
-echo "[LOADER-PID1] Configuring USB gadget for ADB..." > /dev/kmsg
+# 5. Configure USB Gadget for Root ADB
+log_kmsg "[LOADER-PID1] Configuring USB gadget for ADB..."
 /system/bin/toybox mount -t configfs none /config || true
 /system/bin/toybox mkdir -p /config/usb_gadget/g1
 echo "0x18d1" > /config/usb_gadget/g1/idVendor
@@ -70,91 +120,255 @@ echo "adb" > /config/usb_gadget/g1/configs/b.1/strings/0x409/configuration
 
 /system/bin/toybox mount -t functionfs adb /dev/usb-ffs/adb -o uid=2000,gid=2000 || /system/bin/toybox mount -t functionfs adb /dev/usb-ffs/adb
 
-# Launch adbd in background
 /system/bin/adbd --root_seclabel=u:r:su:s0 --device_banner=recovery &
 ADBD_PID=$!
-echo "[LOADER-PID1] adbd launched (PID: $ADBD_PID)" > /dev/kmsg
+log_kmsg "[LOADER-PID1] adbd launched (PID: $ADBD_PID)"
 
-# Bind USB gadget controller to UDC with retry loop
+# Bind USB Gadget Controller
 UDC_BOUND=0
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
     /system/bin/toybox sleep 1
     echo "a600000.dwc3" > /config/usb_gadget/g1/UDC 2>/dev/null && {
         UDC_BOUND=1
-        echo "[LOADER-PID1] USB gadget bound to UDC a600000.dwc3 (attempt $attempt)" > /dev/kmsg
+        log_kmsg "[LOADER-PID1] USB gadget bound to UDC a600000.dwc3"
         break
     }
 done
 
-if [ "$UDC_BOUND" -eq 0 ]; then
-    echo "[LOADER-PID1 WARN] Failed to bind UDC on initial attempts, retrying continuously in background..." > /dev/kmsg
-fi
+# 6. Active Watchdog Supervisor & Heartbeat Monitor
+# Monitors /mnt/watchdog_heartbeat. If heartbeat stops for 60s, triggers fallback reboot.
+(
+    TIMEOUT=60
+    REMAINING=$TIMEOUT
+    while true; do
+        if [ -f /mnt/watchdog_heartbeat ] || [ -f /tmp/watchdog_heartbeat ]; then
+            /system/bin/toybox rm -f /mnt/watchdog_heartbeat /tmp/watchdog_heartbeat 2>/dev/null || true
+            REMAINING=$TIMEOUT
+        elif [ -f /mnt/watchdog_cancel ] || [ -f /tmp/watchdog_cancel ]; then
+            REMAINING=86400
+        fi
 
-# Wait for trigger file created after images are staged in RAM
-echo "[LOADER-PID1] Waiting for image staging and trigger (/tmp/boot_now)..." > /dev/kmsg
-while [ ! -f /tmp/boot_now ] && [ ! -f /mnt/boot_now ]; do
-    # If UDC not bound yet, keep attempting
+        REMAINING=$((REMAINING - 1))
+        if [ "$REMAINING" -le 0 ]; then
+            log_kmsg "[WATCHDOG FATAL] Safety heartbeat lost for ${TIMEOUT}s! Host connection lost."
+            log_kmsg "[WATCHDOG FATAL] Initiating safe emergency reboot to bootloader..."
+            /system/bin/reboot bootloader
+            exit 1
+        fi
+        /system/bin/toybox sleep 1
+    done
+) &
+WATCHDOG_PID=$!
+log_kmsg "[LOADER-PID1] Safety watchdog supervisor active (PID: $WATCHDOG_PID, 60s timeout)"
+
+# 7. Await Boot Trigger (/mnt/boot_now)
+log_kmsg "[LOADER-PID1] Staging area ready. Waiting for runner image transfer and /mnt/boot_now trigger..."
+while [ ! -f /mnt/boot_now ] && [ ! -f /tmp/boot_now ]; do
     if [ "$UDC_BOUND" -eq 0 ]; then
         echo "a600000.dwc3" > /config/usb_gadget/g1/UDC 2>/dev/null && {
             UDC_BOUND=1
-            echo "[LOADER-PID1] USB gadget bound to UDC a600000.dwc3" > /dev/kmsg
+            log_kmsg "[LOADER-PID1] USB gadget bound to UDC a600000.dwc3"
         }
     fi
     /system/bin/toybox sleep 1
 done
 
-echo "[LOADER-PID1] Trigger received! Preparing second-stage handover..." > /dev/kmsg
+log_kmsg "[LOADER-PID1] Trigger received (/mnt/boot_now)! Validating staged images..."
+/system/bin/toybox rm -f /mnt/boot_now /tmp/boot_now 2>/dev/null || true
 
-# Stop adbd and detach USB gadget so Android second stage init can reconfigure USB cleanly
-kill $ADBD_PID 2>/dev/null || true
-echo "" > /config/usb_gadget/g1/UDC 2>/dev/null || true
-/system/bin/toybox umount /dev/usb-ffs/adb 2>/dev/null || true
-
-# Verify required images exist in /mnt
-echo "[LOADER-PID1] Verifying OxygenOS 16 images in RAM..." > /dev/kmsg
-for img in system.img system_ext.img product.img vendor.img odm.img; do
-    if [ ! -f "/mnt/$img" ]; then
-        echo "[LOADER-PID1 FATAL] Missing /mnt/$img! Halting." > /dev/kmsg
-        while true; do /system/bin/toybox sleep 60; done
+# 8. Mandatory Image Verification in RAM (/mnt/)
+MANDATORY_IMAGES="system.img system_ext.img vendor.img odm.img"
+for img in $MANDATORY_IMAGES; do
+    if [ ! -f "/mnt/$img" ] || [ ! -s "/mnt/$img" ]; then
+        fatal_halt "Mandatory image /mnt/$img is missing or 0 bytes!"
     fi
-    echo "[LOADER-PID1] Verified /mnt/$img" > /dev/kmsg
+    log_kmsg "[LOADER-PID1] Verified /mnt/$img ($(ls -lh "/mnt/$img" | awk '{print $5}'))"
 done
 
-# Create sysroot mount structure
-/system/bin/toybox mkdir -p /mnt/sysroot
-
-# Mount EROFS partition images
-echo "[LOADER-PID1] Mounting EROFS partition images from RAM..." > /dev/kmsg
-/system/bin/toybox mount -t erofs -o ro /mnt/system.img /mnt/sysroot
-/system/bin/toybox mount -t erofs -o ro /mnt/system_ext.img /mnt/sysroot/system_ext
-/system/bin/toybox mount -t erofs -o ro /mnt/product.img /mnt/sysroot/product
-/system/bin/toybox mount -t erofs -o ro /mnt/product.img /mnt/sysroot/my_product
-/system/bin/toybox mount -t erofs -o ro /mnt/vendor.img /mnt/sysroot/vendor
-/system/bin/toybox mount -t erofs -o ro /mnt/odm.img /mnt/sysroot/odm
-
-if [ -f "/mnt/my_region.img" ]; then
-    /system/bin/toybox mount -t erofs -o ro /mnt/my_region.img /mnt/sysroot/my_region
+# Product / my_product resolution
+if [ -f "/mnt/my_product.img" ] && [ ! -f "/mnt/product.img" ]; then
+    /system/bin/toybox ln -sf /mnt/my_product.img /mnt/product.img
+elif [ -f "/mnt/product.img" ] && [ ! -f "/mnt/my_product.img" ]; then
+    /system/bin/toybox ln -sf /mnt/product.img /mnt/my_product.img
 fi
 
-# Ephemeral RAM /data (1024 MB tmpfs)
-echo "[LOADER-PID1] Initializing ephemeral RAM /data (1024 MB)..." > /dev/kmsg
-/system/bin/toybox mount -t tmpfs -o rw,nosuid,nodev,noatime,mode=0771,size=1024M tmpfs /mnt/sysroot/data
-/system/bin/toybox mkdir -p /mnt/sysroot/data/system /mnt/sysroot/data/misc /mnt/sysroot/data/user /mnt/sysroot/data/user_de /mnt/sysroot/data/local /mnt/sysroot/data/local/tmp /mnt/sysroot/data/media
+if [ ! -f "/mnt/product.img" ] || [ ! -s "/mnt/product.img" ]; then
+    fatal_halt "Missing /mnt/product.img (or /mnt/my_product.img)!"
+fi
+log_kmsg "[LOADER-PID1] Verified product partition image."
+
+# 9. Pre-Create All Mountpoints & Mount Root Filesystem (with OverlayFS Support)
+log_kmsg "[LOADER-PID1] Preparing sysroot directory structure..."
+/system/bin/toybox umount -R /mnt/sysroot 2>/dev/null || true
+/system/bin/toybox mkdir -p /mnt/sysroot /mnt/system_ro /mnt/overlay_upper /mnt/overlay_work
+
+# Mount base system image to /mnt/system_ro
+log_kmsg "[LOADER-PID1] Mounting root filesystem (/mnt/system.img -> /mnt/system_ro)..."
+/system/bin/toybox mount -t erofs -o ro,loop /mnt/system.img /mnt/system_ro || fatal_halt "Failed to mount /mnt/system.img on /mnt/system_ro!"
+
+# Mount OverlayFS on /mnt/sysroot so child mountpoints and runtime directories can be created cleanly
+OVERLAY_MOUNTED=0
+if /system/bin/toybox mount -t overlay overlay -o lowerdir=/mnt/system_ro,upperdir=/mnt/overlay_upper,workdir=/mnt/overlay_work /mnt/sysroot 2>/dev/null; then
+    OVERLAY_MOUNTED=1
+    log_kmsg "[LOADER-PID1] Mounted writable OverlayFS root at /mnt/sysroot"
+else
+    log_kmsg "[LOADER-PID1 WARN] OverlayFS mount unavailable; falling back to direct root mount"
+    /system/bin/toybox umount /mnt/system_ro 2>/dev/null || true
+    /system/bin/toybox mount -t erofs -o ro,loop /mnt/system.img /mnt/sysroot || fatal_halt "Failed to mount /mnt/system.img on /mnt/sysroot!"
+fi
+
+# Pre-create all required child mountpoints
+REQUIRED_MOUNTPOINTS="system_ext vendor odm product my_product my_region apex data dev proc sys linkerconfig mnt"
+for mp in $REQUIRED_MOUNTPOINTS; do
+    if [ "$OVERLAY_MOUNTED" -eq 1 ]; then
+        /system/bin/toybox mkdir -p "/mnt/sysroot/$mp" 2>/dev/null || true
+    fi
+    if [ ! -d "/mnt/sysroot/$mp" ]; then
+        fatal_halt "Required mountpoint directory /mnt/sysroot/$mp does not exist on rootfs!"
+    fi
+done
+
+# 10. Mount Partition Images with Validation
+mount_partition() {
+    local name="$1"
+    local src="$2"
+    local target="/mnt/sysroot/$name"
+    local is_mandatory="${3:-1}"
+
+    if [ ! -f "$src" ] || [ ! -s "$src" ]; then
+        if [ "$is_mandatory" -eq 1 ]; then
+            fatal_halt "Mandatory partition image $src does not exist or is 0 bytes!"
+        else
+            log_kmsg "[LOADER-PID1] Optional image $src not present, skipping."
+            return 0
+        fi
+    fi
+
+    if [ ! -d "$target" ]; then
+        if [ "$is_mandatory" -eq 1 ]; then
+            fatal_halt "Mountpoint target $target does not exist as a directory!"
+        else
+            log_kmsg "[LOADER-PID1] Optional mountpoint $target missing, skipping."
+            return 0
+        fi
+    fi
+
+    /system/bin/toybox mount -t erofs -o ro,loop "$src" "$target" || {
+        if [ "$is_mandatory" -eq 1 ]; then
+            fatal_halt "Failed to mount mandatory partition $src at $target!"
+        else
+            log_kmsg "[LOADER-PID1 WARN] Failed to mount optional partition $src at $target"
+            return 0
+        fi
+    }
+
+    # Verify the actual mounted source and filesystem type in /proc/mounts
+    if ! /system/bin/toybox grep -q " $target erofs " /proc/mounts 2>/dev/null; then
+        if [ "$is_mandatory" -eq 1 ]; then
+            fatal_halt "Mount verification failed for $target (not present as erofs in /proc/mounts)!"
+        fi
+    fi
+
+    log_kmsg "[LOADER-PID1] Mounted and verified $name at $target successfully."
+}
+
+mount_partition "system_ext" "/mnt/system_ext.img" 1
+mount_partition "vendor" "/mnt/vendor.img" 1
+mount_partition "odm" "/mnt/odm.img" 1
+mount_partition "product" "/mnt/product.img" 1
+if [ -d "/mnt/sysroot/my_product" ]; then
+    mount_partition "my_product" "/mnt/product.img" 0
+fi
+if [ -f "/mnt/my_region.img" ] && [ -d "/mnt/sysroot/my_region" ]; then
+    mount_partition "my_region" "/mnt/my_region.img" 0
+fi
+
+# 11. Staging Runtime APEX on Writable tmpfs
+log_kmsg "[LOADER-PID1] Preparing Bionic runtime APEX on tmpfs..."
+/system/bin/toybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/apex || fatal_halt "Failed to mount tmpfs on /mnt/sysroot/apex!"
+/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime
+/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime/bin
+/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime/lib64/bionic
+/system/bin/toybox mkdir -p /mnt/sysroot/apex/com.android.runtime/lib/bionic
+
+if [ -f "/mnt/runtime_apex.img" ]; then
+    APEX_FS="erofs"
+    [ -f "/mnt/runtime_apex.fstype" ] && APEX_FS=$(cat /mnt/runtime_apex.fstype | tr -d '[:space:]')
+    /system/bin/toybox mkdir -p /tmp/apex_payload_staging
+    if /system/bin/toybox mount -t "$APEX_FS" -o ro,loop /mnt/runtime_apex.img /tmp/apex_payload_staging 2>/dev/null; then
+        /system/bin/toybox cp -a /tmp/apex_payload_staging/* /mnt/sysroot/apex/com.android.runtime/ 2>/dev/null || true
+        /system/bin/toybox umount /tmp/apex_payload_staging 2>/dev/null || true
+    fi
+fi
+
+# Ensure 64-bit dynamic linker exists at /apex/com.android.runtime/bin/linker64
+if [ ! -f /mnt/sysroot/apex/com.android.runtime/bin/linker64 ]; then
+    /system/bin/toybox ln -sf /system/bin/bootstrap/linker64 /mnt/sysroot/apex/com.android.runtime/bin/linker64
+fi
+if [ ! -f /mnt/sysroot/apex/com.android.runtime/bin/linker ]; then
+    /system/bin/toybox ln -sf /system/bin/bootstrap/linker /mnt/sysroot/apex/com.android.runtime/bin/linker
+fi
+
+for lib in libc.so libm.so libdl.so; do
+    if [ ! -f "/mnt/sysroot/apex/com.android.runtime/lib64/bionic/$lib" ]; then
+        /system/bin/toybox ln -sf "/system/lib64/bootstrap/$lib" "/mnt/sysroot/apex/com.android.runtime/lib64/bionic/$lib"
+    fi
+    if [ ! -f "/mnt/sysroot/apex/com.android.runtime/lib/bionic/$lib" ]; then
+        /system/bin/toybox ln -sf "/system/lib/bootstrap/$lib" "/mnt/sysroot/apex/com.android.runtime/lib/bionic/$lib"
+    fi
+done
+
+[ -f /mnt/sysroot/apex/com.android.runtime/bin/linker64 ] || fatal_halt "Bionic linker64 is MISSING from runtime APEX!"
+log_kmsg "[LOADER-PID1] Runtime APEX and Bionic linker64 verified."
+
+# 12. Linker Configuration & Directories
+/system/bin/toybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/linkerconfig || fatal_halt "Failed to mount tmpfs on linkerconfig!"
+/system/bin/toybox mkdir -p /mnt/sysroot/linkerconfig/bootstrap /mnt/sysroot/linkerconfig/default
+echo "#" > /mnt/sysroot/linkerconfig/bootstrap/ld.config.txt
+echo "#" > /mnt/sysroot/linkerconfig/default/ld.config.txt
+echo "#" > /mnt/sysroot/linkerconfig/ld.config.txt
+/system/bin/toybox chmod 644 /mnt/sysroot/linkerconfig/bootstrap/ld.config.txt
+/system/bin/toybox chmod 644 /mnt/sysroot/linkerconfig/default/ld.config.txt
+/system/bin/toybox chmod 644 /mnt/sysroot/linkerconfig/ld.config.txt
+
+/system/bin/toybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/mnt
+/system/bin/toybox mkdir -p /mnt/sysroot/mnt/vendor/persist
+
+# 13. Ephemeral RAM /data (1024 MB tmpfs)
+log_kmsg "[LOADER-PID1] Initializing ephemeral RAM /data (1024 MB)..."
+/system/bin/toybox mount -t tmpfs -o rw,nosuid,nodev,noatime,mode=0771,size=1024M tmpfs /mnt/sysroot/data || fatal_halt "Failed to mount /data tmpfs!"
+/system/bin/toybox mkdir -p /mnt/sysroot/data/system /mnt/sysroot/data/misc /mnt/sysroot/data/user /mnt/sysroot/data/user_de /mnt/sysroot/data/local /mnt/sysroot/data/local/tmp /mnt/sysroot/data/media /mnt/sysroot/data/persist_log
 /system/bin/toybox chmod 0775 /mnt/sysroot/data/local/tmp
 /system/bin/toybox chmod 0700 /mnt/sysroot/data/system
 /system/bin/toybox chmod 01771 /mnt/sysroot/data/misc
 
-# Setup core kernel pseudo-filesystems inside sysroot
-/system/bin/toybox mount -o bind /dev /mnt/sysroot/dev
+# 14. Bind Kernel Interfaces
+/system/bin/toybox mount --bind /dev /mnt/sysroot/dev
 /system/bin/toybox mount -t devpts devpts /mnt/sysroot/dev/pts || true
 /system/bin/toybox mount -t proc proc /mnt/sysroot/proc
-/system/bin/toybox mount -t sysfs sysfs /mnt/sysroot/sys
+/system/bin/toybox mount --bind /sys /mnt/sysroot/sys
 /system/bin/toybox mkdir -p /mnt/sysroot/sys/fs/selinux
 /system/bin/toybox mount -t selinuxfs selinuxfs /mnt/sysroot/sys/fs/selinux || true
 
-echo "[LOADER-PID1] ALL RAM FILESYSTEMS READY. EXECUTING SECOND STAGE INIT AS PID 1..." > /dev/kmsg
+# Isolate property workspace and socket dirs
+/system/bin/toybox mkdir -p /mnt/sysroot/dev/__properties__ /mnt/sysroot/dev/socket
+/system/bin/toybox mount -t tmpfs tmpfs /mnt/sysroot/dev/__properties__
+/system/bin/toybox mount -t tmpfs tmpfs /mnt/sysroot/dev/socket
 
-# Hand over PID 1 directly to Android 16 init
+# Graphics compatibility node
+/system/bin/toybox mkdir -p /mnt/sysroot/dev/graphics
+/system/bin/toybox ln -s /dev/dri/card0 /mnt/sysroot/dev/graphics/fb0 2>/dev/null || true
+
+# Note: The recursive bind mount /mnt/sysroot/mnt/sysroot has been completely removed.
+
+log_kmsg "[LOADER-PID1] ALL RAM FILESYSTEMS READY. EXECUTING SECOND STAGE INIT AS PID 1..."
+
+# Stop loader adbd so Android 16 init second stage can configure USB cleanly
+kill $ADBD_PID 2>/dev/null || true
+echo "" > /config/usb_gadget/g1/UDC 2>/dev/null || true
+/system/bin/toybox umount /dev/usb-ffs/adb 2>/dev/null || true
+
+# 15. Hand over PID 1 directly to Android 16 init
 export PATH=/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin
 export ANDROID_ROOT=/system
 export ANDROID_DATA=/data

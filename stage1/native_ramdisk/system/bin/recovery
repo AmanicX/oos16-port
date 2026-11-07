@@ -1,16 +1,30 @@
 #!/system/bin/sh
-# Stage-1 Safe Harness (PID root service)
+# ==============================================================================
+# Stage-1 Safe Harness (Native Ramdisk PID root service)
+# Enforces dynamic physical device write locks and active watchdog monitor.
+# ==============================================================================
+
 echo "==========================================================" > /dev/kmsg
 echo "  STAGE-1 SAFE RAM HARNESS STARTING ON ONEPLUS 7T         " > /dev/kmsg
 echo "==========================================================" > /dev/kmsg
 
-# 1. Enforce read-only lock on all physical storage devices
-for dev in /dev/block/sd* /dev/block/mmcblk*; do
-    if [ -b "$dev" ]; then
-        /system/bin/toybox blockdev --setro "$dev" 2>/dev/null || true
+# 1. Enforce read-only lock on all physical storage devices dynamically
+for bdir in /sys/block/*; do
+    [ -d "$bdir" ] || continue
+    bname=$(basename "$bdir")
+    case "$bname" in
+        loop*|ram*|zram*|dm-*) continue ;;
+    esac
+
+    if [ -e "$bdir/device" ] || case "$bname" in sd*|mmcblk*) true ;; *) false ;; esac; then
+        dev_node="/dev/block/$bname"
+        if [ -b "$dev_node" ]; then
+            /system/bin/toybox blockdev --setro "$dev_node" 2>/dev/null || true
+            ro_val=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
+            echo "[STAGE1] Physical device $dev_node locked read-only (ro=$ro_val)" > /dev/kmsg
+        fi
     fi
 done
-echo "[STAGE1] Physical flash disks locked read-only (blockdev --setro)." > /dev/kmsg
 
 # 2. Continuous Safety Guard Loop & Heartbeat Watchdog in background
 (
@@ -22,18 +36,18 @@ echo "[STAGE1] Physical flash disks locked read-only (blockdev --setro)." > /dev
             if [ -b "$dev" ]; then
                 ro_status=$(/system/bin/toybox blockdev --getro "$dev" 2>/dev/null)
                 if [ "$ro_status" != "1" ]; then
-                    echo "[GUARD FATAL] Security violation: $dev became writable (ro=$ro_status)! Re-locking and emergency rebooting to bootloader!" > /dev/kmsg
+                    echo "[GUARD FATAL] Security violation: $dev became writable (ro=$ro_status)! Emergency rebooting to bootloader!" > /dev/kmsg
                     /system/bin/toybox blockdev --setro "$dev" 2>/dev/null || true
                     /system/bin/reboot bootloader
                 fi
             fi
         done
 
-        # B. Heartbeat check: extend watchdog if laptop sends heartbeat signal or cancelled
-        if [ -f /tmp/watchdog_cancel ]; then
+        # B. Heartbeat check: extend watchdog if host sends heartbeat signal or cancelled
+        if [ -f /mnt/watchdog_cancel ] || [ -f /tmp/watchdog_cancel ]; then
             TIMER=86400
-        elif [ -f /tmp/watchdog_heartbeat ]; then
-            /system/bin/toybox rm -f /tmp/watchdog_heartbeat
+        elif [ -f /mnt/watchdog_heartbeat ] || [ -f /tmp/watchdog_heartbeat ]; then
+            /system/bin/toybox rm -f /mnt/watchdog_heartbeat /tmp/watchdog_heartbeat 2>/dev/null || true
             TIMER=300
         fi
 
@@ -52,16 +66,7 @@ if [ -f /sys/class/backlight/panel0-backlight/brightness ]; then
     echo 200 > /sys/class/backlight/panel0-backlight/brightness
 fi
 
-# 4. Draw test pattern to framebuffer if present
-for fb in /dev/graphics/fb0 /dev/fb0; do
-    if [ -c "$fb" ] || [ -b "$fb" ]; then
-        echo "[STAGE1] Framebuffer detected at $fb, drawing test pattern..." > /dev/kmsg
-        head -c 4194304 /dev/urandom > "$fb" 2>/dev/null || true
-        break
-    fi
-done
-
-# 5. Trigger USB ADB mode
+# 4. Trigger USB ADB mode
 echo "[STAGE1] Setting sys.usb.config=adb..." > /dev/kmsg
 /system/bin/toolbox setprop sys.usb.config adb
 
@@ -69,7 +74,7 @@ echo "==========================================================" > /dev/kmsg
 echo "  STAGE-1 SAFE RAM HARNESS RUNNING & READY                " > /dev/kmsg
 echo "  - Physical flash read-only verified                     " > /dev/kmsg
 echo "  - ADB daemon ready                                      " > /dev/kmsg
-echo "  - 90s watchdog active (cancel: touch /tmp/watchdog_cancel)" > /dev/kmsg
+echo "  - Watchdog active (heartbeat: /mnt/watchdog_heartbeat)   " > /dev/kmsg
 echo "==========================================================" > /dev/kmsg
 
 # Keep service alive

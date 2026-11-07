@@ -4,20 +4,24 @@ Unit tests for tools/safe/fastboot safety wrapper.
 Verifies that:
 - Destructive commands (flash, erase, format, set_active, wipe) are blocked.
 - Arbitrary parameters are rejected.
-- Invalid boot targets (directories, non-existent files) are rejected.
+- Invalid boot targets (directories, non-existent files, non-boot images) are rejected.
 - Legitimate diagnostic commands pass validation.
+- Strict getvar allowlist (permitted static and slotted vars vs rejected unapproved vars).
 """
 
 import subprocess
 import os
 import sys
+import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 SAFE_FASTBOOT = os.path.join(PROJECT_ROOT, "tools/safe/fastboot")
 
 def run_fastboot(args):
-    p = subprocess.run([sys.executable, SAFE_FASTBOOT] + args, capture_output=True, text=True)
+    env = os.environ.copy()
+    env["REAL_FASTBOOT_BIN"] = "/usr/bin/true"
+    p = subprocess.run([sys.executable, SAFE_FASTBOOT] + args, capture_output=True, text=True, env=env)
     return p.returncode, p.stdout, p.stderr
 
 def test_blocked_destructive_commands():
@@ -47,24 +51,55 @@ def test_boot_validation():
     assert "does not exist" in err
 
     # Directory as boot target must fail
-    code, out, err = run_fastboot(["boot", "scripts"])
+    code, out, err = run_fastboot(["boot", PROJECT_ROOT])
     assert code == 1, f"Expected directory boot target to fail, got {code}"
     assert "not a regular file" in err
 
-    # Multiple arguments to boot must fail
-    code, out, err = run_fastboot(["boot", "file1.img", "file2.img"])
-    assert code == 1, f"Expected multiple boot arguments to fail, got {code}"
-    print("[PASS] Boot command validation test passed.")
+    # Empty file must fail
+    with tempfile.NamedTemporaryFile() as tmp:
+        code, out, err = run_fastboot(["boot", tmp.name])
+        assert code == 1, f"Expected empty file to fail, got {code}"
+        assert "0 bytes" in err
+
+    # Non-boot image (invalid magic) must fail
+    with tempfile.NamedTemporaryFile() as tmp:
+        tmp.write(b"NOT_ANDROID_MAGIC_HEADER")
+        tmp.flush()
+        code, out, err = run_fastboot(["boot", tmp.name])
+        assert code == 1, f"Expected invalid magic to fail, got {code}"
+        assert "missing valid Android boot header" in err
+
+    print("[PASS] Boot command validation tests passed.")
 
 def test_getvar_validation():
-    # Empty getvar must fail
-    code, out, err = run_fastboot(["getvar"])
-    assert code == 1, f"Expected empty getvar to fail, got {code}"
+    # Permitted static getvars
+    allowed_static = ["product", "unlocked", "current-slot", "all", "version"]
+    for var in allowed_static:
+        code, out, err = run_fastboot(["getvar", var])
+        assert code == 0, f"Expected getvar {var} to pass validation, got {code}: {err}"
+        assert "SAFETY VIOLATION" not in err
 
-    # Invalid variable containing shell metacharacters must fail
-    code, out, err = run_fastboot(["getvar", "product;rm -rf /"])
-    assert code == 1, f"Expected malicious getvar to fail, got {code}"
-    print("[PASS] Getvar validation test passed.")
+    # Permitted slotted getvars
+    allowed_slotted = ["has-slot:boot", "has-slot:system", "slot-successful:a", "slot-unbootable:_b"]
+    for var in allowed_slotted:
+        code, out, err = run_fastboot(["getvar", var])
+        assert code == 0, f"Expected slotted getvar {var} to pass validation, got {code}: {err}"
+        assert "SAFETY VIOLATION" not in err
+
+    # Rejected unapproved getvars
+    rejected = [
+        "some_random_var",
+        "has-slot:malicious_partition",
+        "slot-successful:invalid_slot",
+        "product;rm -rf /",
+        "partition-size:userdata"
+    ]
+    for var in rejected:
+        code, out, err = run_fastboot(["getvar", var])
+        assert code == 1, f"Expected unapproved getvar '{var}' to be blocked, got {code}"
+        assert "SAFETY VIOLATION" in err
+
+    print("[PASS] Getvar validation tests passed.")
 
 if __name__ == "__main__":
     test_blocked_destructive_commands()

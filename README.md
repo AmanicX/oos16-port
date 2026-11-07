@@ -68,6 +68,10 @@ oos16-port/
 │   ├── adb                        # Python safety wrapper logging and blocking flash writes
 │   ├── run_stage2.sh              # Host-side orchestrator pushing and executing Stage 2
 │   └── audit-no-writes.sh         # Static auditor verifying 0 write commands in images
+├── tests/                         # Unit and integration test suite
+│   ├── test_safe_adb.py           # ADB safety proxy unit tests
+│   ├── test_safe_fastboot.py      # Fastboot safety proxy unit tests
+│   └── test_integration_stage2.py # End-to-end integration tests (Mock ADB, auditor, build validation)
 ├── stage1/                        # Stage-1 native RAM harness sources
 │   ├── native_ramdisk/            # Root filesystem files, init scripts, and SELinux policies
 │   └── loader_ramdisk/            # Secondary loader ramdisk definition
@@ -90,22 +94,23 @@ oos16-port/
 #### 2. `tools/safe/adb`
 * **Language**: Python 3
 * **Purpose**: Safety proxy for Android Debug Bridge.
-* **Mechanism**: Logs all executed commands with timestamps to `logs/phone-commands.log`. Blocks `sideload`, `install`, raw block writes (`dd of=`), and partition remounts (`remount`). Only allows pushing to `/tmp/` and safe inspection commands.
+* **Mechanism**: Tokenized argument parsing (`shlex`), strict command and toybox applet whitelist, shell metacharacter and injection rejection, executable path spoofing protection, and path traversal rejection. Only allows pushing to RAM directories (`/tmp/`, `/mnt/`) and approved read-only inspection commands.
 
 #### 3. `tools/safe/audit-no-writes.sh`
 * **Language**: Bash
-* **Purpose**: Pre-boot static validation of boot images.
-* **Mechanism**: Unpacks `boot.img`/`stage1.img`, parses the kernel command line, scans ramdisk scripts for any write traps or mount commands targeting physical disks, and returns `PASS` or `FAIL`.
+* **Purpose**: Pre-boot static validation of boot images, ramdisks, and orchestration scripts.
+* **Mechanism**: Unpacks `boot.img`/`stage1.img`, parses the kernel command line, scans ramdisk scripts for any write traps or mount commands targeting physical disks. Differentiates mandatory vs optional checks, returning exit code 0 (`PASSED`), 1 (`FAILED`), or 2 (`INCOMPLETE`).
 
 #### 4. `tools/safe/run_stage2.sh`
 * **Language**: Bash
 * **Purpose**: Host-side orchestrator for the Stage-2 bringup.
 * **Mechanism**:
   1. Verifies ADB connection in RAM mode.
-  2. Runs a host heartbeat loop.
-  3. Verifies physical block devices `sda` through `sdf` are write-locked (`ro=1`).
-  4. Pushes the 6 EROFS images to `/tmp/` in volatile RAM at ~115 MB/s over USB 3.0.
-  5. Pushes and executes `/tmp/stage2_init.sh` on the phone.
+  2. Dynamically discovers physical storage devices via `/sys/block/*` using safe diagnostic commands.
+  3. Verifies physical block devices are write-locked (`ro=1`) and live mounts contain zero writable physical disks.
+  4. Runs active host heartbeat loop (`/mnt/watchdog_heartbeat`).
+  5. Pushes verified partition images to volatile RAM (`/mnt/`) and verifies transfer integrity.
+  6. Activates Stage-1 PID 1 boot supervisor trigger (`/mnt/boot_now`). Stage-1 mounts RAM filesystems and executes Android 16 init second_stage directly as PID 1.
 
 #### 5. `scripts/build_stage1.sh`
 * **Language**: Bash

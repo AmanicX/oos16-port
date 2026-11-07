@@ -28,20 +28,29 @@ mount_or_fail() {
     /system/bin/toybox mount "$@" || fatal "Failed mount command: mount $*"
 }
 
-# 1. Heartbeat check (Do not cancel watchdog unconditionally; allow host heartbeat loop)
-if [ -f /tmp/watchdog_heartbeat ]; then
+# 1. Heartbeat check
+if [ -f /mnt/watchdog_heartbeat ] || [ -f /tmp/watchdog_heartbeat ]; then
     echo "[STAGE2] Active host heartbeat signal verified." > /dev/kmsg
 fi
 
 # 2. Strict read-only verification of physical block devices
 echo "[STAGE2] Verifying physical block devices are write-locked read-only..." > /dev/kmsg
 DISCOVERED_PHYSICAL=0
-for dev in /dev/block/sd* /dev/block/mmcblk*; do
-    if [ -b "$dev" ]; then
-        DISCOVERED_PHYSICAL=1
-        ro=$(/system/bin/toybox blockdev --getro "$dev" 2>/dev/null || echo "error")
-        if [ "$ro" != "1" ]; then
-            fatal "$dev is NOT read-only (ro=$ro)! Halting to protect physical storage."
+for bdir in /sys/block/*; do
+    [ -d "$bdir" ] || continue
+    bname=$(basename "$bdir")
+    case "$bname" in
+        loop*|ram*|zram*|dm-*) continue ;;
+    esac
+
+    if [ -e "$bdir/device" ] || case "$bname" in sd*|mmcblk*) true ;; *) false ;; esac; then
+        dev_node="/dev/block/$bname"
+        if [ -b "$dev_node" ]; then
+            DISCOVERED_PHYSICAL=$((DISCOVERED_PHYSICAL + 1))
+            ro=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
+            if [ "$ro" != "1" ]; then
+                fatal "$dev_node is NOT read-only (ro=$ro)! Halting to protect physical storage."
+            fi
         fi
     fi
 done
@@ -53,21 +62,36 @@ echo "[STAGE2] Verified: All physical storage devices are strictly locked read-o
 
 # 3. Clean up any previous mounts
 /system/bin/toybox umount -R /mnt/sysroot 2>/dev/null || true
-mkdir -p /mnt/sysroot
+/system/bin/toybox mkdir -p /mnt/sysroot /mnt/system_ro /mnt/overlay_upper /mnt/overlay_work
 
-# 4. Mount Base System Image
-SYSTEM_IMG="/tmp/system.img"
-[ -f "$SYSTEM_IMG" ] || fatal "Required system image $SYSTEM_IMG not found!"
-mount_or_fail -t erofs -o ro,loop "$SYSTEM_IMG" /mnt/sysroot
+# 4. Resolve and Mount Base System Image
+SYSTEM_IMG="/mnt/system.img"
+[ -f "$SYSTEM_IMG" ] || SYSTEM_IMG="/tmp/system.img"
+[ -f "$SYSTEM_IMG" ] || fatal "Required system image /mnt/system.img (or /tmp/system.img) not found!"
+
+# Attempt OverlayFS mount for writable sysroot in RAM
+OVERLAY_MOUNTED=0
+if /system/bin/toybox mount -t erofs -o ro,loop "$SYSTEM_IMG" /mnt/system_ro 2>/dev/null; then
+    if /system/bin/toybox mount -t overlay overlay -o lowerdir=/mnt/system_ro,upperdir=/mnt/overlay_upper,workdir=/mnt/overlay_work /mnt/sysroot 2>/dev/null; then
+        OVERLAY_MOUNTED=1
+        echo "[STAGE2] Mounted writable OverlayFS root at /mnt/sysroot" > /dev/kmsg
+    fi
+fi
+
+if [ "$OVERLAY_MOUNTED" -eq 0 ]; then
+    echo "[STAGE2 WARN] OverlayFS unavailable, mounting system image directly to /mnt/sysroot" > /dev/kmsg
+    /system/bin/toybox umount /mnt/system_ro 2>/dev/null || true
+    mount_or_fail -t erofs -o ro,loop "$SYSTEM_IMG" /mnt/sysroot
+fi
 
 # 5. Verify & Create Mountpoints on Rootfs
-# Note: /mnt/sysroot is now an EROFS filesystem. Required child mountpoints must exist.
 REQUIRED_MOUNTPOINTS="system_ext vendor odm product my_product my_region apex data dev proc sys linkerconfig mnt"
-
 for mp in $REQUIRED_MOUNTPOINTS; do
+    if [ "$OVERLAY_MOUNTED" -eq 1 ]; then
+        /system/bin/toybox mkdir -p "/mnt/sysroot/$mp" 2>/dev/null || true
+    fi
     if [ ! -d "/mnt/sysroot/$mp" ]; then
-        echo "[STAGE2 WARNING] Mountpoint /mnt/sysroot/$mp missing on system rootfs. Initializing in-memory fallback..." > /dev/kmsg
-        # In-memory mountpoints can be mounted via tmpfs if missing in rootfs
+        fatal "Required mountpoint directory /mnt/sysroot/$mp does not exist on rootfs!"
     fi
 done
 
@@ -76,42 +100,73 @@ mount_partition() {
     local name="$1"
     local img_path="$2"
     local target="/mnt/sysroot/$name"
+    local mandatory="${3:-1}"
 
-    [ -f "$img_path" ] || fatal "Partition image $img_path does not exist!"
+    if [ ! -f "$img_path" ] || [ ! -s "$img_path" ]; then
+        if [ "$mandatory" -eq 1 ]; then
+            fatal "Mandatory partition image $img_path does not exist or is 0 bytes!"
+        else
+            echo "[STAGE2] Optional partition image $img_path not present, skipping." > /dev/kmsg
+            return 0
+        fi
+    fi
 
     if [ ! -d "$target" ]; then
-        echo "[STAGE2] Creating target directory $target using tmpfs anchor..." > /dev/kmsg
+        if [ "$mandatory" -eq 1 ]; then
+            fatal "Mountpoint directory $target does not exist!"
+        else
+            echo "[STAGE2] Optional mountpoint $target missing, skipping." > /dev/kmsg
+            return 0
+        fi
     fi
 
     mount_or_fail -t erofs -o ro,loop "$img_path" "$target"
-    echo "[STAGE2] Successfully mounted $name at $target." > /dev/kmsg
+    
+    # Verify mount in /proc/mounts
+    if ! /system/bin/toybox grep -q " $target erofs " /proc/mounts 2>/dev/null; then
+        if [ "$mandatory" -eq 1 ]; then
+            fatal "Verification failed: $target is not mounted as erofs in /proc/mounts!"
+        fi
+    fi
+    echo "[STAGE2] Successfully mounted and verified $name at $target." > /dev/kmsg
 }
 
-[ -f /tmp/system_ext.img ] && mount_partition "system_ext" "/tmp/system_ext.img"
-
-MY_PROD_IMG=""
-if [ -f /mnt/my_product.img ]; then
-    MY_PROD_IMG="/mnt/my_product.img"
-elif [ -f /tmp/my_product.img ]; then
-    MY_PROD_IMG="/tmp/my_product.img"
-fi
-
-if [ -n "$MY_PROD_IMG" ]; then
-    mount_partition "my_product" "$MY_PROD_IMG"
-    if [ -d /mnt/sysroot/product ]; then
-        mount_or_fail -t erofs -o ro,loop "$MY_PROD_IMG" /mnt/sysroot/product
+# Resolve image paths preferring /mnt/ over /tmp/
+get_img() {
+    local name="$1"
+    if [ -f "/mnt/$name" ]; then
+        echo "/mnt/$name"
+    elif [ -f "/tmp/$name" ]; then
+        echo "/tmp/$name"
+    else
+        echo ""
     fi
+}
+
+SYSTEM_EXT_IMG=$(get_img "system_ext.img")
+[ -n "$SYSTEM_EXT_IMG" ] && mount_partition "system_ext" "$SYSTEM_EXT_IMG" 1
+
+PRODUCT_IMG=$(get_img "product.img")
+[ -z "$PRODUCT_IMG" ] && PRODUCT_IMG=$(get_img "my_product.img")
+if [ -n "$PRODUCT_IMG" ]; then
+    mount_partition "product" "$PRODUCT_IMG" 1
+    if [ -d /mnt/sysroot/my_product ]; then
+        mount_partition "my_product" "$PRODUCT_IMG" 0
+    fi
+else
+    fatal "Mandatory product.img (or my_product.img) not found in /mnt/ or /tmp/!"
 fi
 
-if [ -f /tmp/my_region.img ]; then
-    mount_partition "my_region" "/tmp/my_region.img"
-fi
+REGION_IMG=$(get_img "my_region.img")
+[ -n "$REGION_IMG" ] && mount_partition "my_region" "$REGION_IMG" 0
 
-mount_partition "vendor" "/tmp/vendor.img"
-mount_partition "odm" "/tmp/odm.img"
+VENDOR_IMG=$(get_img "vendor.img")
+[ -n "$VENDOR_IMG" ] && mount_partition "vendor" "$VENDOR_IMG" 1 || fatal "Mandatory vendor.img not found!"
+
+ODM_IMG=$(get_img "odm.img")
+[ -n "$ODM_IMG" ] && mount_partition "odm" "$ODM_IMG" 1 || fatal "Mandatory odm.img not found!"
 
 # 7. Runtime APEX Filesystem Handling & Dynamic Linker Bridging
-# Mount /mnt/sysroot/apex as writable tmpfs so runtime structures can be prepared
 echo "[STAGE2] Initializing writable APEX hierarchy on tmpfs..." > /dev/kmsg
 mount_or_fail -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/apex
 
@@ -120,25 +175,24 @@ mkdir -p /mnt/sysroot/apex/com.android.runtime/bin
 mkdir -p /mnt/sysroot/apex/com.android.runtime/lib64/bionic
 mkdir -p /mnt/sysroot/apex/com.android.runtime/lib/bionic
 
-RUNTIME_IMG="/tmp/runtime_apex.img"
-if [ ! -f "$RUNTIME_IMG" ] && [ -f "/tmp/runtime_apex.erofs.img" ]; then
-    RUNTIME_IMG="/tmp/runtime_apex.erofs.img"
-fi
+RUNTIME_IMG=$(get_img "runtime_apex.img")
+[ -z "$RUNTIME_IMG" ] && RUNTIME_IMG=$(get_img "runtime_apex.erofs.img")
 
-if [ -f "$RUNTIME_IMG" ]; then
-    # Detect filesystem type dynamically (EROFS vs ext4)
+if [ -n "$RUNTIME_IMG" ] && [ -f "$RUNTIME_IMG" ]; then
     APEX_FSTYPE="erofs"
-    if [ -f /tmp/runtime_apex.fstype ]; then
+    if [ -f /mnt/runtime_apex.fstype ]; then
+        APEX_FSTYPE=$(cat /mnt/runtime_apex.fstype | tr -d '[:space:]')
+    elif [ -f /tmp/runtime_apex.fstype ]; then
         APEX_FSTYPE=$(cat /tmp/runtime_apex.fstype | tr -d '[:space:]')
     fi
 
     echo "[STAGE2] Staging runtime APEX payload ($APEX_FSTYPE) to temporary loop mount..." > /dev/kmsg
     mkdir -p /tmp/apex_payload_mnt
-    mount_or_fail -t "$APEX_FSTYPE" -o ro,loop "$RUNTIME_IMG" /tmp/apex_payload_mnt
-
-    echo "[STAGE2] Populating /mnt/sysroot/apex/com.android.runtime from payload..." > /dev/kmsg
-    /system/bin/toybox cp -a /tmp/apex_payload_mnt/* /mnt/sysroot/apex/com.android.runtime/ 2>/dev/null || true
-    /system/bin/toybox umount /tmp/apex_payload_mnt 2>/dev/null || true
+    if mount_or_fail -t "$APEX_FSTYPE" -o ro,loop "$RUNTIME_IMG" /tmp/apex_payload_mnt; then
+        echo "[STAGE2] Populating /mnt/sysroot/apex/com.android.runtime from payload..." > /dev/kmsg
+        /system/bin/toybox cp -a /tmp/apex_payload_mnt/* /mnt/sysroot/apex/com.android.runtime/ 2>/dev/null || true
+        /system/bin/toybox umount /tmp/apex_payload_mnt 2>/dev/null || true
+    fi
 fi
 
 # Ensure 64-bit dynamic linker is accessible at /apex/com.android.runtime/bin/linker64
@@ -202,16 +256,13 @@ mount_or_fail -t tmpfs tmpfs /mnt/sysroot/dev/socket
 mkdir -p /mnt/sysroot/dev/graphics
 /system/bin/toybox ln -s /dev/dri/card0 /mnt/sysroot/dev/graphics/fb0 2>/dev/null || true
 
-# Note: The recursive bind mount `/mnt/sysroot/mnt/sysroot` has been REMOVED
-# to prevent kernel VFS mount recursion issues.
+# Note: The recursive bind mount `/mnt/sysroot/mnt/sysroot` has been REMOVED.
 
 echo "[STAGE2] All RAM filesystems verified and mounted cleanly." > /dev/kmsg
 
 # 11. Android Init Handover
 # Architecture Note: Android init is designed to execute as PID 1.
-# Inside a chroot execution, second_stage init runs as an unprivileged child process,
-# which limits process management, signal handling, and subcontext lifecycles.
-# Full production bringup requires PID 1 replacement (pivot_root from stage 1).
+# Executing via chroot replaces the process image.
 echo "[STAGE2] Executing Android 16 init second_stage in sysroot..." > /dev/kmsg
 
 export PATH=/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin

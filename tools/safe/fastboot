@@ -3,19 +3,19 @@
 tools/safe/fastboot - Hardened Safety Interceptor Proxy for Fastboot
 Enforces strict volatile RAM boot operation only.
 All flash, erase, format, partition modification, or slot-switch commands are permanently blocked.
+Strict allowlist enforcement for getvar diagnostic queries and boot images.
 """
 
 import sys
 import os
 import subprocess
 import stat
-import re
 from datetime import datetime
 
 LOG_FILE = "/run/media/apex/New Volume/oos16-port/logs/phone-commands.log"
-REAL_FASTBOOT = "/usr/bin/fastboot"
+REAL_FASTBOOT = os.environ.get("REAL_FASTBOOT_BIN", "/usr/bin/fastboot")
 
-if not os.path.exists(REAL_FASTBOOT):
+if not os.path.exists(REAL_FASTBOOT) and "REAL_FASTBOOT_BIN" not in os.environ:
     for p in os.environ.get("PATH", "").split(os.path.pathsep):
         candidate = os.path.join(p, "fastboot")
         if os.path.exists(candidate) and os.path.abspath(candidate) != os.path.abspath(__file__):
@@ -43,7 +43,7 @@ if not raw_args:
     res = subprocess.run([REAL_FASTBOOT])
     sys.exit(res.returncode)
 
-# 1. Parse global fastboot options
+# 1. Parse global fastboot options (-s <serial>, -i <vendor_id>)
 idx = 0
 global_flags = []
 while idx < len(raw_args):
@@ -94,17 +94,31 @@ elif cmd == "getvar":
     if len(subargs) != 1:
         abort("fastboot getvar requires exactly 1 variable name", raw_args)
     var = subargs[0]
-    ALLOWED_GETVARS = {
+    
+    ALLOWED_STATIC_GETVARS = {
         "all", "version", "version-bootloader", "version-baseband", 
         "product", "serialno", "secure", "unlocked", "current-slot", 
         "slot-count", "slot-successful", "slot-unbootable", "slot-retry-count",
         "max-download-size", "has-slot", "is-userspace", "battery-voltage", 
         "battery-soc-ok", "hw-revision", "variant"
     }
-    # Allow exact match or standard indexed query like has-slot:boot
-    base_var = var.split(":")[0]
-    if base_var not in ALLOWED_GETVARS and not re.match(r"^[a-zA-Z0-9_-]+$", var):
-        abort(f"Disallowed getvar variable: '{var}'", raw_args)
+
+    is_allowed = False
+    if var in ALLOWED_STATIC_GETVARS:
+        is_allowed = True
+    elif ":" in var:
+        prefix, suffix = var.split(":", 1)
+        if prefix == "has-slot":
+            ALLOWED_PARTITIONS = {"boot", "recovery", "dtbo", "system", "vendor", "modem", "vbmeta", "userdata"}
+            if suffix in ALLOWED_PARTITIONS:
+                is_allowed = True
+        elif prefix in ["slot-successful", "slot-unbootable", "slot-retry-count"]:
+            ALLOWED_SLOTS = {"a", "b", "_a", "_b"}
+            if suffix in ALLOWED_SLOTS:
+                is_allowed = True
+
+    if not is_allowed:
+        abort(f"Disallowed getvar variable: '{var}'. Variable is not in strict allowlist", raw_args)
 
     log_command(True, raw_args)
     res = subprocess.run([REAL_FASTBOOT] + raw_args)
@@ -123,7 +137,6 @@ elif cmd == "reboot":
     sys.exit(res.returncode)
 
 elif cmd == "boot":
-    # fastboot boot <image_file> (strictly loads into RAM without flashing)
     if len(subargs) != 1:
         abort("fastboot boot requires exactly 1 local image path", raw_args)
     
@@ -137,8 +150,14 @@ elif cmd == "boot":
             abort(f"Target '{img_path}' is not a regular file", raw_args)
         if st.st_size == 0:
             abort(f"Target image '{img_path}' is 0 bytes (empty file)", raw_args)
+        
+        # Verify Android boot image magic bytes
+        with open(img_path, "rb") as f:
+            magic = f.read(8)
+            if magic != b"ANDROID!":
+                abort(f"Target image '{img_path}' is missing valid Android boot header (magic: {magic!r})", raw_args)
     except Exception as e:
-        abort(f"Cannot stat target image '{img_path}': {e}", raw_args)
+        abort(f"Cannot validate target image '{img_path}': {e}", raw_args)
 
     log_command(True, raw_args)
     res = subprocess.run([REAL_FASTBOOT] + raw_args)
