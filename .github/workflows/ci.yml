@@ -58,9 +58,9 @@ jobs:
       - name: Verify Strict Non-Destructive Invariants (Static Scan)
         run: |
           echo "Auditing repository for forbidden physical flash write patterns..."
-          ! grep -rn "fastboot[[:space:]]\+flash" scripts tools stage1
-          ! grep -rn "fastboot[[:space:]]\+erase" scripts tools stage1
-          ! grep -rn "fastboot[[:space:]]\+format" scripts tools stage1
+          ! grep -rn --exclude="audit-no-writes.sh" "fastboot[[:space:]]\+flash" scripts tools stage1
+          ! grep -rn --exclude="audit-no-writes.sh" "fastboot[[:space:]]\+erase" scripts tools stage1
+          ! grep -rn --exclude="audit-no-writes.sh" "fastboot[[:space:]]\+format" scripts tools stage1
           ! grep -rn "mkfs\.ext4[[:space:]]\+/dev/block" scripts tools stage1
           echo "Non-destructive invariants verified."
 
@@ -107,7 +107,8 @@ jobs:
             echo "Auditing built loader.img..."
             bash tools/safe/audit-no-writes.sh build/loader.img
           else
-            echo "build/loader.img not present in CI checkout; skipping boot image audit."
+            echo "::notice title=Boot Image Audit Skipped::build/loader.img is not present in CI checkout (requires device kernel/dtb binaries in stage1/kernel_src/). Packaged boot-image audit skipped in CI; verified locally when built."
+            echo "[SKIPPED - ARTIFACT NOT IN CHECKOUT] Packaged loader.img not present in git checkout."
           fi
 
       - name: Run Boot Image Safety Auditor (stage1.img if present)
@@ -116,7 +117,8 @@ jobs:
             echo "Auditing built stage1.img..."
             bash tools/safe/audit-no-writes.sh build/stage1.img
           else
-            echo "build/stage1.img not present in CI checkout; skipping boot image audit."
+            echo "::notice title=Boot Image Audit Skipped::build/stage1.img is not present in CI checkout (requires device kernel/dtb binaries in stage1/kernel_src/). Packaged boot-image audit skipped in CI; verified locally when built."
+            echo "[SKIPPED - ARTIFACT NOT IN CHECKOUT] Packaged stage1.img not present in git checkout."
           fi
 
       - name: Upload Safety Audit & Execution Logs

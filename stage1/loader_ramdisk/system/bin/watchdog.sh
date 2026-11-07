@@ -20,25 +20,83 @@ log_msg() {
 }
 
 # 1. Configuration Validation & Safe Fallbacks
-RAW_TIMEOUT="${WATCHDOG_TIMEOUT:-60}"
-case "$RAW_TIMEOUT" in
-    ''|*[!0-9]*)
-        log_msg "[WATCHDOG WARN] Invalid WATCHDOG_TIMEOUT '$RAW_TIMEOUT'. Falling back to safe default (60s)."
-        TIMEOUT=60
+validate_timeout() {
+    local var_name="$1"
+    local raw_val="$2"
+    local default_val="$3"
+    local min_val="$4"
+    local max_val="$5"
+
+    case "$raw_val" in
+        ''|*[!0-9]*)
+            log_msg "[WATCHDOG WARN] Invalid $var_name '$raw_val'. Falling back to safe default (${default_val}s)."
+            echo "$default_val"
+            return 0
+            ;;
+    esac
+
+    if [ "$raw_val" -le 0 ]; then
+        log_msg "[WATCHDOG WARN] Non-positive $var_name '$raw_val'. Falling back to safe default (${default_val}s)."
+        echo "$default_val"
+    elif [ "$raw_val" -lt "$min_val" ]; then
+        log_msg "[WATCHDOG WARN] $var_name '$raw_val' is below minimum (${min_val}s). Falling back to safe default (${default_val}s)."
+        echo "$default_val"
+    elif [ "$raw_val" -gt "$max_val" ]; then
+        log_msg "[WATCHDOG WARN] $var_name '$raw_val' exceeds maximum (${max_val}s). Falling back to safe default (${default_val}s)."
+        echo "$default_val"
+    else
+        echo "$raw_val"
+    fi
+}
+
+TIMEOUT=$(validate_timeout "WATCHDOG_TIMEOUT" "${WATCHDOG_TIMEOUT:-60}" 60 1 86400)
+STAGE2_TIMEOUT=$(validate_timeout "WATCHDOG_STAGE2_TIMEOUT" "${WATCHDOG_STAGE2_TIMEOUT:-120}" 120 1 86400)
+# Default first boot health timeout: 600s (10 minutes)
+HEALTH_TIMEOUT=$(validate_timeout "WATCHDOG_HEALTH_TIMEOUT" "${WATCHDOG_HEALTH_TIMEOUT:-600}" 600 1 86400)
+
+RAW_SLEEP="${WATCHDOG_SLEEP_INTERVAL:-1}"
+case "$RAW_SLEEP" in
+    ''|*[!0-9.]*)
+        log_msg "[WATCHDOG WARN] Invalid non-numeric WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP'. Falling back to safe default (1s)."
+        SLEEP_INTERVAL=1
+        ;;
+    *.*.*)
+        log_msg "[WATCHDOG WARN] Malformed WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP' (multiple decimal points). Falling back to default (1s)."
+        SLEEP_INTERVAL=1
         ;;
     *)
-        if [ "$RAW_TIMEOUT" -le 0 ]; then
-            log_msg "[WATCHDOG WARN] Non-positive WATCHDOG_TIMEOUT '$RAW_TIMEOUT'. Falling back to safe default (60s)."
-            TIMEOUT=60
+        _int_part="${RAW_SLEEP%%.*}"
+        [ -z "$_int_part" ] && _int_part=0
+        if [ "$_int_part" -ge 60 ]; then
+            log_msg "[WATCHDOG WARN] WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP' exceeds maximum (60s). Falling back to default (1s)."
+            SLEEP_INTERVAL=1
+        elif [ "$RAW_SLEEP" = "0" ] || [ "$RAW_SLEEP" = "0.0" ] || [ "$RAW_SLEEP" = "0.00" ]; then
+            log_msg "[WATCHDOG WARN] Zero WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP' prohibited. Falling back to default (1s)."
+            SLEEP_INTERVAL=1
         else
-            TIMEOUT="$RAW_TIMEOUT"
+            SLEEP_INTERVAL="$RAW_SLEEP"
         fi
         ;;
 esac
 
-STAGE2_TIMEOUT="${WATCHDOG_STAGE2_TIMEOUT:-120}"
-# Default first boot health timeout: 600s (10 minutes)
-HEALTH_TIMEOUT="${WATCHDOG_HEALTH_TIMEOUT:-600}"
+RAW_MAX_TICKS="${WATCHDOG_MAX_TICKS:-0}"
+case "$RAW_MAX_TICKS" in
+    ''|*[!0-9]*)
+        log_msg "[WATCHDOG WARN] Invalid non-numeric WATCHDOG_MAX_TICKS '$RAW_MAX_TICKS'. Falling back to safe default (0)."
+        MAX_TICKS=0
+        ;;
+    *)
+        if [ "$RAW_MAX_TICKS" -lt 0 ]; then
+            log_msg "[WATCHDOG WARN] Negative WATCHDOG_MAX_TICKS '$RAW_MAX_TICKS'. Falling back to safe default (0)."
+            MAX_TICKS=0
+        elif [ "$RAW_MAX_TICKS" -gt 1000000 ]; then
+            log_msg "[WATCHDOG WARN] WATCHDOG_MAX_TICKS '$RAW_MAX_TICKS' exceeds 1000000. Falling back to default (0)."
+            MAX_TICKS=0
+        else
+            MAX_TICKS="$RAW_MAX_TICKS"
+        fi
+        ;;
+esac
 
 HEARTBEAT_FILE="${WATCHDOG_HEARTBEAT_FILE:-/mnt/watchdog_heartbeat}"
 DEVICE_HEARTBEAT_FILE="${WATCHDOG_DEVICE_HEARTBEAT_FILE:-/mnt/stage2_heartbeat}"
@@ -49,8 +107,6 @@ STATE_FILE="${WATCHDOG_STATE_FILE:-/mnt/watchdog_state}"
 REBOOT_BIN="${REBOOT_BIN:-/system/bin/reboot}"
 GETPROP_BIN="${GETPROP_BIN:-/system/bin/getprop}"
 CHROOT_BIN="${CHROOT_BIN:-/system/bin/chroot}"
-SLEEP_INTERVAL="${WATCHDOG_SLEEP_INTERVAL:-1}"
-MAX_TICKS="${WATCHDOG_MAX_TICKS:-0}"
 
 # Atomic state writer using temp file and rename
 set_state() {

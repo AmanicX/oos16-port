@@ -84,7 +84,7 @@ func TestValidateOrCreateLegacyNodeRefuseOverwrite(t *testing.T) {
 	}
 
 	// Attempting to create legacy node on top of an ordinary file must fail
-	err := validateOrCreateLegacyNode(existingFile, 10, 237, true)
+	_, err := validateOrCreateLegacyNode(existingFile, 10, 237, true)
 	if err == nil {
 		t.Fatalf("Expected error when target is regular file, got nil")
 	}
@@ -103,7 +103,7 @@ func TestValidateOrCreateLegacyNodeExistingDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := validateOrCreateLegacyNode(dirPath, 10, 237, true)
+	_, err := validateOrCreateLegacyNode(dirPath, 10, 237, true)
 	if err == nil {
 		t.Fatalf("Expected error when target is directory, got nil")
 	}
@@ -113,7 +113,7 @@ func TestValidateOrCreateLegacyNodeConflictingCharDevice(t *testing.T) {
 	// /dev/null is character device 1:3 on Linux
 	if fi, err := os.Stat("/dev/null"); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
 		// Try to validate /dev/null with mismatched maj/min (e.g. 10:237)
-		err := validateOrCreateLegacyNode("/dev/null", 10, 237, true)
+		_, err := validateOrCreateLegacyNode("/dev/null", 10, 237, true)
 		if err == nil {
 			t.Fatalf("Expected error when validating /dev/null with wrong rdev, got nil")
 		}
@@ -130,13 +130,25 @@ func TestValidateOrCreateLegacyNodeSymlinkHandling(t *testing.T) {
 	}
 
 	// Stale symlink to regular file should be removed and recreated in test mode
-	err := validateOrCreateLegacyNode(symlinkPath, 10, 237, true)
+	res, err := validateOrCreateLegacyNode(symlinkPath, 10, 237, true)
 	if err != nil {
 		t.Fatalf("validateOrCreateLegacyNode failed on stale symlink: %v", err)
+	}
+	if res != ResultCreated {
+		t.Errorf("Expected ResultCreated on recreating stale symlink, got %v", res)
 	}
 	content, _ := os.ReadFile(symlinkPath)
 	if string(content) != "test-legacy" {
 		t.Errorf("Expected recreated test-legacy node, got %s", string(content))
+	}
+
+	// Subsequent call on valid legacy node in test mode should return ResultAlreadyValid
+	res2, err := validateOrCreateLegacyNode(symlinkPath, 10, 237, true)
+	if err != nil {
+		t.Fatalf("Idempotent validateOrCreateLegacyNode failed: %v", err)
+	}
+	if res2 != ResultAlreadyValid {
+		t.Errorf("Expected ResultAlreadyValid on second call, got %v", res2)
 	}
 }
 
@@ -148,7 +160,7 @@ func TestSafeSymlinkRefuseOverwrite(t *testing.T) {
 	}
 
 	// Source missing
-	err := safeSymlink(filepath.Join(tmpDir, "nonexistent"), destFile)
+	_, err := safeSymlink(filepath.Join(tmpDir, "nonexistent"), destFile)
 	if err == nil {
 		t.Fatalf("Expected error when source does not exist, got nil")
 	}
@@ -156,7 +168,7 @@ func TestSafeSymlinkRefuseOverwrite(t *testing.T) {
 	// Source is regular file (not character device)
 	srcMock := filepath.Join(tmpDir, "src_mock")
 	_ = os.WriteFile(srcMock, []byte("mock"), 0666)
-	err = safeSymlink(srcMock, destFile)
+	_, err = safeSymlink(srcMock, destFile)
 	if err == nil {
 		t.Fatalf("Expected error when source is not character device, got nil")
 	}
@@ -168,24 +180,90 @@ func TestSafeSymlinkRealCharDevice(t *testing.T) {
 		tmpDir := t.TempDir()
 		symlinkDest := filepath.Join(tmpDir, "binder_symlink")
 
-		err := safeSymlink("/dev/null", symlinkDest)
+		res, err := safeSymlink("/dev/null", symlinkDest)
 		if err != nil {
 			t.Fatalf("safeSymlink to /dev/null failed: %v", err)
 		}
+		if res != ResultCreated {
+			t.Errorf("Expected ResultCreated on first symlink, got %v", res)
+		}
 
-		// Calling safeSymlink again on existing identical symlink should be idempotent
-		err = safeSymlink("/dev/null", symlinkDest)
+		// Calling safeSymlink again on existing identical symlink should be idempotent ResultAlreadyValid
+		res2, err := safeSymlink("/dev/null", symlinkDest)
 		if err != nil {
 			t.Fatalf("Idempotent safeSymlink failed: %v", err)
+		}
+		if res2 != ResultAlreadyValid {
+			t.Errorf("Expected ResultAlreadyValid on second symlink, got %v", res2)
 		}
 
 		// Destination conflicting with /dev/zero (different char device)
 		if zfi, err := os.Stat("/dev/zero"); err == nil && (zfi.Mode()&os.ModeCharDevice != 0) {
-			err = safeSymlink("/dev/null", "/dev/zero")
+			_, err := safeSymlink("/dev/null", "/dev/zero")
 			if err == nil {
 				t.Fatalf("Expected error when destination is conflicting char device (/dev/zero), got nil")
 			}
 		}
+	}
+}
+
+func TestRollbackPreservesPreExisting(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Pre-existing valid node
+	preExistingNode := filepath.Join(tmpDir, "pre_existing_binder")
+	if err := os.WriteFile(preExistingNode, []byte("pre-existing-content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-existing symlink
+	preExistingSymlink := filepath.Join(tmpDir, "pre_existing_symlink")
+	if err := os.Symlink(preExistingNode, preExistingSymlink); err != nil {
+		t.Fatal(err)
+	}
+
+	// Newly created resources by current invocation
+	newAlloc := filepath.Join(tmpDir, "new_allocated")
+	if err := os.WriteFile(newAlloc, []byte("new-alloc"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	newSym := filepath.Join(tmpDir, "new_symlink")
+	if err := os.Symlink(newAlloc, newSym); err != nil {
+		t.Fatal(err)
+	}
+	newLegacy := filepath.Join(tmpDir, "new_legacy")
+	if err := os.WriteFile(newLegacy, []byte("new-legacy"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute rollback specifying ONLY newly created items
+	rollbackCreated(
+		[]string{newAlloc},
+		[]string{newSym},
+		[]string{newLegacy},
+	)
+
+	// Newly created items MUST be removed
+	if _, err := os.Lstat(newAlloc); !os.IsNotExist(err) {
+		t.Errorf("Expected %s to be removed by rollback, but it still exists", newAlloc)
+	}
+	if _, err := os.Lstat(newSym); !os.IsNotExist(err) {
+		t.Errorf("Expected %s to be removed by rollback, but it still exists", newSym)
+	}
+	if _, err := os.Lstat(newLegacy); !os.IsNotExist(err) {
+		t.Errorf("Expected %s to be removed by rollback, but it still exists", newLegacy)
+	}
+
+	// Pre-existing items MUST be preserved
+	if _, err := os.Lstat(preExistingNode); err != nil {
+		t.Errorf("Pre-existing node was erroneously removed or modified: %v", err)
+	}
+	content, _ := os.ReadFile(preExistingNode)
+	if string(content) != "pre-existing-content" {
+		t.Errorf("Pre-existing node content changed: %s", string(content))
+	}
+	if _, err := os.Lstat(preExistingSymlink); err != nil {
+		t.Errorf("Pre-existing symlink was erroneously removed: %v", err)
 	}
 }
 

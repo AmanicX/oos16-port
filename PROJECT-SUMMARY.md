@@ -216,6 +216,42 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
   * Hardened `tools/extract_apex_info.py`: rejects varints $> 2^{64}-1$, tag 0, invalid tags $> 536870911$, duplicate critical fields, and enforces ZIP limits (`MAX_APEX_FILE_SIZE = 500MB`, `MAX_ZIP_ENTRIES = 1000`, `MAX_MANIFEST_BYTES = 10MB`).
   * Hardened safety auditor `tools/safe/audit-no-writes.sh` with comment-stripped command scanning for `dd`, `wipefs`, `sgdisk`, `parted`, `fdisk`, and `mkfs`.
 
+### 21. Critical RAM Accounting, Partition Mapping, BinderFS Rollback & Validation Repairs
+* **Problem**:
+  1. `scripts/stage2_init.sh` double-counted staged images against `MemAvailable` after those images were already resident in RAM tmpfs, and checked `/mnt` free space against already-staged image bytes. It also silently skipped checks if `/proc/meminfo` was empty.
+  2. `tools/safe/run_stage2.sh` duplicated `my_product.erofs.img` as both `/mnt/product.img` and `/mnt/my_product.img`.
+  3. APEX expanded size fell back to guessing 2.5x image size instead of requiring authentic uncompressed measurements.
+  4. `src/binderfs_init.go` rollback deleted pre-existing valid symlinks or character devices on failure because it didn't track ownership.
+  5. Protobuf tag parsing in `tools/extract_apex_info.py` only read 1 byte rather than a bounded varint, didn't enforce wire types for known fields, and allowed duplicate `versionName`.
+  6. Watchdog parameters (`STAGE2_TIMEOUT`, `HEALTH_TIMEOUT`, `SLEEP_INTERVAL`, `MAX_TICKS`) were not validated against bounds.
+* **Solution**:
+  1. **Device-Side RAM Accounting Model**:
+     - Staged images in `/mnt` are already in RAM and accounted for in kernel `MemAvailable`.
+     - Future allocations from `MemAvailable`: `_FUTURE_RAM_REQ_MB = _EXP_APEX_MB (measured) + 1024 (/data) + 512 (overlay) + 1536 (kernel/gpu/runtime) + 256 (safety headroom)`.
+     - `/mnt` requires only 576 MB free (OverlayFS upper/work directories: 512MB + 64MB buffer).
+     - `/tmp` checked independently, requiring >= 64 MB free.
+     - Fail-closed on `/proc/meminfo`: missing file, missing `MemTotal` (<6500MB), missing `MemAvailable`, non-numeric values, or overflow strictly halt bringup.
+  2. **Product & My_Product Explicit Mapping**:
+     - Donor OxygenOS 16 / ColorOS uses `/my_product` as its product layer (`my_product.erofs.img` -> `/mnt/my_product.img`), mounting to `/mnt/sysroot/my_product` and leaving `/mnt/sysroot/product` as an empty overlay directory.
+     - Staging manifest `PARTITION_MAP` generated in `build_stage2_erofs.sh` and tracked in `SHA256SUMS`.
+     - SHA-256 duplicate content detection rejects identical images mapped to both product and my_product paths in both runner and Stage 2.
+  3. **Strict APEX Expanded-Size Measurement**:
+     - Build pipeline extracts uncompressed payloads (`fsck.erofs --extract` / `7z x`), validates non-empty payload, and measures exact uncompressed byte counts into `*.expanded_size`. Fails build if measurement cannot be obtained.
+     - Runner strictly requires positive numeric `.expanded_size` metadata for all 4 bootstrap APEX modules (<= 500MB).
+     - Stage 2 enforces per-module pre-copy check: parses `df -k /mnt/sysroot/apex` strictly, requiring that next module fits with a 5 MB headroom margin.
+  4. **BinderFS Rollback Ownership**:
+     - Introduced `OpResult` enum (`ResultAlreadyValid`, `ResultCreated`) in `src/binderfs_init.go`.
+     - Tracks `newlyAllocated`, `newlySymlinked`, and `newlyLegacy`. Rollback removes ONLY resources created by this invocation, strictly preserving pre-existing valid nodes, symlinks, and legacy devices.
+  5. **Hardened Protobuf Tag Varint Parser**:
+     - Decodes protobuf tag keys as multi-byte varints with bounds and overflow checks.
+     - Validates wire types for known fields (tag 1: wire 2, tag 2: wire 0, tag 3: wire 2).
+     - Rejects duplicate critical fields (tags 1, 2, 3). Strictly validates JSON manifest field types.
+  6. **Watchdog Configuration Validation**:
+     - Validates all 5 configuration variables with safe fallbacks and bounds: `WATCHDOG_TIMEOUT` (1..86400, default 60), `WATCHDOG_STAGE2_TIMEOUT` (1..86400, default 120), `WATCHDOG_HEALTH_TIMEOUT` (1..86400, default 600), `WATCHDOG_SLEEP_INTERVAL` (0.001..60, default 1), `WATCHDOG_MAX_TICKS` (0..1000000, default 0).
+  7. **CI & Documentation Integrity**:
+     - Updated `.github/workflows/ci.yml` to log `[SKIPPED - ARTIFACT NOT IN CHECKOUT]` for boot image checks in CI without proprietary device kernel binaries.
+     - Rebuilt local boot images: `build/loader.img` (SHA-256: `a467af4ac8ebd5b0aa04f77ff6b36e67bea6cd34b073dc244f311a69cd00709e`) and `build/stage1.img` (SHA-256: `6f055cf9de0445bdca5afc2a7e5ea332adbdf1d988e1bb18282a12ab6bd8a1c8`), both passing 31/31 pre-boot safety checks.
+
 ---
 
 ## 3. Verification Matrix & Current Status
@@ -223,9 +259,9 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on `build/loader.img` (31/31), `build/stage1.img` (31/31), and ramdisks (29/29) with zero mandatory unverified checks. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (101/101)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf & ZIP limits (14), Watchdog protocol & lifecycle (19), Stage-2 runner integration mocks (49), and Go BinderFS unit tests (8). |
-| **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `a467af4a...`, 31/31), `build/stage1.img` (SHA-256: `6f055cf9...`, 31/31), and ramdisks (29/29). In CI without device kernel binaries, ramdisks pass 29/29 and packaged image audits are reported as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (118/118)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf & ZIP limits (18), Watchdog protocol & lifecycle (21), Stage-2 runner integration mocks (59), and Go BinderFS unit tests (9). |
+| **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
 
@@ -236,6 +272,6 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 The repository is in a verified, build-clean, and audited state:
 * All host-side safety wrappers (`tools/safe/adb`, `tools/safe/fastboot`, `tools/safe/audit-no-writes.sh`) are active and verified.
 * All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (31/31).
-* All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS`.
-* All 101 automated unit and integration tests pass without error (100% OK).
+* All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS` and `PARTITION_MAP`.
+* All 118 automated unit and integration tests pass without error (100% OK).
 * **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`).

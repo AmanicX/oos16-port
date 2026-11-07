@@ -116,11 +116,18 @@ func isBinderfsMounted(mountPath string, procDir string) bool {
 	return false
 }
 
+type OpResult int
+
+const (
+	ResultAlreadyValid OpResult = iota
+	ResultCreated
+)
+
 // validateOrCreateLegacyNode safely creates a character device node without overwriting unrelated files
-func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool) error {
+func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool) (OpResult, error) {
 	devNum, err := mkdev(maj, min)
 	if err != nil {
-		return fmt.Errorf("invalid dev numbers (%d:%d): %w", maj, min, err)
+		return 0, fmt.Errorf("invalid dev numbers (%d:%d): %w", maj, min, err)
 	}
 
 	if fi, err := os.Lstat(destNode); err == nil {
@@ -134,48 +141,58 @@ func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool)
 				if tfi, err := os.Stat(resolvedTarget); err == nil && (tfi.Mode()&os.ModeCharDevice != 0) {
 					st, ok := tfi.Sys().(*syscall.Stat_t)
 					if ok && st != nil && st.Rdev == uint64(devNum) {
-						return nil
+						return ResultAlreadyValid, nil
 					}
 				}
 			}
 			if err := os.Remove(destNode); err != nil {
-				return fmt.Errorf("failed to remove stale symlink %s: %w", destNode, err)
+				return 0, fmt.Errorf("failed to remove stale symlink %s: %w", destNode, err)
 			}
 		} else if fi.Mode()&os.ModeCharDevice != 0 {
 			st, ok := fi.Sys().(*syscall.Stat_t)
 			if !ok || st == nil {
-				return fmt.Errorf("existing character device %s missing Stat_t info; refusing to overwrite", destNode)
+				return 0, fmt.Errorf("existing character device %s missing Stat_t info; refusing to overwrite", destNode)
 			}
 			if st.Rdev == uint64(devNum) {
-				return os.Chmod(destNode, 0666)
+				_ = os.Chmod(destNode, 0666)
+				return ResultAlreadyValid, nil
 			}
-			return fmt.Errorf("existing character device %s has conflicting rdev (%d != %d); refusing to overwrite", destNode, st.Rdev, devNum)
+			return 0, fmt.Errorf("existing character device %s has conflicting rdev (%d != %d); refusing to overwrite", destNode, st.Rdev, devNum)
 		} else {
-			return fmt.Errorf("path %s already exists and is not a binder device (mode: %s); refusing to overwrite", destNode, fi.Mode())
+			if testMode {
+				content, readErr := os.ReadFile(destNode)
+				if readErr == nil && string(content) == "test-legacy" {
+					return ResultAlreadyValid, nil
+				}
+			}
+			return 0, fmt.Errorf("path %s already exists and is not a binder device (mode: %s); refusing to overwrite", destNode, fi.Mode())
 		}
 	}
 
 	if testMode {
-		return os.WriteFile(destNode, []byte("test-legacy"), 0666)
+		if err := os.WriteFile(destNode, []byte("test-legacy"), 0666); err != nil {
+			return 0, err
+		}
+		return ResultCreated, nil
 	}
 
 	if err := syscall.Mknod(destNode, syscall.S_IFCHR|0666, devNum); err != nil {
-		return fmt.Errorf("mknod failed for %s (dev %d): %w", destNode, devNum, err)
+		return 0, fmt.Errorf("mknod failed for %s (dev %d): %w", destNode, devNum, err)
 	}
 	if err := os.Chmod(destNode, 0666); err != nil {
-		return fmt.Errorf("chmod failed for %s: %w", destNode, err)
+		return 0, fmt.Errorf("chmod failed for %s: %w", destNode, err)
 	}
-	return nil
+	return ResultCreated, nil
 }
 
 // safeSymlink creates a symlink from destNode to srcNode, strictly validating types
-func safeSymlink(srcNode, destNode string) error {
+func safeSymlink(srcNode, destNode string) (OpResult, error) {
 	fi, err := os.Stat(srcNode)
 	if err != nil {
-		return fmt.Errorf("source node %s does not exist: %w", srcNode, err)
+		return 0, fmt.Errorf("source node %s does not exist: %w", srcNode, err)
 	}
 	if fi.Mode()&os.ModeCharDevice == 0 {
-		return fmt.Errorf("source node %s is not a character device (mode: %s)", srcNode, fi.Mode())
+		return 0, fmt.Errorf("source node %s is not a character device (mode: %s)", srcNode, fi.Mode())
 	}
 	srcStat, srcOk := fi.Sys().(*syscall.Stat_t)
 
@@ -185,7 +202,7 @@ func safeSymlink(srcNode, destNode string) error {
 			rel, _ := filepath.Rel(filepath.Dir(destNode), srcNode)
 			if target == srcNode || target == rel {
 				_ = os.Chmod(srcNode, 0666)
-				return nil
+				return ResultAlreadyValid, nil
 			}
 			resolved := target
 			if !filepath.IsAbs(target) {
@@ -195,20 +212,21 @@ func safeSymlink(srcNode, destNode string) error {
 				tStat, tOk := tfi.Sys().(*syscall.Stat_t)
 				if srcOk && tOk && srcStat != nil && tStat != nil && srcStat.Rdev == tStat.Rdev {
 					_ = os.Chmod(srcNode, 0666)
-					return nil
+					return ResultAlreadyValid, nil
 				}
 			}
 			if err := os.Remove(destNode); err != nil {
-				return fmt.Errorf("failed to remove existing symlink %s: %w", destNode, err)
+				return 0, fmt.Errorf("failed to remove existing symlink %s: %w", destNode, err)
 			}
 		} else if lfi.Mode()&os.ModeCharDevice != 0 {
 			dstStat, dstOk := lfi.Sys().(*syscall.Stat_t)
 			if srcOk && dstOk && srcStat != nil && dstStat != nil && srcStat.Rdev == dstStat.Rdev {
-				return os.Chmod(destNode, 0666)
+				_ = os.Chmod(destNode, 0666)
+				return ResultAlreadyValid, nil
 			}
-			return fmt.Errorf("destination %s is an existing character device with conflicting rdev; refusing to overwrite", destNode)
+			return 0, fmt.Errorf("destination %s is an existing character device with conflicting rdev; refusing to overwrite", destNode)
 		} else {
-			return fmt.Errorf("destination %s exists and is not a symlink/char-device (mode: %s); refusing to overwrite", destNode, lfi.Mode())
+			return 0, fmt.Errorf("destination %s exists and is not a symlink/char-device (mode: %s); refusing to overwrite", destNode, lfi.Mode())
 		}
 	}
 
@@ -218,12 +236,25 @@ func safeSymlink(srcNode, destNode string) error {
 	}
 
 	if err := os.Symlink(relPath, destNode); err != nil {
-		return fmt.Errorf("symlink %s -> %s failed: %w", destNode, relPath, err)
+		return 0, fmt.Errorf("symlink %s -> %s failed: %w", destNode, relPath, err)
 	}
 	if err := os.Chmod(srcNode, 0666); err != nil && !os.IsPermission(err) {
-		return fmt.Errorf("chmod source node %s failed: %w", srcNode, err)
+		return 0, fmt.Errorf("chmod source node %s failed: %w", srcNode, err)
 	}
-	return nil
+	return ResultCreated, nil
+}
+
+// rollbackCreated removes only resources that were newly created by this invocation
+func rollbackCreated(newlyAllocated, newlySymlinked, newlyLegacy []string) {
+	for _, node := range newlyAllocated {
+		_ = os.Remove(node)
+	}
+	for _, sym := range newlySymlinked {
+		_ = os.Remove(sym)
+	}
+	for _, leg := range newlyLegacy {
+		_ = os.Remove(leg)
+	}
 }
 
 func main() {
@@ -252,6 +283,7 @@ func main() {
 
 	var newlyAllocated []string
 	var newlySymlinked []string
+	var newlyLegacy []string
 	controlFd, err := syscall.Open(*controlPath, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
 	controlAvailable := (err == nil)
 	if controlAvailable {
@@ -303,11 +335,16 @@ func main() {
 		destNode := filepath.Join(*devDir, name)
 
 		if fi, err := os.Lstat(srcNode); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
-			if err := safeSymlink(srcNode, destNode); err != nil {
+			res, err := safeSymlink(srcNode, destNode)
+			if err != nil {
 				logKmsg(fmt.Sprintf("[BINDERFS_INIT WARNING] safeSymlink failed for %s -> %s: %v", destNode, srcNode, err))
 			} else {
-				newlySymlinked = append(newlySymlinked, destNode)
-				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Symlinked %s -> %s", destNode, srcNode))
+				if res == ResultCreated {
+					newlySymlinked = append(newlySymlinked, destNode)
+					logKmsg(fmt.Sprintf("[BINDERFS_INIT] Symlinked newly created %s -> %s", destNode, srcNode))
+				} else {
+					logKmsg(fmt.Sprintf("[BINDERFS_INIT] Preserved existing valid symlink/device: %s -> %s", destNode, srcNode))
+				}
 			}
 		} else {
 			// Check legacy sysfs fallback: /sys/class/misc/<name>/dev
@@ -320,10 +357,16 @@ func main() {
 					continue
 				}
 				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Discovered legacy binder '%s' via sysfs (%d:%d)", name, maj, min))
-				if err := validateOrCreateLegacyNode(destNode, maj, min, *unitTestMode); err != nil {
+				res, err := validateOrCreateLegacyNode(destNode, maj, min, *unitTestMode)
+				if err != nil {
 					logKmsg(fmt.Sprintf("[BINDERFS_INIT ERROR] validateOrCreateLegacyNode failed for %s: %v", destNode, err))
 				} else {
-					logKmsg(fmt.Sprintf("[BINDERFS_INIT] Legacy binder node verified at %s (%d:%d)", destNode, maj, min))
+					if res == ResultCreated {
+						newlyLegacy = append(newlyLegacy, destNode)
+						logKmsg(fmt.Sprintf("[BINDERFS_INIT] Newly created legacy binder node at %s (%d:%d)", destNode, maj, min))
+					} else {
+						logKmsg(fmt.Sprintf("[BINDERFS_INIT] Preserved existing valid legacy binder node at %s (%d:%d)", destNode, maj, min))
+					}
 				}
 			}
 		}
@@ -359,14 +402,9 @@ func main() {
 	}
 
 	if !allOk {
-		// Clean up partial allocations and newly created symlinks to avoid inconsistent state
-		for _, node := range newlyAllocated {
-			_ = os.Remove(node)
-		}
-		for _, sym := range newlySymlinked {
-			_ = os.Remove(sym)
-		}
-		logKmsg("[BINDERFS_INIT FATAL] Critical Binder IPC device initialization FAILED! Partial state cleaned up.")
+		// Clean up ONLY resources created by this execution without deleting pre-existing valid nodes
+		rollbackCreated(newlyAllocated, newlySymlinked, newlyLegacy)
+		logKmsg("[BINDERFS_INIT FATAL] Critical Binder IPC device initialization FAILED! Newly created resources cleaned up.")
 		os.Exit(1)
 	}
 

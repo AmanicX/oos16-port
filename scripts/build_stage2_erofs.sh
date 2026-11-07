@@ -424,21 +424,39 @@ extract_and_stage_apex() {
     local exp_dir="$unpack_dir/expanded_measure"
     mkdir -p "$exp_dir"
     if [ "$fstype" = "erofs" ]; then
-        if "$FSCK_EROFS" --extract="$exp_dir" "$payload" >/dev/null 2>&1; then
-            exp_size=$(du -sb "$exp_dir" 2>/dev/null | awk '{print $1}' || echo "0")
+        if ! "$FSCK_EROFS" --extract="$exp_dir" "$payload" >/dev/null 2>&1; then
+            echo "CRITICAL BUILD ERROR: fsck.erofs --extract failed on $output_base payload ($payload)!" >&2
+            exit 1
         fi
     elif [ "$fstype" = "ext4" ]; then
-        if command -v 7z >/dev/null 2>&1 && 7z x -o"$exp_dir" "$payload" >/dev/null 2>&1; then
-            exp_size=$(du -sb "$exp_dir" 2>/dev/null | awk '{print $1}' || echo "0")
+        if ! command -v 7z >/dev/null 2>&1; then
+            echo "CRITICAL BUILD ERROR: '7z' utility required to extract and measure ext4 APEX payload ($payload)!" >&2
+            exit 1
+        fi
+        if ! 7z x -o"$exp_dir" "$payload" >/dev/null 2>&1; then
+            echo "CRITICAL BUILD ERROR: 7z extraction failed on $output_base payload ($payload)!" >&2
+            exit 1
         fi
     fi
+
+    # Verify extraction directory is non-empty
+    if [ -z "$(ls -A "$exp_dir" 2>/dev/null)" ]; then
+        echo "CRITICAL BUILD ERROR: Extraction directory for $output_base payload is empty!" >&2
+        exit 1
+    fi
+
+    exp_size=$(du -sb "$exp_dir" 2>/dev/null | awk '{print $1}' || echo "0")
     rm -rf "$exp_dir"
 
-    # If extraction measurement was 0, fall back to safe conservative bound (2.5x payload size)
-    if [ -z "$exp_size" ] || [ "$exp_size" -le 0 ]; then
-        local raw_sz
-        raw_sz=$(stat -c%s "$payload" 2>/dev/null || stat -f%z "$payload" 2>/dev/null || echo "0")
-        exp_size=$(( raw_sz * 5 / 2 ))
+    # Validate authentic uncompressed measurement (strictly positive numeric, no fallback guessing)
+    exp_size=$(echo "$exp_size" | tr -d '[:space:]')
+    if [ -z "$exp_size" ] || ! echo "$exp_size" | grep -qE '^[1-9][0-9]*$'; then
+        echo "CRITICAL BUILD ERROR: Failed to obtain valid positive byte count for $output_base payload: '$exp_size'!" >&2
+        exit 1
+    fi
+    if [ "$exp_size" -le 0 ]; then
+        echo "CRITICAL BUILD ERROR: Measured expanded size for $output_base is non-positive ($exp_size bytes)!" >&2
+        exit 1
     fi
 
     cp "$payload" "$STAGING_DIR/${output_base}.img"
@@ -453,6 +471,19 @@ extract_and_stage_apex "art" "art_apex" 1
 extract_and_stage_apex "i18n" "i18n_apex" 1
 extract_and_stage_apex "tzdata" "tzdata_apex" 1
 
+# Generate explicit partition-to-mountpoint mapping manifest
+echo "Generating explicit partition-to-mountpoint mapping manifest (PARTITION_MAP)..."
+cat > "$STAGING_DIR/PARTITION_MAP" << 'EOF'
+# OxygenOS 16 / ColorOS RAM Bringup Partition Map Manifest
+# Format: image_filename:target_mountpoint:nature
+system.erofs.img:/mnt/sysroot:mandatory
+system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory
+vendor.erofs.img:/mnt/sysroot/vendor:mandatory
+odm.erofs.img:/mnt/sysroot/odm:mandatory
+my_product.erofs.img:/mnt/sysroot/my_product:mandatory
+my_region.erofs.img:/mnt/sysroot/my_region:optional
+EOF
+
 # 8. Staging Verification & Pre-Publish Validation
 echo "Verifying staged images before atomic publication..."
 MANDATORY_OUTPUTS=(
@@ -465,6 +496,11 @@ MANDATORY_OUTPUTS=(
     "art_apex.img"
     "i18n_apex.img"
     "tzdata_apex.img"
+    "runtime_apex.expanded_size"
+    "art_apex.expanded_size"
+    "i18n_apex.expanded_size"
+    "tzdata_apex.expanded_size"
+    "PARTITION_MAP"
 )
 
 for out in "${MANDATORY_OUTPUTS[@]}"; do
@@ -476,7 +512,7 @@ done
 
 # Generate SHA256 checksums in staging directory
 echo "Generating and verifying SHA256SUMS in staging..."
-(cd "$STAGING_DIR" && sha256sum *.img *.fstype *.version *.expanded_size > SHA256SUMS)
+(cd "$STAGING_DIR" && sha256sum *.img *.fstype *.version *.expanded_size PARTITION_MAP > SHA256SUMS)
 (cd "$STAGING_DIR" && sha256sum -c SHA256SUMS >/dev/null 2>&1) || {
     echo "CRITICAL BUILD ERROR: Checksum validation failed in staging!" >&2
     exit 1

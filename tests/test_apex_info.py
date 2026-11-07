@@ -208,8 +208,73 @@ class TestApexInfoParser(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 extract_manifest_from_apex(temp_path)
             self.assertIn("'version' must be a positive integer", str(ctx.exception))
+            # Non-string versionName
+            with zipfile.ZipFile(temp_path, "w") as z:
+                z.writestr("apex_manifest.json", json.dumps({"name": "com.android.runtime", "version": 1, "versionName": 12345}))
+            with self.assertRaises(ValueError) as ctx:
+                extract_manifest_from_apex(temp_path)
+            self.assertIn("'versionName' must be a string", str(ctx.exception))
         finally:
             os.unlink(temp_path)
+
+    def test_multibyte_field_tag_and_unknown_fields(self):
+        # Build valid manifest and append an unknown tag with field number 20 (wire 2: length delimited)
+        data = bytearray(build_manifest_pb("com.android.runtime", 361501120, "16.0"))
+        # Tag 20: key = (20 << 3) | 2 = 162 = 0xA2. In varint: [0xA2, 0x01]
+        key = encode_varint((20 << 3) | 2)
+        payload = b"unknown_field_data"
+        data.extend(key)
+        data.extend(encode_varint(len(payload)))
+        data.extend(payload)
+
+        name, version, version_name = parse_manifest_pb(bytes(data))
+        self.assertEqual(name, "com.android.runtime")
+        self.assertEqual(version, 361501120)
+        self.assertEqual(version_name, "16.0")
+
+    def test_wrong_wire_types_for_known_fields(self):
+        # Tag 1 (name) with wire 0 (varint) instead of wire 2
+        data = bytearray([(1 << 3) | 0, 42])
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes(data))
+        self.assertIn("Wrong wire type", str(ctx.exception))
+
+        # Tag 2 (version) with wire 2 (length-delimited) instead of wire 0
+        data2 = bytearray([(2 << 3) | 2, 4, b"test"[0], b"test"[1], b"test"[2], b"test"[3]])
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes(data2))
+        self.assertIn("Wrong wire type", str(ctx.exception))
+
+        # Tag 3 (versionName) with wire 0 (varint) instead of wire 2
+        data3 = bytearray([(3 << 3) | 0, 10])
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes(data3))
+        self.assertIn("Wrong wire type", str(ctx.exception))
+
+    def test_duplicate_version_name_rejected(self):
+        data = bytearray(build_manifest_pb("com.android.runtime", 1, "1.0"))
+        # Add tag 3 again
+        vn_bytes = b"2.0"
+        data.append((3 << 3) | 2)
+        data.extend(encode_varint(len(vn_bytes)))
+        data.extend(vn_bytes)
+
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes(data))
+        self.assertIn("Duplicate critical field", str(ctx.exception))
+
+    def test_truncated_and_overlong_tag_varint(self):
+        # High bit set on tag byte but ends prematurely
+        data = bytes([0x80])
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(data)
+        self.assertIn("Truncated varint tag", str(ctx.exception))
+
+        # Overlong tag varint (> 10 bytes)
+        data_overlong = bytes([0x80] * 11 + [0x01])
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(data_overlong)
+        self.assertIn("Varint tag exceeds 10 bytes", str(ctx.exception))
 
     def test_malformed_nested_original_apex_rejected(self):
         with tempfile.NamedTemporaryFile(suffix=".apex", delete=False) as f:

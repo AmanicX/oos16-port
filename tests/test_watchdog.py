@@ -444,5 +444,26 @@ exit 0
         self.assertIn("Safety heartbeat lost", res.stderr)
         self.assertTrue(os.path.exists(self.reboot_log))
 
+    def test_invalid_and_boundary_configuration_values(self):
+        """Verify that malformed, negative, out-of-range, or zero configuration parameters are safely normalized."""
+        res = self.run_watchdog({
+            "WATCHDOG_STAGE2_TIMEOUT": "-50",
+            "WATCHDOG_HEALTH_TIMEOUT": "999999",
+            "WATCHDOG_SLEEP_INTERVAL": "0",
+            "WATCHDOG_MAX_TICKS": "1",
+        }, timeout_sec=3)
+        self.assertIn("[WATCHDOG WARN] Invalid WATCHDOG_STAGE2_TIMEOUT '-50'", res.stderr)
+        self.assertIn("[WATCHDOG WARN] WATCHDOG_HEALTH_TIMEOUT '999999' exceeds maximum", res.stderr)
+        self.assertIn("[WATCHDOG WARN] Zero WATCHDOG_SLEEP_INTERVAL '0' prohibited", res.stderr)
+
+    def test_malformed_sleep_interval_multiple_decimals(self):
+        """Verify multiple decimal points in sleep interval are rejected."""
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "1",
+            "WATCHDOG_SLEEP_INTERVAL": "1.2.3",
+            "WATCHDOG_MAX_TICKS": "1"
+        }, timeout_sec=2)
+        self.assertIn("multiple decimal points", res.stderr)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

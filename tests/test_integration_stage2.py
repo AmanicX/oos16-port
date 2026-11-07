@@ -293,6 +293,16 @@ sys.exit(0)
                 f.write("erofs\n")
             with open(os.path.join(img_dir, f"{apex}.version"), "w") as f:
                 f.write("1\n")
+            with open(os.path.join(img_dir, f"{apex}.expanded_size"), "w") as f:
+                f.write("20971520\n")
+        with open(os.path.join(img_dir, "PARTITION_MAP"), "w") as f:
+            f.write("system.erofs.img:/mnt/sysroot:mandatory\n")
+
+    def run_stage2_runner(self, images_dir, mock_adb):
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = images_dir
+        return subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
 
     def test_runner_compatibility_and_success(self):
         """
@@ -1158,16 +1168,16 @@ exit 1
             self.assertIn("/dev/binderfs/binder-control", os.popen("strings '" + loader_bin + "' | grep binder-control").read())
 
     def test_stage2_init_product_and_my_product_mount_selection(self):
-        """Verify scripts/stage2_init.sh distinguishes product and my_product explicitly."""
+        """Verify scripts/stage2_init.sh handles product vs my_product partition layout strictly."""
         stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
         with open(stage2_script) as f:
             content = f.read()
 
-        # Must NOT use directory existence check as proxy for image presence
-        self.assertNotIn("if [ -d /mnt/sysroot/my_product ]; then\n    MY_PROD_IMG=$(get_img \"my_product.img\")\n    [ -z \"$MY_PROD_IMG\" ] && MY_PROD_IMG=\"$PRODUCT_IMG\"", content)
-        # Must explicitly check for separate my_product.img
+        # Must check both images and detect duplicate SHA-256
+        self.assertIn('PROD_IMG=$(get_img "product.img")', content)
         self.assertIn('MY_PROD_IMG=$(get_img "my_product.img")', content)
-        self.assertIn('"$MY_PROD_IMG" != "$PRODUCT_IMG"', content)
+        self.assertIn('CRITICAL DUPLICATION ERROR', content)
+        self.assertIn('ACTIVE_PRODUCT_MOUNTS', content)
 
     def test_stage2_init_fail_closed_df_capacity(self):
         """Verify scripts/stage2_init.sh rejects empty/malformed df output fail-closed."""
@@ -1177,7 +1187,7 @@ exit 1
 
         self.assertIn("df -m /mnt returned empty output", content)
         self.assertIn("Failed to parse numeric free capacity from df output", content)
-        self.assertIn("REQUIRED_MNT_FREE_MB", content)
+        self.assertIn("REQUIRED_MNT_FREE_MB=576", content)
 
     def test_runner_apex_expanded_size_budget_accounting(self):
         """Verify run_stage2.sh accounts for expanded APEX payloads and breakdowns in output."""
@@ -1188,6 +1198,234 @@ exit 1
         self.assertIn("TOTAL_EXPANDED_APEX_MB", content)
         self.assertIn("Expanded APEX payloads (/apex tmpfs)", content)
         self.assertIn("expanded_size", content)
+
+    def test_runner_aborts_on_missing_or_invalid_expanded_size(self):
+        """Verify run_stage2.sh strictly enforces mandatory .expanded_size metadata."""
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+        os.remove(os.path.join(test_images, "runtime_apex.expanded_size"))
+
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Mandatory APEX metadata", res.stderr)
+        self.assertIn("runtime_apex.expanded_size is missing or 0 bytes", res.stderr)
+
+    def test_runner_aborts_on_duplicate_product_images(self):
+        """Verify run_stage2.sh rejects identical product.erofs.img and my_product.erofs.img content."""
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+        # Create identical product.erofs.img and my_product.erofs.img
+        identical_data = b"IDENTICAL_PRODUCT_IMAGE_CONTENT"
+        with open(os.path.join(test_images, "my_product.erofs.img"), "wb") as f:
+            f.write(identical_data)
+        with open(os.path.join(test_images, "product.erofs.img"), "wb") as f:
+            f.write(identical_data)
+
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Ambiguous duplicate image content!", res.stderr)
+
+    def test_runner_independent_product_and_my_product(self):
+        """Verify run_stage2.sh stages both when product and my_product are genuinely independent."""
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+        # Create distinct product.erofs.img and my_product.erofs.img
+        with open(os.path.join(test_images, "my_product.erofs.img"), "wb") as f:
+            f.write(b"MY_PRODUCT_CONTENT_UNIQUE")
+        with open(os.path.join(test_images, "product.erofs.img"), "wb") as f:
+            f.write(b"PRODUCT_CONTENT_UNIQUE")
+
+        mock_adb = self.create_mock_adb({
+            "ro_status": "1",
+            "auto_ack_on_trigger": True,
+            "boot_completed": "1"
+        })
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 0, f"Failed with: {res.stdout}\n{res.stderr}")
+        self.assertIn("Found independent product.erofs.img and my_product.erofs.img", res.stdout)
+        self.assertIn("Pushing product.erofs.img", res.stdout)
+        self.assertIn("Pushing my_product.erofs.img", res.stdout)
+
+    def run_stage2_ram_check_script(self, meminfo_content, mnt_free_mb, tmp_free_mb, apex_sizes, omit_meminfo=False):
+        """
+        Executes the actual stage2_init.sh RAM checking logic in an isolated subshell environment.
+        """
+        sub_dir = tempfile.mkdtemp(prefix="stage2_ram_check_")
+        try:
+            mnt_dir = os.path.join(sub_dir, "mnt")
+            tmp_dir = os.path.join(sub_dir, "tmp")
+            os.makedirs(mnt_dir, exist_ok=True)
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            meminfo_file = os.path.join(sub_dir, "meminfo")
+            if not omit_meminfo and meminfo_content is not None:
+                with open(meminfo_file, "w") as f:
+                    f.write(meminfo_content)
+
+            for mod, sz in apex_sizes.items():
+                if sz is not None:
+                    with open(os.path.join(mnt_dir, f"{mod}.expanded_size"), "w") as f:
+                        f.write(str(sz))
+
+            script = f"""
+fatal() {{
+    echo "[FATAL] $1" >&2
+    exit 42
+}}
+
+MNT_FREE_MB="{mnt_free_mb}"
+REQUIRED_MNT_FREE_MB=576
+if [ "$MNT_FREE_MB" -lt "$REQUIRED_MNT_FREE_MB" ]; then
+    fatal "/mnt has only ${{MNT_FREE_MB}}MB free; requires ${{REQUIRED_MNT_FREE_MB}}MB"
+fi
+
+TMP_FREE_MB="{tmp_free_mb}"
+if [ "$TMP_FREE_MB" -lt 64 ]; then
+    fatal "/tmp has only ${{TMP_FREE_MB}}MB free; requires 64MB"
+fi
+
+MEMINFO_PATH="{meminfo_file}"
+if [ ! -f "$MEMINFO_PATH" ] || [ ! -s "$MEMINFO_PATH" ]; then
+    fatal "/proc/meminfo is missing or empty"
+fi
+_DEV_MEMINFO=$(cat "$MEMINFO_PATH" 2>/dev/null || true)
+if [ -z "$_DEV_MEMINFO" ]; then
+    fatal "Unable to read /proc/meminfo"
+fi
+
+_DEV_MEM_TOTAL_KB=$(echo "$_DEV_MEMINFO" | awk '/MemTotal:/ {{print $2}}' | tr -d '[:space:]')
+case "$_DEV_MEM_TOTAL_KB" in
+    ''|*[!0-9]*)
+        fatal "Missing or non-numeric MemTotal" ;;
+esac
+if [ "$_DEV_MEM_TOTAL_KB" -gt 100000000 ]; then
+    fatal "MemTotal overflow"
+fi
+_DEV_MEM_TOTAL_MB=$((_DEV_MEM_TOTAL_KB / 1024))
+if [ "$_DEV_MEM_TOTAL_MB" -lt 6500 ]; then
+    fatal "MemTotal is ${{_DEV_MEM_TOTAL_MB}}MB (< 6500MB)"
+fi
+
+_DEV_MEM_AVAIL_KB=$(echo "$_DEV_MEMINFO" | awk '/MemAvailable:/ {{print $2}}' | tr -d '[:space:]')
+case "$_DEV_MEM_AVAIL_KB" in
+    ''|*[!0-9]*)
+        fatal "Missing or non-numeric MemAvailable" ;;
+esac
+if [ "$_DEV_MEM_AVAIL_KB" -gt "$_DEV_MEM_TOTAL_KB" ]; then
+    fatal "MemAvailable exceeds MemTotal"
+fi
+_DEV_MEM_AVAIL_MB=$((_DEV_MEM_AVAIL_KB / 1024))
+
+_TOTAL_EXP_APEX_BYTES=0
+for _mod in runtime_apex art_apex i18n_apex tzdata_apex; do
+    _exp_f="{mnt_dir}/${{_mod}}.expanded_size"
+    if [ ! -f "$_exp_f" ] || [ ! -s "$_exp_f" ]; then
+        fatal "Missing mandatory APEX metadata $_exp_f"
+    fi
+    _val=$(cat "$_exp_f" 2>/dev/null | tr -d '[:space:]')
+    case "$_val" in
+        ''|*[!0-9]*)
+            fatal "Malformed non-numeric APEX expanded size in $_exp_f: '$_val'" ;;
+    esac
+    if [ "$_val" -le 0 ] || [ "$_val" -gt 524288000 ]; then
+        fatal "APEX expanded size in $_exp_f out of range"
+    fi
+    _TOTAL_EXP_APEX_BYTES=$((_TOTAL_EXP_APEX_BYTES + _val))
+done
+_EXP_APEX_MB=$(( (_TOTAL_EXP_APEX_BYTES + 1048575) / 1048576 ))
+_FUTURE_RAM_REQ_MB=$((_EXP_APEX_MB + 1024 + 512 + 1536 + 256))
+
+if [ "$_DEV_MEM_AVAIL_MB" -lt "$_FUTURE_RAM_REQ_MB" ]; then
+    fatal "Insufficient device RAM! MemAvailable is ${{_DEV_MEM_AVAIL_MB}}MB, required ${{_FUTURE_RAM_REQ_MB}}MB"
+fi
+echo "SUCCESS"
+"""
+            return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        finally:
+            shutil.rmtree(sub_dir, ignore_errors=True)
+
+    def test_stage2_device_ram_check_missing_meminfo_fatal(self):
+        """Verify device-side RAM check halts fail-closed if /proc/meminfo is missing."""
+        default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
+        res = self.run_stage2_ram_check_script(None, 1000, 100, default_apex, omit_meminfo=True)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("/proc/meminfo is missing or empty", res.stderr)
+
+    def test_stage2_device_ram_check_missing_memavailable_fatal(self):
+        """Verify device-side RAM check halts fail-closed if MemAvailable is missing."""
+        mem_data = "MemTotal:        7628800 kB\nMemFree:          100000 kB\n"
+        default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
+        res = self.run_stage2_ram_check_script(mem_data, 1000, 100, default_apex)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("Missing or non-numeric MemAvailable", res.stderr)
+
+    def test_stage2_device_ram_check_insufficient_ram_fatal(self):
+        """Verify device-side RAM check halts fail-closed if MemAvailable is below future requirement."""
+        mem_data = "MemTotal:        7628800 kB\nMemFree:          100000 kB\nMemAvailable:    2000000 kB\n"
+        default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
+        res = self.run_stage2_ram_check_script(mem_data, 1000, 100, default_apex)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("Insufficient device RAM", res.stderr)
+
+    def test_stage2_device_ram_check_sufficient_ram_success(self):
+        """Verify device-side RAM check passes when MemAvailable satisfies future budget."""
+        mem_data = "MemTotal:        7628800 kB\nMemFree:         3500000 kB\nMemAvailable:    4500000 kB\n"
+        default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
+        res = self.run_stage2_ram_check_script(mem_data, 1000, 100, default_apex)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("SUCCESS", res.stdout)
+
+    def test_stage2_device_ram_check_mnt_insufficient_capacity_fatal(self):
+        """Verify device-side RAM check fails if /mnt has less than 576MB free."""
+        mem_data = "MemTotal:        7628800 kB\nMemFree:         3500000 kB\nMemAvailable:    4500000 kB\n"
+        default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
+        res = self.run_stage2_ram_check_script(mem_data, 500, 100, default_apex)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("/mnt has only 500MB free; requires 576MB", res.stderr)
+
+    def test_stage2_device_ram_check_missing_apex_metadata_fatal(self):
+        """Verify device-side RAM check fails if any mandatory APEX metadata is missing."""
+        mem_data = "MemTotal:        7628800 kB\nMemFree:         3500000 kB\nMemAvailable:    4500000 kB\n"
+        incomplete_apex = {"art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}  # runtime_apex missing
+        res = self.run_stage2_ram_check_script(mem_data, 1000, 100, incomplete_apex)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("Missing mandatory APEX metadata", res.stderr)
+
+    def test_stage2_device_duplicate_product_sha_rejected(self):
+        """Verify stage2_init.sh duplicate detection rejects identical content between product and my_product."""
+        sub_dir = tempfile.mkdtemp(prefix="stage2_dup_test_")
+        try:
+            mnt_dir = os.path.join(sub_dir, "mnt")
+            os.makedirs(mnt_dir, exist_ok=True)
+            with open(os.path.join(mnt_dir, "product.img"), "wb") as f:
+                f.write(b"IDENTICAL_CONTENT")
+            with open(os.path.join(mnt_dir, "my_product.img"), "wb") as f:
+                f.write(b"IDENTICAL_CONTENT")
+
+            script = f"""
+fatal() {{
+    echo "[FATAL] $1" >&2
+    exit 55
+}}
+
+PROD_IMG="{mnt_dir}/product.img"
+MY_PROD_IMG="{mnt_dir}/my_product.img"
+
+if [ -n "$PROD_IMG" ] && [ -n "$MY_PROD_IMG" ]; then
+    PROD_SHA=$(sha256sum "$PROD_IMG" | awk '{{print $1}}')
+    MY_PROD_SHA=$(sha256sum "$MY_PROD_IMG" | awk '{{print $1}}')
+    if [ -n "$PROD_SHA" ] && [ "$PROD_SHA" = "$MY_PROD_SHA" ]; then
+        fatal "CRITICAL DUPLICATION ERROR: $PROD_IMG and $MY_PROD_IMG have identical SHA-256 ($PROD_SHA)! Refusing duplicate mount."
+    fi
+fi
+"""
+            res = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 55)
+            self.assertIn("CRITICAL DUPLICATION ERROR", res.stderr)
+        finally:
+            shutil.rmtree(sub_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -43,10 +43,27 @@ def parse_manifest_pb(data: bytes):
     seen_tags = set()
 
     while idx < len(data):
-        tag_wire = data[idx]
-        idx += 1
-        tag = tag_wire >> 3
-        wire = tag_wire & 7
+        # Decode protobuf field tag key (varint: tag << 3 | wire)
+        key = 0
+        shift = 0
+        varint_bytes = 0
+        found_end = False
+        while idx < len(data):
+            b = data[idx]
+            idx += 1
+            varint_bytes += 1
+            key |= (b & 0x7F) << shift
+            shift += 7
+            if (b & 0x80) == 0:
+                found_end = True
+                break
+            if varint_bytes > 10:
+                raise ValueError("Varint tag exceeds 10 bytes (malformed)")
+        if not found_end:
+            raise ValueError("Truncated varint tag in protobuf data")
+
+        tag = key >> 3
+        wire = key & 7
 
         if tag == 0 or tag > 536870911:
             raise ValueError(f"Invalid protobuf tag {tag}")
@@ -54,6 +71,14 @@ def parse_manifest_pb(data: bytes):
         # Only standard proto3 wire types allowed: 0 (varint), 1 (64-bit), 2 (length-delimited), 5 (32-bit)
         if wire not in (0, 1, 2, 5):
             raise ValueError(f"Unsupported or malformed protobuf wire type {wire} for tag {tag}")
+
+        # Validate expected wire types for known manifest fields
+        if tag == 1 and wire != 2:
+            raise ValueError(f"Wrong wire type {wire} for package name tag {tag} (expected wire 2)")
+        if tag == 2 and wire != 0:
+            raise ValueError(f"Wrong wire type {wire} for version tag {tag} (expected wire 0)")
+        if tag == 3 and wire != 2:
+            raise ValueError(f"Wrong wire type {wire} for versionName tag {tag} (expected wire 2)")
 
         if wire == 0:  # varint
             val = 0
@@ -125,9 +150,13 @@ def parse_manifest_pb(data: bytes):
 
             elif tag == 3:  # versionName
                 try:
-                    version_name = chunk.decode("utf-8")
+                    decoded_version_name = chunk.decode("utf-8")
                 except UnicodeDecodeError as e:
                     raise ValueError(f"Malformed UTF-8 in versionName for tag {tag}: {e}")
+                if tag in seen_tags:
+                    raise ValueError(f"Conflicting duplicate or Duplicate critical field encountered: versionName (tag {tag})")
+                seen_tags.add(tag)
+                version_name = decoded_version_name
 
         elif wire == 1:  # 64-bit
             if idx + 8 > len(data):
@@ -170,8 +199,10 @@ def _validate_json_manifest(j_bytes: bytes):
         raise ValueError(f"JSON manifest 'version' must be a positive integer, got: {version}")
 
     version_name = j_data.get("versionName", "")
-    if not isinstance(version_name, str):
-        version_name = str(version_name)
+    if version_name is not None and not isinstance(version_name, str):
+        raise ValueError(f"JSON manifest 'versionName' must be a string, got: {type(version_name).__name__}")
+    if version_name is None:
+        version_name = ""
 
     validate_package_name(name)
     return name, version, version_name
