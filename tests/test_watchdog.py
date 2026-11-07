@@ -35,7 +35,11 @@ class TestRealWatchdogImplementation(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="watchdog_test_")
         self.heartbeat_file = os.path.join(self.test_dir, "watchdog_heartbeat")
+        self.device_heartbeat_file = os.path.join(self.test_dir, "stage2_heartbeat")
+        self.ack_file = os.path.join(self.test_dir, "stage1_ack")
+        self.done_file = os.path.join(self.test_dir, "stage2_done")
         self.cancel_file = os.path.join(self.test_dir, "watchdog_cancel")
+        self.state_file = os.path.join(self.test_dir, "watchdog_state")
         self.reboot_log = os.path.join(self.test_dir, "reboot_invocations.log")
 
         # Mock reboot executable that records all calls
@@ -47,6 +51,20 @@ exit 0
 """)
         os.chmod(self.mock_reboot, stat.S_IRWXU)
 
+        # Mock getprop executable
+        self.mock_getprop = os.path.join(self.test_dir, "mock_getprop")
+        with open(self.mock_getprop, "w") as f:
+            f.write("""#!/bin/sh
+if [ "$1" = "sys.boot_completed" ]; then
+    cat "$GETPROP_BOOT_STATUS_FILE" 2>/dev/null || echo "0"
+    exit 0
+fi
+echo ""
+exit 0
+""")
+        os.chmod(self.mock_getprop, stat.S_IRWXU)
+        self.boot_status_file = os.path.join(self.test_dir, "boot_status")
+
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
@@ -55,9 +73,17 @@ exit 0
         env = os.environ.copy()
         default_env = {
             "WATCHDOG_HEARTBEAT_FILE": self.heartbeat_file,
+            "WATCHDOG_DEVICE_HEARTBEAT_FILE": self.device_heartbeat_file,
+            "WATCHDOG_ACK_FILE": self.ack_file,
+            "WATCHDOG_DONE_FILE": self.done_file,
             "WATCHDOG_CANCEL_FILE": self.cancel_file,
+            "WATCHDOG_STATE_FILE": self.state_file,
             "REBOOT_BIN": self.mock_reboot,
+            "GETPROP_BIN": self.mock_getprop,
+            "GETPROP_BOOT_STATUS_FILE": self.boot_status_file,
             "WATCHDOG_TIMEOUT": "2",
+            "WATCHDOG_STAGE2_TIMEOUT": "4",
+            "WATCHDOG_HEALTH_TIMEOUT": "4",
             "WATCHDOG_SLEEP_INTERVAL": "0.02",
             "WATCHDOG_MAX_TICKS": "0"
         }
@@ -240,6 +266,99 @@ exit 0
         })
         self.assertEqual(res2.returncode, 0)
         self.assertIn("Non-positive WATCHDOG_TIMEOUT '0'. Falling back to safe default (60s)", res2.stderr)
+
+    def test_stage1_ack_transitions_to_stage2_running(self):
+        """Verify presence of stage1_ack transitions state to STAGE2_RUNNING and resets timer."""
+        with open(self.ack_file, "w") as f:
+            f.write("ack")
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "1",
+            "WATCHDOG_STAGE2_TIMEOUT": "5",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "3"
+        })
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Transitioned to STAGE2_RUNNING", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STAGE2_RUNNING")
+
+    def test_device_heartbeat_accepted_in_stage2(self):
+        """Verify device-side heartbeat in stage 2 resets timer without conflict."""
+        with open(self.ack_file, "w") as f:
+            f.write("ack")
+        with open(self.device_heartbeat_file, "w") as f:
+            f.write("device_ping")
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "1",
+            "WATCHDOG_STAGE2_TIMEOUT": "5",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "3"
+        })
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Heartbeat received during Stage-2 bringup", res.stderr)
+        self.assertFalse(os.path.exists(self.device_heartbeat_file))
+
+    def test_stage2_done_transitions_to_health_monitor(self):
+        """Verify stage2_done marker transitions state to HEALTH_MONITOR."""
+        with open(self.ack_file, "w") as f:
+            f.write("ack")
+        with open(self.done_file, "w") as f:
+            f.write("done")
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "1",
+            "WATCHDOG_STAGE2_TIMEOUT": "2",
+            "WATCHDOG_HEALTH_TIMEOUT": "5",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "4"
+        })
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Transitioned to HEALTH_MONITOR", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "HEALTH_MONITOR")
+
+    def test_health_monitor_detects_boot_completed(self):
+        """Verify health monitor exits cleanly with code 0 when sys.boot_completed=1."""
+        with open(self.ack_file, "w") as f:
+            f.write("ack")
+        with open(self.done_file, "w") as f:
+            f.write("done")
+        with open(self.boot_status_file, "w") as f:
+            f.write("1\n")
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "1",
+            "WATCHDOG_STAGE2_TIMEOUT": "2",
+            "WATCHDOG_HEALTH_TIMEOUT": "5",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "10"
+        })
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Android boot completed successfully (sys.boot_completed=1)", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "BOOT_COMPLETED")
+
+    def test_health_monitor_timeout_triggers_reboot(self):
+        """Verify timeout in health monitor triggers safe emergency reboot."""
+        with open(self.ack_file, "w") as f:
+            f.write("ack")
+        with open(self.done_file, "w") as f:
+            f.write("done")
+        with open(self.boot_status_file, "w") as f:
+            f.write("0\n")
+
+        res = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "2",
+            "WATCHDOG_STAGE2_TIMEOUT": "3",
+            "WATCHDOG_HEALTH_TIMEOUT": "1",
+            "WATCHDOG_SLEEP_INTERVAL": "0.02",
+            "WATCHDOG_MAX_TICKS": "0"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("State at failure: HEALTH_MONITOR", res.stderr)
+        self.assertTrue(os.path.exists(self.reboot_log))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -5,7 +5,8 @@
 [![Device](https://img.shields.io/badge/Device-OnePlus%207T%20(hotdogb)-blue.svg)](https://wiki.lineageos.org/devices/hotdogb/)
 [![SoC](https://img.shields.io/badge/SoC-Snapdragon%20855%2B%20(SM8150--AC)-orange.svg)](https://www.qualcomm.com/)
 [![Storage](https://img.shields.io/badge/Storage-100%25%20Read--Only%20RAM-red.svg)](#non-negotiable-safety-contract)
-[![Tests](https://img.shields.io/badge/Tests-64%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Tests](https://img.shields.io/badge/Tests-66%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Audit](https://img.shields.io/badge/Audit-31%2F31%20Passed-brightgreen.svg)](#7-verification-status--test-matrix)
 
 ---
 
@@ -63,12 +64,18 @@ oos16-port/
 │   ├── build_stage1.sh            # Builds Native Recovery RAM boot image (build/stage1.img)
 │   ├── build_stage2_erofs.sh      # Repacks EROFS partitions and extracts bootstrap APEXes
 │   ├── stage2_init.sh             # Phone-side Stage-2 orchestrator running in RAM
-│   └── watchdog.sh                # Modular Stage-1 watchdog supervisor script
-├── tools/safe/                    # Host-side safety wrappers and auditors
-│   ├── fastboot                   # Python safety wrapper blocking destructive commands
-│   ├── adb                        # Python safety wrapper logging and blocking flash writes
-│   ├── run_stage2.sh              # Host-side orchestrator pushing and executing Stage 2
-│   └── audit-no-writes.sh         # Static auditor verifying 0 write commands in images
+│   └── watchdog.sh                # Modular 4-state Stage-1 watchdog supervisor script
+├── src/                           # Native helper source code
+│   ├── binderfs_init.go           # Dynamic BinderFS allocation tool (Go, zero libc dependencies)
+│   ├── binderfs_init.c            # Dynamic BinderFS allocation tool (C fallback)
+│   └── Makefile                   # Builds static aarch64 & host test binaries
+├── tools/                         # Tooling and utilities
+│   ├── extract_apex_info.py       # APEX protobuf & JSON manifest metadata extractor
+│   └── safe/                      # Host-side safety wrappers and auditors
+│       ├── fastboot               # Python safety wrapper blocking destructive commands
+│       ├── adb                    # Python safety wrapper logging and blocking flash writes
+│       ├── run_stage2.sh          # Host-side orchestrator with RAM budget enforcement
+│       └── audit-no-writes.sh     # Static auditor verifying 0 write commands in images
 ├── tests/                         # Unit and integration test suite
 │   ├── test_safe_adb.py           # ADB safety proxy unit tests
 │   ├── test_safe_fastboot.py      # Fastboot safety proxy unit tests
@@ -143,7 +150,7 @@ OxygenOS 16 Android Init Second Stage (PID 1)
 ### Phone-Side Stage-2 Handover (`scripts/stage2_init.sh`):
 1. Re-verifies all physical block devices are read-only (`ro=1`) and live mounts have zero writable physical partitions.
 2. Sets up OverlayFS mount on `/mnt/sysroot` backed by volatile tmpfs upper layer.
-3. Loop-mounts all staged partition images into `/mnt/sysroot/{system,system_ext,vendor,odm,product,my_product,my_region}`.
+3. Loop-mounts all staged partition images into `/mnt/sysroot/{system,system_ext,vendor,odm,product,my_product,my_region}` using non-fatal `try_mount()` candidate evaluation.
 4. Populates and verifies Android 16 APEX bootstrap modules in canonical versioned structure:
    * Payload directories: `/mnt/sysroot/apex/${mod_name}@${version}`
    * Active symlinks: `/mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}`
@@ -153,8 +160,42 @@ OxygenOS 16 Android Init Second Stage (PID 1)
    * `com.android.tzdata@361157000` (Timezone data)
 5. Mounts ephemeral `/data` tmpfs (1024 MB in RAM) and binds `/dev`, `/dev/pts`, `/proc`, `/sys`.
 6. Performs display diagnostics: confirms DRM card0, KGSL 3D0, SurfaceFlinger binary, Composer HAL, and powers on AMOLED backlight.
-7. Disarms Stage-1 watchdog cleanly by creating regular file `/mnt/watchdog_cancel` only after all mounts succeed. (On any failure, `fatal()` halts without disarming, ensuring safety reboot to bootloader).
+7. Maintains active device-side heartbeat (`/mnt/stage2_heartbeat`) during bringup, and signals `/mnt/stage2_done` to transition watchdog into Android `HEALTH_MONITOR` state.
 8. Replaces process image via `exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage` (PID 1).
+
+### Dynamic BinderFS Device Allocation (`binderfs_init`):
+In fresh Linux BinderFS instances, mounting `none /dev/binderfs binder` creates only the control device `/dev/binderfs/binder-control`. IPC nodes (`binder`, `hwbinder`, `vndbinder`) do **not** appear automatically and must be allocated dynamically:
+* The native helper `src/binderfs_init` opens `/dev/binderfs/binder-control` and invokes `ioctl(ctl_fd, BINDER_CTL_ADD, &dev)` with `struct binderfs_device` for `binder`, `hwbinder`, and `vndbinder`.
+* On older kernels lacking dynamic BinderFS ioctls, it provides automatic fallback to legacy sysfs major:minor nodes (`/sys/class/misc/<name>/dev`).
+* Validates device nodes are character devices (`S_ISCHR`), checks `O_RDWR` read/write accessibility, creates symlinks in `/dev/`, and sets `0666` permissions.
+* Halts boot execution with a clear diagnostic message if required IPC nodes cannot be created.
+
+### Watchdog 4-State Lifecycle Protocol:
+The watchdog supervisor (`scripts/watchdog.sh`) implements a 4-state state machine guarding every phase of volatile execution:
+1. **`STAGE1_WAIT`** (Timeout: 60s): Monitors host heartbeats (`/mnt/watchdog_heartbeat`) while waiting for the Stage-1 supervisor to consume `/mnt/boot_now` and issue `/mnt/stage1_ack`.
+2. **`STAGE2_RUNNING`** (Timeout: 120s): Monitors Stage-2 bringup in RAM, accepting either device-side (`/mnt/stage2_heartbeat`) or host-side heartbeats until Stage-2 finishes and touches `/mnt/stage2_done`.
+3. **`HEALTH_MONITOR`** (Timeout: 180s): Monitors Android init bringup after `exec init second_stage`. Continuously polls Android property `sys.boot_completed=1` via `getprop`. Upon successful boot completion, logs `BOOT_COMPLETED` and exits cleanly (exit code 0). If boot fails to complete within 180s, triggers emergency reboot to bootloader.
+4. **`DISARMED`**: If manual cancellation is requested via regular file `/mnt/watchdog_cancel`, logs `DISARMED` and exits cleanly (exit code 0).
+
+### Volatile RAM Capacity & Peak-Memory Budgeting:
+Running an entire mobile operating system purely from RAM requires strict memory budgeting:
+* Target device: OnePlus 7T (`hotdogb`), 8 GB LPDDR4X physical RAM.
+* Staged partition images (`system`, `system_ext`, `vendor`, `odm`, `my_product`, APEXes): ~3,300 MB.
+* Memory reservations:
+  * Ephemeral `/data` tmpfs: 1,024 MB
+  * Volatile staging `/tmp` & OverlayFS upper layers: 512 MB
+  * Kernel, base drivers, display buffers & Android runtime headroom: 1,536 MB
+  * **Total Peak Budget**: ~6,372 MB ($\approx 6.4\text{ GB}$).
+* In `tools/safe/run_stage2.sh`, target `/proc/meminfo` is parsed for `MemTotal` and `MemAvailable`. The runner verifies `MemAvailable >= REQUIRED_RAM_MB` before initiating image transfer and halts closed immediately if memory is insufficient or cannot be read.
+
+### OnePlus 7T Display & Graphics Bringup Technical Analysis:
+* **Display Hardware**: OnePlus 7T (`hotdogb`) features a 6.55" 2400x1080 Fluid AMOLED display driven by Qualcomm Snapdragon 855 (SM8150) Mobile Display Subsystem (MDSS) and Display Processing Unit (DPU).
+* **Command Mode & Aftermarket Panels**: Common replacement AMOLED panels use Samsung display driver IC `dsi_samsung_s6e3fc2x01_cmd_display`. Injected vendor properties enforce fixed 60Hz mode (`default_fps=60`, `game_default_frame_rate_override=60`) to avoid display flicker or blank screens caused by 90Hz timing mismatches on replacement glass.
+* **Kernel & DRM Stack**:
+  * Adreno 640 GPU kernel driver: `/dev/kgsl-3d0`
+  * Qualcomm Snapdragon Display Engine (SDE) DRM compositor: `/dev/dri/card0`
+  * Backlight control: `/sys/class/backlight/panel0-backlight/brightness`
+* **Honest Scope Distinction**: The diagnostic checks in Stage 1 and Stage 2 confirm that the kernel has enumerated `/dev/dri/card0`, `/dev/kgsl-3d0`, and powered the backlight (`brightness = 200`). However, actual display rendering (SurfaceFlinger HWComposer vs GPU composition, frame delivery) requires live execution on physical silicon and is classified strictly under **Tier 6: PENDING LIVE TEST**.
 
 ---
 
@@ -220,8 +261,8 @@ To maintain rigorous engineering honesty, verification states are strictly parti
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (23/23)** | Passed on `build/loader.img` and `build/stage1.img` with zero mandatory unverified checks. |
-| **Tier 3: Host Tests Passed** | Automated Python & Shell unit/integration test suites | **PASSED (64/64)** | 100% pass across ADB proxy (8), Fastboot proxy (3), Watchdog protocol (10), and Stage-2 runner integration mocks (43). |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on `build/loader.img` and `build/stage1.img` with zero mandatory unverified checks. |
+| **Tier 3: Host Tests Passed** | Automated Python & Shell unit/integration test suites | **PASSED (66/66)** | 100% pass across ADB proxy (8), Fastboot proxy (3), Watchdog protocol (15), and Stage-2 runner integration mocks (40). |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all 10 Stage-2 images generated with valid SHA256SUMS. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |

@@ -113,12 +113,36 @@ if subcmd in ["shell", "exec-out"]:
             print("tmpfs on /mnt type tmpfs (rw,seclabel,relatime,size=6500M)")
             print("/dev/block/loop0 on /mnt/sysroot type erofs (ro,relatime)")
         sys.exit(0)
-        
+
+    if "cat /proc/meminfo" in shell_cmd or "/proc/meminfo" in shell_cmd:
+        fail_mem = "{behavior_config.get('fail_meminfo', '')}"
+        if fail_mem == "missing":
+            sys.exit(1)
+        elif fail_mem == "corrupt":
+            print("invalid_meminfo_output")
+            sys.exit(0)
+        elif fail_mem == "low":
+            print("MemTotal:        7628800 kB\\nMemFree:          100000 kB\\nMemAvailable:    1500000 kB")
+            sys.exit(0)
+        else:
+            print("MemTotal:        7628800 kB\\nMemFree:         6500000 kB\\nMemAvailable:    7100000 kB")
+        sys.exit(0)
+
     if "free -m" in shell_cmd:
         print("               total        used        free      shared     buffers")
         print("Mem:            7450        1200        6250           0          10")
         sys.exit(0)
-        
+
+    if "stage1_ack" in shell_cmd:
+        fail_ack = "{behavior_config.get('fail_ack', '')}"
+        if fail_ack == "transport_error":
+            sys.stderr.write("error: device offline\\n")
+            sys.exit(255)
+        elif fail_ack == "timeout":
+            sys.exit(1)
+        else:
+            sys.exit(0)
+
     if "test -f" in shell_cmd:
         target_path = shell_cmd.split()[-1]
         fail_verify = "{behavior_config.get('fail_verify', '')}"
@@ -858,6 +882,114 @@ exit 1
             "ro.vendor.display.default_fps=60",
         ]:
             self.assertIn(prop, erofs_content)
+
+    def test_runner_aborts_on_missing_meminfo(self):
+        """Verify runner fails closed if /proc/meminfo cannot be read from target."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_meminfo": "missing"})
+        test_images = os.path.join(self.test_dir, "mem_missing_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL SAFETY ERROR: Unable to read /proc/meminfo", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_insufficient_ram_budget(self):
+        """Verify runner aborts if available RAM is insufficient for peak memory budget."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_meminfo": "low"})
+        test_images = os.path.join(self.test_dir, "mem_low_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL MEMORY BUDGET VIOLATION", res.stderr + res.stdout)
+        self.assertIn("peak memory budget requires at least", res.stderr + res.stdout)
+
+    def test_runner_distinguishes_adb_transport_failure_from_ack(self):
+        """Verify runner does not mistake ADB transport errors for Stage-1 acknowledgement."""
+        mock_adb = self.create_mock_adb({"ro_status": "1", "fail_ack": "transport_error"})
+        test_images = os.path.join(self.test_dir, "ack_trans_images")
+        self.create_dummy_images(test_images)
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("ADB transport communication failure", res.stdout + res.stderr)
+        self.assertIn("CRITICAL ERROR: Stage-1 PID 1 supervisor did not acknowledge trigger", res.stderr)
+
+    def test_runner_aborts_on_invalid_apex_fstype(self):
+        """Verify runner aborts if APEX .fstype is not erofs or ext4."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "bad_fstype_images")
+        self.create_dummy_images(test_images)
+        with open(os.path.join(test_images, "runtime_apex.fstype"), "w") as f:
+            f.write("btrfs\n")
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Unsupported APEX filesystem 'btrfs'", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_invalid_apex_version(self):
+        """Verify runner aborts if APEX .version is non-positive or non-numeric."""
+        mock_adb = self.create_mock_adb({"ro_status": "1"})
+        test_images = os.path.join(self.test_dir, "bad_ver_images")
+        self.create_dummy_images(test_images)
+        with open(os.path.join(test_images, "runtime_apex.version"), "w") as f:
+            f.write("0\n")
+
+        env = os.environ.copy()
+        env["REAL_ADB_BIN"] = mock_adb
+        env["IMAGES_DIR"] = test_images
+
+        res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Invalid APEX version code '0'", res.stderr + res.stdout)
+
+    def test_stage2_init_try_mount_fallback(self):
+        """Verify scripts/stage2_init.sh defines try_mount and uses it for fallback."""
+        stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+        with open(stage2_script) as f:
+            content = f.read()
+
+        self.assertIn("try_mount()", content)
+        self.assertIn("if ! try_mount -t ext4", content)
+        self.assertIn("try_mount -t erofs", content)
+
+    def test_binderfs_init_execution_and_verification(self):
+        """Verify binderfs_init helper binary and its invocation in loader and native init."""
+        loader_init = os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk/init")
+        native_init = os.path.join(PROJECT_ROOT, "stage1/native_ramdisk/init")
+        loader_bin = os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk/system/bin/binderfs_init")
+        native_bin = os.path.join(PROJECT_ROOT, "stage1/native_ramdisk/system/bin/binderfs_init")
+
+        self.assertTrue(os.path.isfile(loader_bin))
+        self.assertTrue(os.path.isfile(native_bin))
+        self.assertTrue(os.access(loader_bin, os.X_OK))
+        self.assertTrue(os.access(native_bin, os.X_OK))
+
+        with open(loader_init) as f:
+            l_content = f.read()
+        with open(native_init) as f:
+            n_content = f.read()
+
+        for content in [l_content, n_content]:
+            self.assertIn("/system/bin/binderfs_init", content)
+            self.assertIn("CRITICAL: binderfs_init failed", content)
+            self.assertIn("/dev/binderfs/binder-control", os.popen("strings '" + loader_bin + "' | grep binder-control").read())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

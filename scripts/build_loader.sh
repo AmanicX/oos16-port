@@ -24,6 +24,10 @@ cp "$PROJECT_ROOT/scripts/stage2_init.sh" "$LOADER_RAMDISK/system/bin/stage2_ini
 chmod 0755 "$LOADER_RAMDISK/system/bin/stage2_init.sh"
 cp "$PROJECT_ROOT/scripts/watchdog.sh" "$LOADER_RAMDISK/system/bin/watchdog.sh"
 chmod 0755 "$LOADER_RAMDISK/system/bin/watchdog.sh"
+if [ -f "$PROJECT_ROOT/src/binderfs_init_arm64" ]; then
+    cp "$PROJECT_ROOT/src/binderfs_init_arm64" "$LOADER_RAMDISK/system/bin/binderfs_init"
+    chmod 0755 "$LOADER_RAMDISK/system/bin/binderfs_init"
+fi
 
 echo "2. Packaging Loader Ramdisk with mkbootfs..."
 "$OTATOOLS/mkbootfs" "$LOADER_RAMDISK" | lz4 -l -12 --favor-decSpeed > "$STAGE1_DIR/stage1_loader_ramdisk.cpio.lz4"

@@ -106,6 +106,10 @@ cp "$PROJECT_ROOT/scripts/stage2_init.sh" "$NATIVE_RAMDISK/system/bin/stage2_ini
 chmod 0755 "$NATIVE_RAMDISK/system/bin/stage2_init.sh"
 cp "$PROJECT_ROOT/scripts/watchdog.sh" "$NATIVE_RAMDISK/system/bin/watchdog.sh"
 chmod 0755 "$NATIVE_RAMDISK/system/bin/watchdog.sh"
+if [ -f "$PROJECT_ROOT/src/binderfs_init_arm64" ]; then
+    cp "$PROJECT_ROOT/src/binderfs_init_arm64" "$NATIVE_RAMDISK/system/bin/binderfs_init"
+    chmod 0755 "$NATIVE_RAMDISK/system/bin/binderfs_init"
+fi
 
 # 5. Packaging Native Stage-1 Ramdisk
 echo "3. Packaging Native Stage-1 Ramdisk with mkbootfs..."

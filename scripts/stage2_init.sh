@@ -35,6 +35,22 @@ mount_or_fail() {
     /system/bin/toybox mount "$@" || fatal "Failed mandatory mount: mount $*"
 }
 
+# Helper for non-fatal mount attempt (for multi-filesystem fallback)
+try_mount() {
+    echo "[STAGE2] Attempting mount: $*" > /dev/kmsg 2>/dev/null || true
+    /system/bin/toybox mount "$@" 2>/dev/null
+}
+
+# Background device-side heartbeat for Stage-2 watchdog monitoring
+(
+    while [ ! -f /mnt/stage2_done ] && [ ! -f /tmp/stage2_done ]; do
+        echo "heartbeat" > /mnt/stage2_heartbeat 2>/dev/null || true
+        /system/bin/toybox sleep 2 2>/dev/null || sleep 2
+    done
+) &
+STAGE2_HB_PID=$!
+trap 'kill -9 "$STAGE2_HB_PID" 2>/dev/null || true' EXIT
+
 # 1. Heartbeat check (Validates regular file, rejects symlinks and directories)
 if ([ -f /mnt/watchdog_heartbeat ] && [ ! -L /mnt/watchdog_heartbeat ]) || \
    ([ -f /tmp/watchdog_heartbeat ] && [ ! -L /tmp/watchdog_heartbeat ]); then
@@ -248,7 +264,12 @@ populate_apex() {
             fstype=$(cat "/tmp/${img_name%.img}.fstype" | tr -d '[:space:]')
         fi
         echo "[STAGE2] Staging $mod_name to $versioned_dir from image $img_path (fstype: $fstype)..." > /dev/kmsg
-        mount_or_fail -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"
+        if ! try_mount -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"; then
+            local alt_fstype="ext4"
+            [ "$fstype" = "ext4" ] && alt_fstype="erofs"
+            try_mount -t "$alt_fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}" || \
+                fatal "Failed to mount $mod_name payload image from $img_path (attempted $fstype and $alt_fstype)!"
+        fi
         /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy $mod_name payload!"
         /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
     else
@@ -272,16 +293,20 @@ populate_apex() {
             /system/bin/toybox mkdir -p "$unpack_tmp"
             if /system/bin/unzip -q "$donor_apex" "apex_payload.img" -d "$unpack_tmp" 2>/dev/null; then
                 local pimg="$unpack_tmp/apex_payload.img"
-                mount_or_fail -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" 2>/dev/null || \
-                mount_or_fail -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"
+                if ! try_mount -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"; then
+                    try_mount -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" || \
+                        fatal "Failed to mount unpacked $mod_name payload image (attempted ext4 and erofs)!"
+                fi
                 /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
                 /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
             elif /system/bin/unzip -q "$donor_apex" "original_apex" -d "$unpack_tmp" 2>/dev/null; then
                 local orig_apex="$unpack_tmp/original_apex"
                 if /system/bin/unzip -q "$orig_apex" "apex_payload.img" -d "$unpack_tmp/orig" 2>/dev/null; then
                     local pimg="$unpack_tmp/orig/apex_payload.img"
-                    mount_or_fail -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" 2>/dev/null || \
-                    mount_or_fail -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"
+                    if ! try_mount -t ext4 -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}"; then
+                        try_mount -t erofs -o ro,loop "$pimg" "/tmp/apex_stage_${mod_name}" || \
+                            fatal "Failed to mount unpacked $mod_name payload image (attempted ext4 and erofs)!"
+                    fi
                     /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy unpacked $mod_name payload!"
                     /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
                 fi
@@ -400,11 +425,19 @@ for target in $MANDATORY_MOUNTS; do
 done
 echo "[STAGE2] All mandatory filesystems verified in /proc/mounts." > /dev/kmsg
 
-# 13. Watchdog Handover & Cancellation
-echo "[STAGE2] Disarming Stage-1 watchdog supervisor before Android init handover..." > /dev/kmsg
-/system/bin/toybox rm -f /mnt/watchdog_cancel /tmp/watchdog_cancel 2>/dev/null || true
-echo "cancel" > /mnt/watchdog_cancel 2>/dev/null || true
-echo "cancel" > /tmp/watchdog_cancel 2>/dev/null || true
+# 13. Stage-2 Completion & Watchdog Handover
+echo "[STAGE2] Signaling Stage-2 bringup completion to watchdog (/mnt/stage2_done)..." > /dev/kmsg
+echo "done" > /mnt/stage2_done 2>/dev/null || true
+echo "done" > /tmp/stage2_done 2>/dev/null || true
+kill -9 "$STAGE2_HB_PID" 2>/dev/null || true
+
+# Optional explicit disarm override
+if [ "${DISARM_WATCHDOG:-0}" = "1" ]; then
+    echo "cancel" > /mnt/watchdog_cancel 2>/dev/null || true
+    echo "cancel" > /tmp/watchdog_cancel 2>/dev/null || true
+fi
+
+echo "[STAGE2] Handing over to Android init health monitor (watching sys.boot_completed=1)..." > /dev/kmsg
 
 # 14. Android Init Handover (PID 1 preserved via exec)
 echo "[STAGE2] ALL RAM FILESYSTEMS READY. EXECUTING ANDROID 16 INIT SECOND_STAGE AS PID 1..." > /dev/kmsg

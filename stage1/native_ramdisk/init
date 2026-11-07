@@ -38,14 +38,24 @@ fi
 /system/bin/toybox mkdir -p /dev/pts /dev/block /dev/socket /dev/usb-ffs /dev/usb-ffs/adb /dev/binderfs /dev/dri /dev/graphics /dev/input
 /system/bin/toybox mount -t devpts devpts /dev/pts
 
-# Mount binderfs and create binder device nodes
+# Mount binderfs and initialize dynamic Binder device nodes via binderfs_init
 if /system/bin/toybox mount -t binder binder /dev/binderfs -o stats=global 2>/dev/null || \
    /system/bin/toybox mount -t binder binder /dev/binderfs 2>/dev/null; then
+    log_kmsg "[LOADER-PID1] Binderfs mounted at /dev/binderfs."
+fi
+
+if [ -x /system/bin/binderfs_init ]; then
+    log_kmsg "[LOADER-PID1] Executing /system/bin/binderfs_init to allocate dynamic Binder devices..."
+    if ! /system/bin/binderfs_init; then
+        fatal_halt "CRITICAL: binderfs_init failed to allocate and verify required Binder IPC devices!"
+    fi
+else
+    # Fallback legacy dynamic symlink creator if helper binary is absent
     [ -e /dev/binderfs/binder ] && /system/bin/toybox ln -sf /dev/binderfs/binder /dev/binder
     [ -e /dev/binderfs/hwbinder ] && /system/bin/toybox ln -sf /dev/binderfs/hwbinder /dev/hwbinder
     [ -e /dev/binderfs/vndbinder ] && /system/bin/toybox ln -sf /dev/binderfs/vndbinder /dev/vndbinder
     /system/bin/toybox chmod 0666 /dev/binderfs/* /dev/binder /dev/hwbinder /dev/vndbinder 2>/dev/null || true
-    log_kmsg "[LOADER-PID1] Binderfs mounted and symlinks established."
+    log_kmsg "[LOADER-PID1] Binderfs fallback links established."
 fi
 
 # 2. Create Essential Device Nodes
@@ -139,7 +149,7 @@ fi
 if [ -c /dev/binder ] && [ -c /dev/hwbinder ] && [ -c /dev/vndbinder ]; then
     log_kmsg "[LOADER-PID1] Binder IPC devices verified: binder, hwbinder, vndbinder."
 else
-    log_kmsg "[LOADER-PID1 WARNING] Binder IPC device nodes incomplete!"
+    fatal_halt "CRITICAL SAFETY HALT: Binder IPC device nodes incomplete (/dev/binder, /dev/hwbinder, /dev/vndbinder required)!"
 fi
 
 # Screen backlight power-on for Samsung AMOLED DSI panel
@@ -291,8 +301,11 @@ while [ ! -f /mnt/boot_now ] && [ ! -f /tmp/boot_now ]; do
     /system/bin/toybox sleep 1
 done
 
-log_kmsg "[LOADER-PID1] Trigger received (/mnt/boot_now)! Handing over execution to Stage-2..."
+log_kmsg "[LOADER-PID1] Trigger received (/mnt/boot_now)! Publishing acknowledgement marker..."
 /system/bin/toybox rm -f /mnt/boot_now /tmp/boot_now 2>/dev/null || true
+echo "ack" > /mnt/stage1_ack 2>/dev/null || true
+echo "ack" > /tmp/stage1_ack 2>/dev/null || true
+log_kmsg "[LOADER-PID1] Stage-1 acknowledgement marker published (/mnt/stage1_ack). Handing over execution to Stage-2..."
 
 # 10. Transfer Execution to Stage-2 Android Bringup (PID 1 preserved)
 if [ -x /system/bin/stage2_init.sh ]; then

@@ -408,6 +408,96 @@ else
     audit_fail "Mount safety sequencing" "Physical storage lock verification ($FIRST_RO_CHECK) does not precede filesystem mounts ($FIRST_MOUNT)"
 fi
 
+# 9. Multi-Ramdisk Stage-1 /init Implementation Consistency (Loader & Native)
+MULTI_INIT_OK=1
+for init_path in "$PROJECT_ROOT/stage1/loader_ramdisk/init" "$PROJECT_ROOT/stage1/native_ramdisk/init"; do
+    if [ ! -f "$init_path" ] || \
+       ! grep -q "blockdev --setro" "$init_path" || \
+       ! grep -q "binderfs_init" "$init_path" || \
+       ! grep -q "stage1_ack" "$init_path" || \
+       ! grep -q "stage2_init.sh" "$init_path"; then
+        MULTI_INIT_OK=0
+        audit_fail "Stage-1 init consistency" "$init_path missing required write locks, binderfs_init, or handover logic"
+    fi
+done
+if [ "$MULTI_INIT_OK" -eq 1 ]; then
+    audit_pass "Both Stage-1 ramdisk architectures (loader & native) verified for write locks, binderfs_init, and handover"
+fi
+
+# 10. Embedded binderfs_init Binary Integrity & Invocation
+BINDERFS_BIN_OK=1
+for b_bin in "$PROJECT_ROOT/stage1/loader_ramdisk/system/bin/binderfs_init" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/binderfs_init"; do
+    if [ ! -x "$b_bin" ]; then
+        BINDERFS_BIN_OK=0
+        audit_fail "binderfs_init binary" "Helper binary $b_bin does not exist or is not executable"
+    fi
+done
+if [ "$BINDERFS_BIN_OK" -eq 1 ]; then
+    if cmp -s "$PROJECT_ROOT/stage1/loader_ramdisk/system/bin/binderfs_init" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/binderfs_init"; then
+        audit_pass "Embedded binderfs_init static binary verified and identical across both ramdisks"
+    else
+        audit_fail "binderfs_init mismatch" "binderfs_init binaries in loader and native ramdisks differ"
+    fi
+fi
+
+# 11. Embedded Scripts Equality Across Both Ramdisk Architectures
+EMBEDDED_SCRIPTS_OK=1
+if ! cmp -s "$PROJECT_ROOT/scripts/stage2_init.sh" "$PROJECT_ROOT/stage1/loader_ramdisk/system/bin/stage2_init.sh" || \
+   ! cmp -s "$PROJECT_ROOT/scripts/stage2_init.sh" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/stage2_init.sh"; then
+    EMBEDDED_SCRIPTS_OK=0
+    audit_fail "Embedded stage2_init mismatch" "stage2_init.sh in ramdisk does not match scripts/stage2_init.sh"
+fi
+if ! cmp -s "$PROJECT_ROOT/scripts/watchdog.sh" "$PROJECT_ROOT/stage1/loader_ramdisk/system/bin/watchdog.sh" || \
+   ! cmp -s "$PROJECT_ROOT/scripts/watchdog.sh" "$PROJECT_ROOT/stage1/native_ramdisk/system/bin/watchdog.sh"; then
+    EMBEDDED_SCRIPTS_OK=0
+    audit_fail "Embedded watchdog mismatch" "watchdog.sh in ramdisk does not match scripts/watchdog.sh"
+fi
+if [ "$EMBEDDED_SCRIPTS_OK" -eq 1 ]; then
+    audit_pass "All embedded stage2_init and watchdog scripts match repository sources exactly across both ramdisks"
+fi
+
+# 12. Watchdog State Lifecycle & Android Health Monitor
+WATCHDOG_STATES_OK=1
+for st in "STAGE1_WAIT" "STAGE2_RUNNING" "HEALTH_MONITOR" "DISARMED" "BOOT_COMPLETED"; do
+    if ! grep -q "$st" "$PROJECT_ROOT/scripts/watchdog.sh"; then
+        WATCHDOG_STATES_OK=0
+        audit_fail "Watchdog state lifecycle" "Missing state '$st' in scripts/watchdog.sh"
+    fi
+done
+if grep -q "sys.boot_completed" "$PROJECT_ROOT/scripts/watchdog.sh" && [ "$WATCHDOG_STATES_OK" -eq 1 ]; then
+    audit_pass "Watchdog state lifecycle (STAGE1_WAIT -> STAGE2_RUNNING -> HEALTH_MONITOR -> BOOT_COMPLETED) verified"
+fi
+
+# 13. APEX Metadata Enforcement & Non-Fatal Fallback Mounting
+APEX_AUDIT_OK=1
+if [ ! -x "$PROJECT_ROOT/tools/extract_apex_info.py" ]; then
+    APEX_AUDIT_OK=0
+    audit_fail "APEX tool" "tools/extract_apex_info.py is missing or not executable"
+fi
+if ! grep -q "tools/extract_apex_info.py" "$PROJECT_ROOT/scripts/build_stage2_erofs.sh"; then
+    APEX_AUDIT_OK=0
+    audit_fail "APEX version extraction" "scripts/build_stage2_erofs.sh does not invoke tools/extract_apex_info.py"
+fi
+if ! grep -q "try_mount()" "$PROJECT_ROOT/scripts/stage2_init.sh"; then
+    APEX_AUDIT_OK=0
+    audit_fail "APEX non-fatal fallback" "scripts/stage2_init.sh lacks try_mount() non-fatal helper"
+fi
+if ! grep -q 'APEX_FSTYPE' "$PROJECT_ROOT/tools/safe/run_stage2.sh" || ! grep -q 'APEX_VERSION' "$PROJECT_ROOT/tools/safe/run_stage2.sh"; then
+    APEX_AUDIT_OK=0
+    audit_fail "Runner APEX metadata validation" "tools/safe/run_stage2.sh does not strictly validate .fstype and .version"
+fi
+if [ "$APEX_AUDIT_OK" -eq 1 ]; then
+    audit_pass "APEX metadata extraction, strict validation, and non-fatal fallback mounting verified"
+fi
+
+# 14. Target Volatile Memory Capacity & Peak Budgeting
+if grep -q "MemAvailable:" "$PROJECT_ROOT/tools/safe/run_stage2.sh" && \
+   grep -q "REQUIRED_RAM_MB" "$PROJECT_ROOT/tools/safe/run_stage2.sh"; then
+    audit_pass "Volatile RAM capacity and peak-memory budget verification enforced in runner"
+else
+    audit_fail "RAM memory budget" "tools/safe/run_stage2.sh lacks MemAvailable verification or peak budget check"
+fi
+
 # 5. Summary & Disclaimer
 TOTAL_INSPECTED="${#INSPECTED_FILES[@]}"
 echo "==========================================================" | tee -a "$REPORT_FILE"

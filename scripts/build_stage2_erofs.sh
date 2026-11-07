@@ -398,57 +398,26 @@ extract_and_stage_apex() {
         fi
     fi
 
-    # Extract authentic APEX version code from manifest
-    local pkg_version="1"
-    pkg_version=$(python3 -c "
-import zipfile, sys, io
-try:
-    with zipfile.ZipFile('$target_pkg', 'r') as z:
-        pb_data = None
-        if 'apex_manifest.pb' in z.namelist():
-            pb_data = z.read('apex_manifest.pb')
-        elif 'original_apex' in z.namelist():
-            with zipfile.ZipFile(io.BytesIO(z.read('original_apex')), 'r') as oz:
-                if 'apex_manifest.pb' in oz.namelist():
-                    pb_data = oz.read('apex_manifest.pb')
-        if pb_data:
-            idx = 0
-            while idx < len(pb_data):
-                tag_wire = pb_data[idx]
-                tag = tag_wire >> 3
-                wire = tag_wire & 7
-                idx += 1
-                if wire == 0:
-                    val = 0
-                    shift = 0
-                    while idx < len(pb_data):
-                        b = pb_data[idx]
-                        idx += 1
-                        val |= (b & 0x7f) << shift
-                        shift += 7
-                        if (b & 0x80) == 0:
-                            break
-                    if tag == 2:
-                        print(val)
-                        sys.exit(0)
-                elif wire == 2:
-                    length = 0
-                    shift = 0
-                    while idx < len(pb_data):
-                        b = pb_data[idx]
-                        idx += 1
-                        length |= (b & 0x7f) << shift
-                        shift += 7
-                        if (b & 0x80) == 0:
-                            break
-                    idx += length
-                else:
-                    break
-except Exception:
-    pass
-print('1')
-" 2>/dev/null || echo "1")
-    [ -z "$pkg_version" ] && pkg_version="1"
+    # Validate supported filesystem type
+    if [ "$fstype" != "erofs" ] && [ "$fstype" != "ext4" ]; then
+        echo "CRITICAL BUILD ERROR: APEX payload filesystem '$fstype' is unsupported (must be erofs or ext4)!" >&2
+        exit 1
+    fi
+
+    # Extract authentic APEX version code from manifest without silent fallback
+    local expected_pkg="com.android.${apex_id}"
+    echo " -> Extracting and validating manifest metadata via tools/extract_apex_info.py..."
+    local pkg_version
+    if ! pkg_version=$(python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --expect-package "$expected_pkg" --version-only); then
+        echo "CRITICAL BUILD ERROR: APEX manifest extraction failed for $target_pkg ($expected_pkg)!" >&2
+        exit 1
+    fi
+
+    pkg_version=$(echo "$pkg_version" | tr -d '[:space:]')
+    if [ -z "$pkg_version" ] || ! echo "$pkg_version" | grep -qE '^[1-9][0-9]*$'; then
+        echo "CRITICAL BUILD ERROR: APEX version code for $target_pkg is invalid or non-numeric: '$pkg_version'!" >&2
+        exit 1
+    fi
 
     cp "$payload" "$STAGING_DIR/${output_base}.img"
     echo "$fstype" > "$STAGING_DIR/${output_base}.fstype"

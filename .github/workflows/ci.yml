@@ -1,0 +1,48 @@
+name: CI Safety & Unit Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Safety Audit & Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bash lz4 bsdextrautils
+
+      - name: Validate Shell & Init Scripts Syntax (bash -n)
+        run: |
+          echo "Checking syntax of all shell and init scripts..."
+          bash -n scripts/*.sh
+          bash -n tools/safe/*.sh
+          bash -n stage1/loader_ramdisk/init
+          bash -n stage1/native_ramdisk/init
+          bash -n stage1/native_ramdisk/system/bin/recovery
+          echo "All script syntax validated successfully."
+
+      - name: Run Python Unit & Integration Tests
+        run: |
+          python3 -m unittest discover -s tests -p "test_*.py"
+
+      - name: Run Pre-Boot Static Safety Auditor (native_ramdisk)
+        run: |
+          bash tools/safe/audit-no-writes.sh stage1/native_ramdisk
+
+      - name: Run Pre-Boot Static Safety Auditor (loader_ramdisk)
+        run: |
+          bash tools/safe/audit-no-writes.sh stage1/loader_ramdisk
