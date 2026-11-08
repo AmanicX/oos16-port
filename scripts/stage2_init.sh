@@ -24,7 +24,7 @@ fatal() {
     [ -w /dev/kmsg ] && echo "[STAGE2 FATAL] $1" > /dev/kmsg 2>/dev/null || true
     echo "[STAGE2 FATAL] $1" >&2
     [ -w /dev/kmsg ] && echo "[STAGE2 FATAL] System halted in safe RAM state. Safety watchdog will reboot to bootloader." > /dev/kmsg 2>/dev/null || true
-    if [ "${STAGE2_TEST_MODE:-0}" = "1" ]; then
+    if [ "${STAGE2_TEST_MODE:-0}" = "1" ] || [ "${STAGE2_FATAL_TEST_EXIT:-0}" = "1" ]; then
         exit 42
     fi
     while true; do
@@ -295,6 +295,107 @@ parse_and_validate_partition_map() {
     [ -w /dev/kmsg ] && echo "[STAGE2] Partition manifest $map_file strictly validated." > /dev/kmsg 2>/dev/null || true
 }
 
+# Helper to strictly verify block device node identity and fail-closed
+verify_block_node_identity() {
+    local check_node="$1"
+    local exp_maj="$2"
+    local exp_min="$3"
+    local dev_name="$4"
+    local checkpoint="${5:-unspecified}"
+
+    # 1. Device node existence
+    if [ ! -e "$check_node" ]; then
+        fatal "Physical block device node '$dev_name' missing or not a block device (does not exist) at checkpoint: $checkpoint!"
+    fi
+
+    # 2. Block special device enforcement (fail-closed in production)
+    if [ "${STAGE2_TEST_MODE:-0}" = "1" ]; then
+        if [ ! -b "$check_node" ] && [ ! -f "$check_node" ]; then
+            fatal "Physical block device node '$dev_name' is neither block special nor test mock file at checkpoint: $checkpoint!"
+        fi
+    else
+        if [ ! -b "$check_node" ]; then
+            fatal "Physical block device node '$dev_name' is NOT a block device at checkpoint: $checkpoint!"
+        fi
+    fi
+
+    # 3. Stat identity verification
+    # Required for real block-special devices, and for test mocks when explicitly verifying stat
+    local should_verify_stat=0
+    if [ -b "$check_node" ]; then
+        should_verify_stat=1
+    elif [ "${STAGE2_TEST_MODE:-0}" = "1" ]; then
+        if [ "${STAGE2_TEST_VERIFY_STAT:-0}" = "1" ] || [ -n "${STAT_RAW_OUTPUT+x}" ] || [ "${STAT_FAIL:-0}" = "1" ]; then
+            should_verify_stat=1
+        fi
+    fi
+
+    if [ "$should_verify_stat" -eq 1 ]; then
+        local stat_out=""
+        local stat_st=0
+        if [ -n "${STAT_BIN:-}" ] && [ -x "$STAT_BIN" ]; then
+            stat_out=$("$STAT_BIN" -L -c "%t:%T" "$check_node" 2>&1) || stat_st=$?
+        elif [ -x /system/bin/toybox ]; then
+            stat_out=$(/system/bin/toybox stat -L -c "%t:%T" "$check_node" 2>&1) || stat_st=$?
+        elif command -v stat >/dev/null 2>&1; then
+            stat_out=$(stat -L -c "%t:%T" "$check_node" 2>&1) || stat_st=$?
+        elif command -v toybox >/dev/null 2>&1; then
+            stat_out=$(toybox stat -L -c "%t:%T" "$check_node" 2>&1) || stat_st=$?
+        else
+            fatal "No stat binary available to verify block device node identity for '$dev_name' at checkpoint: $checkpoint!"
+        fi
+
+        if [ "$stat_st" -ne 0 ]; then
+            fatal "stat -L -c '%t:%T' failed on block node '$dev_name' with exit code $stat_st ($stat_out) at checkpoint: $checkpoint!"
+        fi
+
+        local clean_stat
+        clean_stat=$(echo "$stat_out" | tr -d '[:space:]')
+        if [ -z "$clean_stat" ]; then
+            fatal "Empty stat output for block node '$dev_name' at checkpoint: $checkpoint!"
+        fi
+
+        # Require exactly 2 fields separated by 1 colon
+        local num_colons
+        num_colons=$(echo "$clean_stat" | tr -cd ':' | wc -c)
+        if [ "$num_colons" -ne 1 ]; then
+            fatal "Malformed stat output '$clean_stat' for block node '$dev_name' at checkpoint: $checkpoint! (expected 2 colon-separated fields)"
+        fi
+
+        local hex_maj="${clean_stat%%:*}"
+        local hex_min="${clean_stat##*:}"
+        if [ -z "$hex_maj" ] || [ -z "$hex_min" ]; then
+            fatal "Malformed stat output '$clean_stat' for block node '$dev_name' at checkpoint: $checkpoint! (empty major or minor)"
+        fi
+
+        case "$hex_maj" in
+            ''|*[!0-9a-fA-F]*)
+                fatal "Non-hexadecimal major '$hex_maj' in stat output for '$dev_name' at checkpoint: $checkpoint!"
+                ;;
+        esac
+        case "$hex_min" in
+            ''|*[!0-9a-fA-F]*)
+                fatal "Non-hexadecimal minor '$hex_min' in stat output for '$dev_name' at checkpoint: $checkpoint!"
+                ;;
+        esac
+
+        # POSIX-compliant conversion of hexadecimal to decimal
+        local dec_maj dec_min
+        dec_maj=$(printf "%d" "0x$hex_maj" 2>/dev/null) || fatal "Failed to convert major '0x$hex_maj' to decimal for '$dev_name' at checkpoint: $checkpoint!"
+        dec_min=$(printf "%d" "0x$hex_min" 2>/dev/null) || fatal "Failed to convert minor '0x$hex_min' to decimal for '$dev_name' at checkpoint: $checkpoint!"
+
+        # Reject unexpected zero identity values (0:0 is invalid for physical storage devices)
+        if [ "$dec_maj" -eq 0 ] && [ "$dec_min" -eq 0 ]; then
+            fatal "Unexpected zero device identity (0:0) for physical block node '$dev_name' at checkpoint: $checkpoint!"
+        fi
+
+        # Compare resulting decimal values with expected major and minor
+        if [ "$dec_maj" != "$exp_maj" ] || [ "$dec_min" != "$exp_min" ]; then
+            fatal "Block node '$dev_name' major:minor ($dec_maj:$dec_min) does not match inventory and sysfs ($exp_maj:$exp_min) at checkpoint: $checkpoint!"
+        fi
+    fi
+}
+
 # Safe Atomic Storage Inventory Updater
 atomic_update_inventory() {
     local record="$1"
@@ -321,6 +422,21 @@ atomic_update_inventory() {
     if grep -q -F "$record" "$t_inv" 2>/dev/null || grep -q "^${dev_node}:" "$t_inv" 2>/dev/null; then
         fatal "Atomic update failed: record '$record' already exists in $t_inv at checkpoint $cp_tag!"
     fi
+
+    # Verify device node identity before staging
+    local r_dev r_maj r_min r_sdir
+    r_dev=$(echo "$record" | cut -d: -f1)
+    r_maj=$(echo "$record" | cut -d: -f2)
+    r_min=$(echo "$record" | cut -d: -f3)
+    r_sdir=$(echo "$record" | cut -d: -f4)
+    local r_node="$r_dev"
+    if [ -n "${DEV_BLOCK_DIR:-}" ]; then
+        local r_rel="${r_dev#/dev/block/}"
+        if [ "$r_rel" != "$r_dev" ]; then
+            r_node="${DEV_BLOCK_DIR:-/dev/block}/$r_rel"
+        fi
+    fi
+    verify_block_node_identity "$r_node" "$r_maj" "$r_min" "$r_dev" "$cp_tag"
 
     local m_target_dir="${MNT_DIR:-/mnt}"
     local t_target_dir="${TMP_DIR:-/tmp}"
@@ -444,16 +560,8 @@ revalidate_storage_inventory() {
             fatal "Physical device $dev major:minor mismatch ($cur_mm != $maj:$min) at checkpoint: $checkpoint!"
         fi
 
-        # 3. Verify block device node still exists
-        if [ "${STAGE2_TEST_MODE:-0}" = "1" ]; then
-            if [ ! -b "$check_dev" ] && [ ! -f "$check_dev" ]; then
-                fatal "Physical block device node $dev missing or not a block device at checkpoint: $checkpoint!"
-            fi
-        else
-            if [ ! -b "$check_dev" ]; then
-                fatal "Physical block device node $dev missing or not a block device at checkpoint: $checkpoint!"
-            fi
-        fi
+        # 3. Verify block device node existence and strict block-node identity
+        verify_block_node_identity "$check_dev" "$maj" "$min" "$dev" "$checkpoint"
 
         # 4. Verify blockdev read-only status is strictly 1
         local ro
@@ -504,6 +612,7 @@ revalidate_storage_inventory() {
                 else
                     [ -b "$check_disk_node" ] || fatal "Failed to create node for newly appearing device $dev_node!"
                 fi
+                verify_block_node_identity "$check_disk_node" "$n_maj" "$n_min" "$dev_node" "$checkpoint"
                 tb_run blockdev --setro "$check_disk_node" || fatal "Failed to lock newly appearing device $dev_node read-only!"
                 local n_ro
                 n_ro=$(tb_run blockdev --getro "$check_disk_node" 2>/dev/null || echo "0")
@@ -544,6 +653,7 @@ revalidate_storage_inventory() {
                     else
                         [ -b "$check_part_node" ] || fatal "Failed to create node for newly appearing partition $part_node!"
                     fi
+                    verify_block_node_identity "$check_part_node" "$p_maj" "$p_min" "$part_node" "$checkpoint"
                     tb_run blockdev --setro "$check_part_node" || fatal "Failed to lock newly appearing partition $part_node read-only!"
                     local p_ro
                     p_ro=$(tb_run blockdev --getro "$check_part_node" 2>/dev/null || echo "0")
@@ -579,19 +689,19 @@ revalidate_storage_inventory() {
 
 # CLI Dispatch for Test Isolation and Direct Subcommand Invocations
 if [ "${1:-}" = "--check-ram" ]; then
-    STAGE2_TEST_MODE=1
+    STAGE2_TEST_MODE="${STAGE2_TEST_MODE:-1}"
     validate_device_ram
     exit 0
 fi
 
 if [ "${1:-}" = "--parse-manifest" ]; then
-    STAGE2_TEST_MODE=1
+    STAGE2_TEST_MODE="${STAGE2_TEST_MODE:-1}"
     parse_and_validate_partition_map "${2:-${MNT_DIR:-/mnt}/PARTITION_MAP}"
     exit 0
 fi
 
 if [ "${1:-}" = "--revalidate-inventory" ]; then
-    STAGE2_TEST_MODE=1
+    STAGE2_TEST_MODE="${STAGE2_TEST_MODE:-1}"
     revalidate_storage_inventory "${2:-manual_check}"
     exit 0
 fi

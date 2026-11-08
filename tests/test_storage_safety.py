@@ -82,6 +82,48 @@ exit 0
 """)
         os.chmod(self.mock_blockdev, 0o755)
 
+        # Create mock stat
+        self.mock_stat = os.path.join(self.bin_dir, "stat")
+        with open(self.mock_stat, "w") as f:
+            f.write(f"""#!/bin/sh
+if [ "${{STAT_FAIL:-0}}" = "1" ]; then
+    echo "stat: cannot stat: I/O error" >&2
+    exit 1
+fi
+if [ -n "${{STAT_RAW_OUTPUT+x}}" ]; then
+    echo "${{STAT_RAW_OUTPUT}}"
+    exit 0
+fi
+node=""
+for arg in "$@"; do
+    case "$arg" in
+        -*|"%t:%T") ;;
+        *) node="$arg" ;;
+    esac
+done
+bname=$(basename "$node")
+dev_file="{self.sys_block}/$bname/dev"
+if [ ! -f "$dev_file" ]; then
+    for parent in "{self.sys_block}"/*; do
+        if [ -f "$parent/$bname/dev" ]; then
+            dev_file="$parent/$bname/dev"
+            break
+        fi
+    done
+fi
+if [ -f "$dev_file" ]; then
+    mm=$(cat "$dev_file" 2>/dev/null | tr -d '[:space:]')
+    maj="${{mm%%:*}}"
+    min="${{mm##*:}}"
+    hex_maj=$(printf "%x" "$maj" 2>/dev/null || echo "$maj")
+    hex_min=$(printf "%x" "$min" 2>/dev/null || echo "$min")
+    echo "$hex_maj:$hex_min"
+    exit 0
+fi
+echo "0:0"
+""")
+        os.chmod(self.mock_stat, 0o755)
+
         # Create mock toybox
         self.mock_toybox = os.path.join(self.bin_dir, "toybox")
         with open(self.mock_toybox, "w") as f:
@@ -100,6 +142,9 @@ elif [ "$1" = "mknod" ]; then
 elif [ "$1" = "mount" ]; then
     cat "{self.proc_mounts}"
     exit 0
+elif [ "$1" = "stat" ]; then
+    shift
+    exec "{self.mock_stat}" "$@"
 fi
 exec "$@"
 """)
@@ -421,6 +466,251 @@ class TestPhysicalStorageProtection(StorageSafetyTestBase):
         ]
         for cp in expected:
             self.assertIn(cp, res.stdout)
+
+    # --------------------------------------------------------------------------
+    # Stage-2 Block-Node Identity Verification Tests
+    # --------------------------------------------------------------------------
+    def test_stage2_block_node_identity_matching_passes(self):
+        """Verify matching block-node identity passes Stage-2 revalidation."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_identity_matching",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "8:0",
+            }
+        )
+        self.assertEqual(res.returncode, 0, f"Expected success but got: {res.stderr}\n{res.stdout}")
+        self.assertIn("Storage inventory revalidation PASSED", res.stdout)
+
+    def test_stage2_block_node_identity_hex_conversion_passes(self):
+        """Verify hexadecimal conversion (0x10 hex -> 16 decimal) passes verification."""
+        self._create_mock_disk("sda", 8, 16, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:16:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_hex_conversion",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "8:10",  # 0x10 == 16
+            }
+        )
+        self.assertEqual(res.returncode, 0, f"Expected success but got: {res.stderr}\n{res.stdout}")
+        self.assertIn("Storage inventory revalidation PASSED", res.stdout)
+
+    def test_stage2_block_node_identity_major_mismatch_fails_closed(self):
+        """Verify major mismatch in stat output triggers immediate fail-closed halt."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_major_mismatch",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "9:0",
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match inventory and sysfs", res.stderr)
+
+    def test_stage2_block_node_identity_minor_mismatch_fails_closed(self):
+        """Verify minor mismatch in stat output triggers immediate fail-closed halt."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_minor_mismatch",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "8:99",
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match inventory and sysfs", res.stderr)
+
+    def test_stage2_block_node_identity_malformed_stat_output_fails_closed(self):
+        """Verify malformed stat output (missing colon, extra colons, non-hex) fails closed."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        for malformed in ["invalid_output", "8:0:1", "g:0", "8:z"]:
+            with self.subTest(malformed=malformed):
+                res = self._run_revalidate(
+                    checkpoint="stage2_malformed_stat",
+                    extra_env={
+                        "STAGE2_TEST_VERIFY_STAT": "1",
+                        "STAT_RAW_OUTPUT": malformed,
+                    }
+                )
+                self.assertNotEqual(res.returncode, 0)
+                self.assertTrue(
+                    "Malformed stat output" in res.stderr or "Non-hexadecimal" in res.stderr,
+                    f"Unexpected stderr for '{malformed}': {res.stderr}"
+                )
+
+    def test_stage2_block_node_identity_empty_stat_output_fails_closed(self):
+        """Verify empty stat output triggers immediate fail-closed halt."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_empty_stat",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "",
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Empty stat output", res.stderr)
+
+    def test_stage2_block_node_identity_stat_nonzero_exit_fails_closed(self):
+        """Verify non-zero stat exit code triggers immediate fail-closed halt."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_stat_fail",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_FAIL": "1",
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("stat -L -c '%t:%T' failed on block node", res.stderr)
+
+    def test_stage2_block_node_identity_stat_unavailable_fails_closed(self):
+        """Verify absence of any stat binary triggers immediate fail-closed halt."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        no_stat_dir = os.path.join(self.test_dir, "no_stat_bin")
+        os.makedirs(no_stat_dir, exist_ok=True)
+        sh_path = shutil.which("sh") or "/bin/sh"
+        os.symlink(sh_path, os.path.join(no_stat_dir, "sh"))
+        for tool in ["rm", "mv", "cp", "cat", "echo", "grep", "tr", "cut", "sed", "wc", "basename", "dirname", "printf", "cmp", "blockdev"]:
+            tool_path = shutil.which(tool)
+            if tool_path:
+                os.symlink(tool_path, os.path.join(no_stat_dir, tool))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_stat_unavailable",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_BIN": "/nonexistent/stat_binary",
+                "PATH": no_stat_dir,
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("No stat binary available to verify block device node identity", res.stderr)
+
+    def test_stage2_block_node_identity_zero_identity_rejected_fails_closed(self):
+        """Verify unexpected zero device identity (0:0) is rejected fail-closed."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_zero_identity",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "0:0",
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Unexpected zero device identity (0:0)", res.stderr)
+
+    def test_stage2_newly_appearing_disk_identity_mismatch_fails_closed(self):
+        """Verify newly appearing disk with mismatched node identity fails closed."""
+        # Initial inventory has sda only
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        # Newly appearing disk sdb in sysfs
+        self._create_mock_disk("sdb", 8, 16, partition_count=0)
+
+        # Force stat to return mismatched identity 8:99
+        res = self._run_revalidate(
+            checkpoint="stage2_new_disk_mismatch",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "8:63",  # 0x63 == 99 decimal != 16
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match inventory and sysfs", res.stderr)
+
+    def test_stage2_newly_appearing_partition_identity_mismatch_fails_closed(self):
+        """Verify newly appearing partition with mismatched node identity fails closed."""
+        self._create_mock_disk("sda", 8, 0, partition_count=1)
+        # Inventory only has sda (sda1 is newly appearing)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        res = self._run_revalidate(
+            checkpoint="stage2_new_part_mismatch",
+            extra_env={
+                "STAGE2_TEST_VERIFY_STAT": "1",
+                "STAT_RAW_OUTPUT": "8:2",  # expected 8:1
+            }
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match inventory and sysfs", res.stderr)
+
+    def test_stage2_production_mode_rejects_regular_file_mock_fails_closed(self):
+        """Verify regular file mocks pass in test mode but fail closed in production mode."""
+        self._create_mock_disk("sda", 8, 0, partition_count=0)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        shutil.copyfile(inv_file, os.path.join(self.tmp_dir, "physical_storage_inventory"))
+
+        # Test mode = 1: regular file mock passes
+        res_test = self._run_revalidate(checkpoint="test_mode_check")
+        self.assertEqual(res_test.returncode, 0, f"Failed in test mode: {res_test.stderr}")
+
+        # Production mode (STAGE2_TEST_MODE = 0): regular file mock is rejected fail-closed
+        res_prod = self._run_revalidate(
+            checkpoint="prod_mode_check",
+            extra_env={
+                "STAGE2_TEST_MODE": "0",
+                "STAGE2_FATAL_TEST_EXIT": "1",
+            }
+        )
+        self.assertNotEqual(res_prod.returncode, 0)
+        self.assertIn("is NOT a block device", res_prod.stderr)
 
 
 class TestStage1StorageSafety(unittest.TestCase):

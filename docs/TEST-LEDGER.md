@@ -14,28 +14,28 @@
 | **H7** | Watchdog Unit & Synchronization Tests | `tests/test_watchdog.py` | 62 unit tests: numeric parsing, timeout bounds, fail-closed storage validation (missing, empty, unreadable, malformed inventory), blockdev ro=1, duplicate detection, newly appearing disk/partition discovery, mknod argument construction, emergency reboot trigger, two-copy inventory synchronization (/mnt & /tmp), atomic staging & publication, byte-identity verification, block-node identity verification via stat -L -c %t:%T, POSIX hex-to-decimal conversion, 0:0 rejection, fail-closed missing stat | 62/62 tests pass | **PASS** |
 | **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 72 integration tests: RAM accounting, 4-field PARTITION_MAP contract, runner storage parity enforcement, APEX staging, fail-closed SELinux checks | 72/72 tests pass | **PASS** |
 | **H9** | Safe ADB & Fastboot Tests | `tests/test_safe_*.py` | 11 tests: command interception, metacharacter protection, flash bans (8 ADB + 3 Fastboot) | 11/11 tests pass | **PASS** |
-| **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 27 tests: multi-disk sysfs discovery, duplicate detection, byte-identity verification, mount_and_verify_tmpfs extraction, capacity exhaustion, 6 checkpoint tracking | 27/27 tests pass | **PASS** |
+| **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 39 tests: multi-disk sysfs discovery, duplicate detection, byte-identity verification, strict block-node identity verification (`stat -L -c "%t:%T"` with hex-to-decimal conversion), mount_and_verify_tmpfs extraction, capacity exhaustion, 6 checkpoint tracking | 39/39 tests pass | **PASS** |
 | **H10b** | Loop & Block Device Safety Tests | `tests/test_storage_loop.py` | 9 tests: live kernel loop-device semantics (when privileged in CI/VM: 1 test), simulated block-special node construction, major/minor hex matching, blockdev --setro/--getro state machine, multi-partition revalidation, disappearing/corrupt device handling (8 simulated tests) | 9 verified (8 passed, 0 failed, 1 unprivileged skip locally; 9 passed in CI/VM) | **PASS** |
 | **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (34 checks per directory, 0 failures, 1 optional unverified cmdline) | 34/34 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Loader Audit | `build/loader.img` | SHA-256: `bee4a72f78d594675d1b62f48eab205786e155061ae6f06036c0078222fb2415` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
-| **H13** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `b85154195068e150e2589c50ea363936e88e5ebdf523f83ded27882ad3bc7fc2` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
+| **H12** | Packaged Loader Audit | `build/loader.img` | SHA-256: `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
+| **H13** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
 | **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`) | Strict SHA-256 and symbol match | **PASS** |
 
 ### Summary of Automated Test Suite
 
 - **Automated Python Tests**:
-  - Total: **207 tests**
-  - Passed: **206 tests** (207 in CI/VM environment)
+  - Total: **219 tests**
+  - Passed: **218 tests** (219 in CI/VM environment)
   - Failed: **0 tests**
   - Skipped: **1 test** (`TestLiveLoopBlockDeviceSafety.test_live_loop_device_setro_enforces_read_only`, skipped in unprivileged local user space; passes in CI/VM with loop capabilities)
   - Live loop-device tests: **1 test** (conditional on kernel loop driver / CAP_SYS_ADMIN)
-  - Simulated tests: **206 tests** (unconditional across all environments)
+  - Simulated tests: **218 tests** (unconditional across all environments)
 - **Automated Go Tests**:
   - Total: **15 tests**
   - Passed: **15 tests**
   - Failed: **0 tests**
   - Skipped: **0 tests**
-- **Total Automated Host Tests**: **222 tests** (221 passed, 0 failed, 1 skipped locally; 222 passed in CI/VM).
+- **Total Automated Host Tests**: **234 tests** (233 passed, 0 failed, 1 skipped locally; 234 passed in CI/VM).
 - **Pre-Boot Static Safety Auditor**:
   - Packaged boot images (`build/loader.img`, `build/stage1.img`): **36/36 checks passed**, 0 failed.
   - Ramdisks (`stage1/native_ramdisk`, `stage1/loader_ramdisk`): **34/34 checks passed**, 0 failed, 1 optional unverified cmdline.
