@@ -19,6 +19,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+          cache: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -123,8 +124,8 @@ jobs:
 
       - name: Run Python Unit & Integration Test Suites
         run: |
-          echo "Running full automated test suite..."
-          python3 -m unittest discover -s tests -p "test_*.py"
+          echo "Running full automated test suite with verbose diagnostics..."
+          python3 -m unittest discover -v -s tests -p "test_*.py"
 
       - name: Run Pre-Boot Static Safety Auditor (native_ramdisk)
         run: |

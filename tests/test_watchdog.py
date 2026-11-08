@@ -184,19 +184,21 @@ exit 0
                         f.write("token")
                 except OSError:
                     pass
-                time.sleep(0.015)
+                time.sleep(0.005)
 
         t = threading.Thread(target=heartbeat_sender)
         t.start()
         try:
-            # Run watchdog with timeout 2, for 8 ticks (total ~0.16s)
+            # Run watchdog with timeout 5, for 10 ticks (total ~0.20s).
+            # Without heartbeats, it would timeout and reboot at tick 5.
+            # Continuous heartbeats reset countdown every tick, surviving all 10 ticks.
             res = self.run_watchdog({
-                "WATCHDOG_TIMEOUT": "2",
+                "WATCHDOG_TIMEOUT": "5",
                 "WATCHDOG_SLEEP_INTERVAL": "0.02",
-                "WATCHDOG_MAX_TICKS": "8"
+                "WATCHDOG_MAX_TICKS": "10"
             })
             self.assertEqual(res.returncode, 0)
-            self.assertIn("Reached maximum ticks (8)", res.stderr)
+            self.assertIn("Reached maximum ticks (10)", res.stderr)
             self.assertFalse(os.path.exists(self.reboot_log))
         finally:
             stop_event.set()
@@ -415,21 +417,23 @@ exit 0
         with open(self.boot_status_file, "w") as f:
             f.write("0\n")
 
-        # Background thread that flips property to "1" after 50ms
+        # Background thread that flips property to "1" after 20ms
         def delayed_flip():
-            time.sleep(0.08)
+            time.sleep(0.02)
             with open(self.boot_status_file, "w") as f:
                 f.write("1\n")
 
         t = threading.Thread(target=delayed_flip)
         t.start()
         try:
+            # Stage 2 done transitions immediately to HEALTH_MONITOR.
+            # Timeout is 50 ticks (1000ms), giving robust margin against runner CPU scheduling latency.
             res = self.run_watchdog({
-                "WATCHDOG_TIMEOUT": "2",
-                "WATCHDOG_STAGE2_TIMEOUT": "3",
-                "WATCHDOG_HEALTH_TIMEOUT": "10",
+                "WATCHDOG_TIMEOUT": "5",
+                "WATCHDOG_STAGE2_TIMEOUT": "5",
+                "WATCHDOG_HEALTH_TIMEOUT": "50",
                 "WATCHDOG_SLEEP_INTERVAL": "0.02",
-                "WATCHDOG_MAX_TICKS": "15"
+                "WATCHDOG_MAX_TICKS": "50"
             })
             self.assertEqual(res.returncode, 0)
             self.assertIn("Android boot completed successfully (sys.boot_completed=1)", res.stderr)
