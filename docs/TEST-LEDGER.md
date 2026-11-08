@@ -17,19 +17,20 @@
 | **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 39 tests: multi-disk sysfs discovery, duplicate detection, byte-identity verification, strict block-node identity verification (`stat -L -c "%t:%T"` with hex-to-decimal conversion), mount_and_verify_tmpfs extraction, capacity exhaustion, 6 checkpoint tracking | 39/39 tests pass | **PASS** |
 | **H10b** | Loop & Block Device Safety Tests | `tests/test_storage_loop.py` | 14 total test methods: 9 simulated block-device semantics tests (unconditional) + 5 live kernel loop-device integration tests (exercising production `scripts/stage2_init.sh` `verify_block_node_identity` with real `stat -L -c "%t:%T"` against disposable Linux loop devices when privileged in CI/VM) | 9 tests executed locally (9 passed, 0 failed, 1 class-level unprivileged skip); all executed in CI/VM | **PASS** |
 | **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (34 checks per directory, 0 failures, 1 optional unverified cmdline). Unconditionally validated both locally and in CI | 34/34 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Loader Audit | `build/loader.img` | Rebuilt SHA-256: `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` (built 2026-11-09 01:49:46 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **PASS** |
-| **H13** | Packaged Stage1 Audit | `build/stage1.img` | Rebuilt SHA-256: `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` (built 2026-11-09 01:49:58 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **PASS** |
-| **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`). Verified strictly locally; explicitly logged as skipped in CI checkout via `.gitignore` | Strict SHA-256 and symbol match locally, Skipped in CI checkout | **PASS** |
+| **H12** | Packaged Loader Audit | `build/loader.img` | Rebuilt SHA-256: `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` (built 2026-11-09 01:49:46 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **LOCAL PASS / CI SKIPPED** |
+| **H13** | Packaged Stage1 Audit | `build/stage1.img` | Rebuilt SHA-256: `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` (built 2026-11-09 01:49:58 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **LOCAL PASS / CI SKIPPED** |
+| **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`). Verified strictly locally; explicitly logged as skipped in CI checkout via `.gitignore` | Strict SHA-256 and symbol match locally, Skipped in CI checkout | **LOCAL PASS / CI SKIPPED** |
 
 ### Summary of Automated Test Suite
 
 - **Total Defined Test Methods in Codebase**: **239** (224 Python test methods across 9 classes in 7 files + 15 Go test functions).
-- **Actual Latest CI Environment Execution (GitHub Actions Run #19 / Run #18)**:
+- **Actual Latest CI Environment Execution (GitHub Actions Run #20, ID 42530682479; historical: Run #19, #18)**:
   - Python tests executed: **224 tests ran, 224 passed, 0 failed, 0 errors, 0 skipped**.
-  - Live loop-device tests: **All 5 live loop-device integration tests executed and passed** in the privileged CI container environment.
+  - Live loop-device tests: **All 5 live loop-device integration tests executed and passed** in the privileged CI container environment (including `test_live_loop_stage2_verify_block_node_identity`).
   - Go tests executed: **15 passed, 0 failed**.
   - **Actual combined CI result**: **239 passed (100% of defined tests executed and passed)**.
-  - Static safety audits: Ramdisks pass 34/34 checks each. Packaged boot-image and kernel asset checks are explicitly skipped (`SKIPPED`) in CI because binary assets are excluded from Git checkout per `.gitignore`.
+  - Static safety audits: Native and loader ramdisk directories pass 34/34 checks each.
+  - Skipped CI checks: Kernel assets (`stage1/kernel_src/`) and packaged boot-image audits (`build/loader.img`, `build/stage1.img`) were skipped because these files were absent from the checkout per `.gitignore`. Do not describe skipped checks as passed.
 - **Actual Local Environment Execution (Developer Workstation)**:
   - Python tests executed: **219 tests ran, 219 passed, 0 failed, 0 errors**.
   - Live loop-device tests: **1 test suite class skipped** (`TestLiveLoopBlockDeviceSafety`, containing 5 live loop test methods) because local loop-device capabilities were unavailable (`CAN_LOOP: False`).
@@ -42,8 +43,8 @@
   - When loop capabilities are absent (unprivileged host): **219 Python + 15 Go = 234 passed, 1 class skipped** (5 live loop tests skipped).
 - **Pre-Boot Static Safety Auditor**:
   - Local packaged boot images (`build/loader.img`, `build/stage1.img`): **36/36 checks passed**, 0 failed.
-  - Ramdisks (`stage1/native_ramdisk`, `stage1/loader_ramdisk`): **34/34 checks passed**, 0 failed, 1 optional unverified cmdline.
-  - CI checkout status: Ramdisk audits pass (34/34), while kernel assets and packaged boot-image audits are explicitly logged as skipped (`SKIPPED`) because binary artifacts are excluded from git checkout per `.gitignore`.
+  - Ramdisks (`stage1/native_ramdisk`, `stage1/loader_ramdisk`): **34/34 checks passed**, 0 failed, 1 optional unverified cmdline (both locally and in CI).
+  - CI checkout status: Ramdisk audits pass (34/34), while kernel assets and packaged boot-image audits were skipped because the files were absent from the checkout per `.gitignore`.
 - **Physical Device Verification Status**:
   - Status: **PRE-BOOT VERIFICATION IN PROGRESS — HARDWARE BOOT NOT APPROVED.** (All T0–T7 physical stages strictly pending live fastboot execution; physical storage safety remains subject to live device-level verification).
 
