@@ -24,7 +24,7 @@
 ### Summary of Automated Test Suite
 
 - **Total Defined Test Methods in Codebase**: **239** (224 Python test methods across 9 classes in 7 files + 15 Go test functions).
-- **Actual Latest CI Environment Execution (GitHub Actions Run #20, ID 42530682479; historical: Run #19, #18)**:
+- **CI Environment Verification (Run #20, ID `42530682479` established recorded baseline; Run #21, ID `42532420525` validated documentation commit; historical: Run #19, #18)**:
   - Python tests executed: **224 tests ran, 224 passed, 0 failed, 0 errors, 0 skipped**.
   - Live loop-device tests: **All 5 live loop-device integration tests executed and passed** in the privileged CI container environment (including `test_live_loop_stage2_verify_block_node_identity`).
   - Go tests executed: **15 passed, 0 failed**.
