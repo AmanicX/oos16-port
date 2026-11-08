@@ -40,7 +40,7 @@ Every file, partition image, and tool used in this project is documented with it
 
 | File / Component | Version / Build | Source / Site | Purpose in Port |
 | :--- | :--- | :--- | :--- |
-| **`ota_full-LE2113_16.0.10.500.zip`** | Android 16 (`BP4A.251205.006`) | Official OnePlus / OPPO OTA Update Servers for OnePlus 9 Pro (`martinit`) | **Donor OS**: Provides OxygenOS 16 system framework, `system`, `system_ext`, `my_product`, and bootstrap APEX packages. |
+| **`ota_full-LE2113_16.0.10.500.zip`** | Android 16 (`BP2A.250605.015`, Display: `LE2113_16.0.10.500(EX01)`, SDK 36) | Official OnePlus / OPPO OTA Update Servers for OnePlus 9 (`lemonade` / `OnePlus9_EEA`, Model `LE2113`) | **Donor OS**: Provides OxygenOS 16 system framework, `system`, `system_ext`, `my_product`, and bootstrap APEX packages. |
 | **`lineage-23.2-20261009-nightly-hotdogb-signed.zip`** | Android 16 / SDK 36 | Official LineageOS for OnePlus 7T (`hotdogb`) | **Base Hardware HALs**: Provides Snapdragon 855 (SM8150) graphics, display, sensor, audio, and camera HALs matching Android 16. |
 | **`crDroid 12.x / LineageOS Recovery`** | Kernel 4.14.357-perf+ (`4.14.357-perf-gcd3073fb68f1`) | crDroid Android / LineageOS hotdogb releases | **Stage-1 Kernel & Ramdisk**: Provides the recovery kernel, DTB, DTBO, and initial USB ADB endpoint. |
 | **`external/coloros_port`** | Branch `COS16/OOS16` | [GitHub: toraidl/coloros_port](https://github.com/toraidl/coloros_port) | **Porting Utilities**: Provides `mkfs.erofs`, `fsck.erofs`, and Android boot image tools. |

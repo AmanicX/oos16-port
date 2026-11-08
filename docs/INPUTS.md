@@ -7,19 +7,19 @@ This document records the exact provenance, sources, versions, and checksums of 
 
 ## 1. Active Donor ROM (OxygenOS 16 / Android 16)
 
-The active donor operating system package used in this port is the official OxygenOS 16 release for the **OnePlus 9 Pro (`LE2113`)**:
+The active donor operating system package used in this port is the official OxygenOS 16 release for the **OnePlus 9 (`LE2113` / `lemonade`)**:
 
 | Field | Detail |
 | :--- | :--- |
 | **Package Filename** | `ota_full-LE2113_16.0.10.500.zip` |
-| **Target Device / Architecture** | OnePlus 9 Pro (`martinit` / `LE2113`, Snapdragon 888 / SM8350, ARM64-v8a) |
+| **Donor Device / Architecture** | OnePlus 9 (`lemonade` / `OnePlus9_EEA`, Model `LE2113`, Snapdragon 888 / SM8350, ARM64-v8a) |
 | **Android Version** | Android 16 (`Baklava` / SDK 36) |
-| **Build ID / Fingerprint** | `LE2113_16.0.10.500(EX01)` / `BP4A.251205.006` |
+| **Build ID / Fingerprint** | `BP2A.250605.015` / `LE2113_16.0.10.500(EX01)` (`OnePlus/OnePlus9_EEA/OnePlus9:16/BP2A.250605.015/1785498910198:user/release-keys`) |
 | **Official Download Source** | Official OnePlus / OPPO OTA Update Delivery Servers |
-| **Extracted Partitions** | `system`, `system_ext`, `my_product`, `my_region`, `com.android.runtime.apex` |
+| **Extracted Partitions** | `system`, `system_ext`, `my_product`, `my_region`, `com.android.runtime.apex`, bootstrap APEXes |
 | **Rationale** | Provides modern OxygenOS 16 system framework, ColorOS/OOS SystemUI, notification panel, and core user-facing features on Android 16 Baklava. |
 
-*Note on Prior Evaluations*: Earlier feasibility notes evaluated OnePlus 8T (`KB2003`) as a candidate donor; however, OnePlus 9 Pro (`LE2113_16.0.10.500`) was selected and finalized as the active working donor because it provided complete Android 16 Baklava images with matching SDK 36 interfaces.
+*Note on Prior Evaluations*: Earlier feasibility notes evaluated OnePlus 8T (`KB2003`) as a candidate donor; however, OnePlus 9 (`LE2113_16.0.10.500`, European variant `OnePlus9_EEA`) was selected and finalized as the active working donor because it provided complete Android 16 Baklava images with matching SDK 36 interfaces. Note: `LE2113` is OnePlus 9 standard (Snapdragon 888, codename `lemonade`), whereas OnePlus 9 Pro models are `LE2123`/`LE2121`/`LE2125` (`lemonadep`). The recipient target device is the OnePlus 7T HD1901 (`hotdogb`, Snapdragon 855+ / SM8150-AC).
 
 ---
 

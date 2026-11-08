@@ -6,17 +6,17 @@
 |---|---|---|---|---|---|
 | **H0** | Script Syntax | 14 shell & init scripts | `bash -n` per script (runner, watchdog, stage2_init, ramdisk inits) | 14/14 scripts valid | **PASS** |
 | **H1** | Invariant Scan | Repository codebase | Static scan for forbidden `fastboot flash/erase/format`, `mkfs.ext4 /dev/block` | Zero violations detected | **PASS** |
-| **H2** | Go Helper Unit Tests | `src/binderfs_init.go` | 9 Go tests: mkdev, 20-bit minor, rollback ownership, safeSymlink, idempotency | 9/9 Go tests pass | **PASS** |
+| **H2** | Go Helper Unit Tests | `src/binderfs_init.go` | 11 Go tests: mkdev Linux dev_t encoding, atomic replacement, rollback ownership, safeSymlink, idempotency | 11/11 Go tests pass | **PASS** |
 | **H3** | ARM64 Compilation | `src/binderfs_init_arm64` | Cross-compiled static ELF 64-bit ARM aarch64 with stripped symbols | Verified static ELF aarch64 | **PASS** |
 | **H4** | C Reference Test | `src/binderfs_init.c` | Strict gcc compilation (-Wall -Wextra -Werror -pedantic) | Clean compilation | **PASS** |
 | **H5** | Embedded Consistency | Ramdisk binaries & scripts | `cmp -s` across `loader_ramdisk`, `native_ramdisk`, and source files | All embedded files byte-identical | **PASS** |
 | **H6** | APEX Metadata Tests | `tests/test_apex_info.py` | 18 unit tests: varint tags, wire types, duplicate fields, ZIP limits | 18/18 tests pass | **PASS** |
-| **H7** | Watchdog Unit Tests | `tests/test_watchdog.py` | 21 unit tests: timeouts, ADB disconnect, prop fail, config bounds | 21/21 tests pass | **PASS** |
-| **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 59 integration tests: RAM accounting, product mapping, APEX staging | 59/59 tests pass | **PASS** |
+| **H7** | Watchdog Unit Tests | `tests/test_watchdog.py` | 22 unit tests: numeric parsing, timeout arithmetic bounds, ADB disconnect, prop fail, config bounds | 22/22 tests pass | **PASS** |
+| **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 63 integration tests: RAM accounting, manifest parsing, product mapping, APEX staging | 63/63 tests pass | **PASS** |
 | **H9** | Safe ADB & Fastboot Tests | `tests/test_safe_*.py` | 11 tests: command interception, metacharacter protection, flash bans (8 ADB + 3 Fastboot) | 11/11 tests pass | **PASS** |
 | **H10** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets | 29/29 Passed, 0 Failed | **PASS** |
-| **H11** | Packaged Loader Audit | `build/loader.img` | SHA-256: `a467af4ac8ebd5b0aa04f77ff6b36e67bea6cd34b073dc244f311a69cd00709e` | 31/31 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `6f055cf9de0445bdca5afc2a7e5ea332adbdf1d988e1bb18282a12ab6bd8a1c8` | 31/31 Passed, 0 Failed | **PASS** |
+| **H11** | Packaged Loader Audit | `build/loader.img` | SHA-256: `1af9f4ff2cba9741016d4edc6b2e3a7bb5845280f1559015a67f24098a16d477` | 31/31 Passed, 0 Failed | **PASS** |
+| **H12** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `59bc9eb73034f9056f21d7c6313c5d3b2066dbc123468b1403e65aa7bac78dba` | 31/31 Passed, 0 Failed | **PASS** |
 
 ## 2. Physical Device Bring-Up Stages (OnePlus 7T Hardware)
 

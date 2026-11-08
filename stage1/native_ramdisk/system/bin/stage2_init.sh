@@ -3,43 +3,291 @@
 # stage2_init.sh - Stage-2 Android 16 Bringup in RAM on OnePlus 7T (HD1901)
 # Target: OnePlus 7T HD1901 (hotdogb), Snapdragon 855+ / SM8150, Adreno 640.
 # 100% Volatile RAM resident, Zero Physical Storage Writes.
-# Handles strict OverlayFS root, mandatory partition verification,
-# canonical AOSP APEX versioned directories & active symlinks, display
+# Handles strict OverlayFS root, manifest-driven partition verification,
+# canonical AOSP APEX versioned directories & active bind mounts, display
 # diagnostics for 60Hz AMOLED panel, watchdog handover, and single PID 1 handover.
 # ==============================================================================
 
 set -e
 
 # Disable kernel printk ratelimiting so no init diagnostic lines are suppressed
-echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null || true
+[ -w /proc/sys/kernel/printk_ratelimit ] && echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null || true
 
-echo "=== STAGE-2 RAM BRINGUP STARTING ===" > /dev/kmsg
-
-# Tactile feedback: haptic vibration pulse
-echo 300 > /sys/class/leds/vibrator/duration 2>/dev/null || true
-echo 1 > /sys/class/leds/vibrator/activate 2>/dev/null || true
+# Helper for logging messages to kmsg and stdout
+log_msg() {
+    [ -w /dev/kmsg ] && echo "$1" > /dev/kmsg 2>/dev/null || true
+    echo "$1"
+}
 
 # Helper for fatal errors - logs to kmsg and halts safely without disarming watchdog
 fatal() {
-    echo "[STAGE2 FATAL] $1" > /dev/kmsg
+    [ -w /dev/kmsg ] && echo "[STAGE2 FATAL] $1" > /dev/kmsg 2>/dev/null || true
     echo "[STAGE2 FATAL] $1" >&2
-    echo "[STAGE2 FATAL] System halted in safe RAM state. Safety watchdog will reboot to bootloader." > /dev/kmsg
+    [ -w /dev/kmsg ] && echo "[STAGE2 FATAL] System halted in safe RAM state. Safety watchdog will reboot to bootloader." > /dev/kmsg 2>/dev/null || true
+    if [ "${STAGE2_TEST_MODE:-0}" = "1" ]; then
+        exit 42
+    fi
     while true; do
-        /system/bin/toybox sleep 60
+        /system/bin/toybox sleep 60 2>/dev/null || sleep 60
     done
+}
+
+# Resolve command wrappers with host fallbacks for test isolation
+TOYBOX_CMD="/system/bin/toybox"
+if [ ! -x "$TOYBOX_CMD" ]; then
+    TOYBOX_CMD="toybox"
+    if ! command -v toybox >/dev/null 2>&1; then
+        TOYBOX_CMD=""
+    fi
+fi
+
+tb_run() {
+    if [ -n "$TOYBOX_CMD" ]; then
+        "$TOYBOX_CMD" "$@"
+    else
+        "$@"
+    fi
 }
 
 # Helper to execute and verify mount
 mount_or_fail() {
-    echo "[STAGE2] Mounting: $*" > /dev/kmsg
-    /system/bin/toybox mount "$@" || fatal "Failed mandatory mount: mount $*"
+    echo "[STAGE2] Mounting: $*" > /dev/kmsg 2>/dev/null || true
+    tb_run mount "$@" || fatal "Failed mandatory mount: mount $*"
 }
 
 # Helper for non-fatal mount attempt (for multi-filesystem fallback)
 try_mount() {
     echo "[STAGE2] Attempting mount: $*" > /dev/kmsg 2>/dev/null || true
-    /system/bin/toybox mount "$@" 2>/dev/null
+    tb_run mount "$@" 2>/dev/null
 }
+
+# Resolve image paths preferring /mnt/ over /tmp/
+get_img() {
+    local name="$1"
+    local mnt_p="${MNT_DIR:-/mnt}/$name"
+    local tmp_p="${TMP_DIR:-/tmp}/$name"
+    if [ -f "$mnt_p" ] && [ -s "$mnt_p" ]; then
+        echo "$mnt_p"
+    elif [ -f "$tmp_p" ] && [ -s "$tmp_p" ]; then
+        echo "$tmp_p"
+    else
+        echo ""
+    fi
+}
+
+# Device RAM and Capacity Validation (Reusable function)
+validate_device_ram() {
+    local mnt_path="${MNT_DIR:-/mnt}"
+    local tmp_path="${TMP_DIR:-/tmp}"
+    local meminfo_path="${MEMINFO_FILE:-/proc/meminfo}"
+
+    # 1. Verify /mnt capacity
+    REQUIRED_MNT_FREE_MB=576
+    local mnt_df_out
+    mnt_df_out=$(tb_run df -m "$mnt_path" 2>/dev/null || true)
+    if [ -z "$mnt_df_out" ]; then
+        fatal "Device-side RAM check: df -m /mnt returned empty output. Cannot verify tmpfs capacity. Halting."
+    fi
+    local mnt_free_mb
+    mnt_free_mb=$(echo "$mnt_df_out" | awk 'NR>1 {print $4}' | tr -d '[:space:]')
+    case "$mnt_free_mb" in
+        ''|*[!0-9]*)
+            fatal "Device-side RAM check: Failed to parse numeric free capacity from df output ('$mnt_df_out'). Halting." ;;
+    esac
+    if [ "$mnt_free_mb" -lt "$REQUIRED_MNT_FREE_MB" ]; then
+        fatal "Device-side RAM check: /mnt has only ${mnt_free_mb}MB free; bringup requires at least ${REQUIRED_MNT_FREE_MB}MB for OverlayFS upper/work headroom. Halting."
+    fi
+    log_msg "[STAGE2] Device-side /mnt tmpfs check passed: /mnt has ${mnt_free_mb}MB free (required: ${REQUIRED_MNT_FREE_MB}MB)."
+
+    # 2. Verify /tmp capacity
+    local tmp_df_out
+    tmp_df_out=$(tb_run df -m "$tmp_path" 2>/dev/null || true)
+    if [ -z "$tmp_df_out" ]; then
+        fatal "Device-side RAM check: df -m $tmp_path returned empty output. Halting."
+    fi
+    local tmp_free_mb
+    tmp_free_mb=$(echo "$tmp_df_out" | awk 'NR>1 {print $4}' | tr -d '[:space:]')
+    case "$tmp_free_mb" in
+        ''|*[!0-9]*)
+            fatal "Device-side RAM check: Failed to parse numeric free capacity from df $tmp_path ('$tmp_df_out'). Halting." ;;
+    esac
+    if [ "$tmp_free_mb" -lt 64 ]; then
+        fatal "Device-side RAM check: $tmp_path has only ${tmp_free_mb}MB free; staging requires at least 64MB. Halting."
+    fi
+    log_msg "[STAGE2] Device-side $tmp_path tmpfs check passed: has ${tmp_free_mb}MB free."
+
+    # 3. Verify /proc/meminfo
+    if [ ! -f "$meminfo_path" ] || [ ! -s "$meminfo_path" ]; then
+        fatal "Device-side RAM check: $meminfo_path is missing or empty! Failing closed to protect hardware."
+    fi
+    local dev_meminfo
+    dev_meminfo=$(cat "$meminfo_path" 2>/dev/null || true)
+    if [ -z "$dev_meminfo" ]; then
+        fatal "Device-side RAM check: Unable to read $meminfo_path! Failing closed."
+    fi
+
+    local dev_mem_total_kb
+    dev_mem_total_kb=$(echo "$dev_meminfo" | awk '/MemTotal:/ {print $2}' | tr -d '[:space:]')
+    case "$dev_mem_total_kb" in
+        ''|*[!0-9]*)
+            fatal "Device-side RAM check: Missing or non-numeric MemTotal in $meminfo_path ('$dev_mem_total_kb'). Halting." ;;
+    esac
+    if [ "$dev_mem_total_kb" -gt 100000000 ]; then
+        fatal "Device-side RAM check: MemTotal value overflow: $dev_mem_total_kb kB. Halting."
+    fi
+    local dev_mem_total_mb=$((dev_mem_total_kb / 1024))
+    if [ "$dev_mem_total_mb" -lt 6500 ]; then
+        fatal "Device-side RAM check: MemTotal is ${dev_mem_total_mb}MB (< 6500MB). Target OnePlus 7T requires 8 GB RAM! Halting."
+    fi
+
+    local dev_mem_avail_kb
+    dev_mem_avail_kb=$(echo "$dev_meminfo" | awk '/MemAvailable:/ {print $2}' | tr -d '[:space:]')
+    case "$dev_mem_avail_kb" in
+        ''|*[!0-9]*)
+            fatal "Device-side RAM check: Missing or non-numeric MemAvailable in $meminfo_path ('$dev_mem_avail_kb'). Halting." ;;
+    esac
+    if [ "$dev_mem_avail_kb" -gt "$dev_mem_total_kb" ]; then
+        fatal "Device-side RAM check: MemAvailable ($dev_mem_avail_kb kB) exceeds MemTotal ($dev_mem_total_kb kB). Halting."
+    fi
+    local dev_mem_avail_mb=$((dev_mem_avail_kb / 1024))
+
+    # 4. Measure authentic expanded sizes for APEX modules
+    local total_exp_apex_bytes=0
+    for mod in runtime_apex art_apex i18n_apex tzdata_apex; do
+        local exp_f="$mnt_path/${mod}.expanded_size"
+        [ -f "$exp_f" ] || exp_f="$tmp_path/${mod}.expanded_size"
+        if [ ! -f "$exp_f" ] || [ ! -s "$exp_f" ]; then
+            fatal "Device-side RAM check: Missing mandatory APEX metadata $exp_f! Halting."
+        fi
+        local val
+        val=$(cat "$exp_f" 2>/dev/null | tr -d '[:space:]')
+        case "$val" in
+            ''|*[!0-9]*)
+                fatal "Device-side RAM check: Malformed non-numeric APEX expanded size in $exp_f: '$val'. Halting." ;;
+        esac
+        if [ "$val" -le 0 ] || [ "$val" -gt 524288000 ]; then
+            fatal "Device-side RAM check: APEX expanded size in $exp_f out of range: $val bytes. Halting."
+        fi
+        total_exp_apex_bytes=$((total_exp_apex_bytes + val))
+    done
+    local exp_apex_mb=$(( (total_exp_apex_bytes + 1048575) / 1048576 ))
+
+    # 5. Future RAM allocations model:
+    # Staged images in /mnt are already counted by kernel VM.
+    # Future allocations:
+    # - Expanded APEX tmpfs:           exp_apex_mb
+    # - Ephemeral /data tmpfs:         1024 MB
+    # - OverlayFS upper/work on tmpfs: 512 MB
+    # - Kernel, GPU, display runtime:  1536 MB
+    # - Safety headroom:               256 MB
+    local future_ram_req_mb=$((exp_apex_mb + 1024 + 512 + 1536 + 256))
+
+    if [ "$dev_mem_avail_mb" -lt "$future_ram_req_mb" ]; then
+        fatal "Device-side RAM check: Insufficient device RAM! MemAvailable is ${dev_mem_avail_mb}MB, but future bringup allocations require ${future_ram_req_mb}MB (APEX: ${exp_apex_mb}MB, /data: 1024MB, overlay: 512MB, runtime: 1536MB, buffer: 256MB). Halting."
+    fi
+    log_msg "[STAGE2] Device-side total RAM verified: ${dev_mem_avail_mb}MB available >= ${future_ram_req_mb}MB future required."
+}
+
+# Manifest Parser and Strict Validator
+parse_and_validate_partition_map() {
+    local map_file="$1"
+    if [ ! -f "$map_file" ] || [ ! -s "$map_file" ]; then
+        fatal "Mandatory partition map manifest $map_file not found or 0 bytes! Cannot determine partition layout."
+    fi
+
+    # Explicit Allowlist of Target Mountpoints
+    local ALLOWLIST=" /mnt/sysroot /mnt/sysroot/system_ext /mnt/sysroot/vendor /mnt/sysroot/odm /mnt/sysroot/product /mnt/sysroot/my_product /mnt/sysroot/my_region "
+
+    local SEEN_TARGETS=""
+    local SEEN_IMAGES=""
+    local HAS_SYSROOT=0
+    local HAS_SYSTEM_EXT=0
+    local HAS_VENDOR=0
+    local HAS_ODM=0
+    local HAS_PRODUCT=0
+    local HAS_MY_PRODUCT=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Trim leading/trailing whitespace
+        local trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        # Skip empty lines and comment lines
+        case "$trimmed" in
+            ''|\#*) continue ;;
+        esac
+
+        local img=$(echo "$trimmed" | cut -d: -f1 | tr -d '[:space:]')
+        local target=$(echo "$trimmed" | cut -d: -f2 | tr -d '[:space:]')
+        local nature=$(echo "$trimmed" | cut -d: -f3 | tr -d '[:space:]')
+        local sha=$(echo "$trimmed" | cut -d: -f4 | tr -d '[:space:]')
+
+        if [ -z "$img" ] || [ -z "$target" ] || [ -z "$nature" ]; then
+            fatal "Malformed manifest entry in $map_file: '$line' (expected image:target:nature[:sha256])"
+        fi
+
+        # Validate target against allowlist
+        case "$ALLOWLIST" in
+            *" $target "*) ;;
+            *) fatal "Target mountpoint '$target' in $map_file is NOT in the allowed mountpoints list! Halting." ;;
+        esac
+
+        # Validate nature
+        if [ "$nature" != "mandatory" ] && [ "$nature" != "optional" ]; then
+            fatal "Invalid partition nature '$nature' in manifest entry '$line' (must be 'mandatory' or 'optional')"
+        fi
+
+        # Check duplicate target mountpoints
+        case " $SEEN_TARGETS " in
+            *" $target "*) fatal "Conflicting manifest: Target mountpoint '$target' mapped multiple times!" ;;
+        esac
+        SEEN_TARGETS="$SEEN_TARGETS $target"
+
+        # Check duplicate images
+        case " $SEEN_IMAGES " in
+            *" $img "*) fatal "Conflicting manifest: Image filename '$img' mapped multiple times!" ;;
+        esac
+        SEEN_IMAGES="$SEEN_IMAGES $img"
+
+        case "$target" in
+            /mnt/sysroot) HAS_SYSROOT=1 ;;
+            /mnt/sysroot/system_ext) HAS_SYSTEM_EXT=1 ;;
+            /mnt/sysroot/vendor) HAS_VENDOR=1 ;;
+            /mnt/sysroot/odm) HAS_ODM=1 ;;
+            /mnt/sysroot/product) HAS_PRODUCT=1 ;;
+            /mnt/sysroot/my_product) HAS_MY_PRODUCT=1 ;;
+        esac
+    done < "$map_file"
+
+    # Enforce mandatory partition presence in manifest
+    [ "$HAS_SYSROOT" -eq 1 ] || fatal "Mandatory manifest mapping for base system (/mnt/sysroot) missing from $map_file!"
+    [ "$HAS_SYSTEM_EXT" -eq 1 ] || fatal "Mandatory manifest mapping for /mnt/sysroot/system_ext missing from $map_file!"
+    [ "$HAS_VENDOR" -eq 1 ] || fatal "Mandatory manifest mapping for /mnt/sysroot/vendor missing from $map_file!"
+    [ "$HAS_ODM" -eq 1 ] || fatal "Mandatory manifest mapping for /mnt/sysroot/odm missing from $map_file!"
+    if [ "$HAS_PRODUCT" -eq 0 ] && [ "$HAS_MY_PRODUCT" -eq 0 ]; then
+        fatal "Neither /mnt/sysroot/product nor /mnt/sysroot/my_product mapped in $map_file! At least one product partition is required."
+    fi
+
+    echo "[STAGE2] Partition manifest $map_file strictly validated."
+    [ -w /dev/kmsg ] && echo "[STAGE2] Partition manifest $map_file strictly validated." > /dev/kmsg 2>/dev/null || true
+}
+
+# CLI Dispatch for Test Isolation and Direct Subcommand Invocations
+if [ "${1:-}" = "--check-ram" ]; then
+    STAGE2_TEST_MODE=1
+    validate_device_ram
+    exit 0
+fi
+
+if [ "${1:-}" = "--parse-manifest" ]; then
+    STAGE2_TEST_MODE=1
+    parse_and_validate_partition_map "${2:-${MNT_DIR:-/mnt}/PARTITION_MAP}"
+    exit 0
+fi
+
+echo "=== STAGE-2 RAM BRINGUP STARTING ===" > /dev/kmsg 2>/dev/null || true
+
+# Tactile feedback: haptic vibration pulse
+echo 300 > /sys/class/leds/vibrator/duration 2>/dev/null || true
+echo 1 > /sys/class/leds/vibrator/activate 2>/dev/null || true
 
 # Background device-side heartbeat for Stage-2 watchdog monitoring
 (
@@ -115,107 +363,8 @@ if ! /system/bin/toybox mount | grep -q " /tmp type tmpfs "; then
     fi
 fi
 
-# Strict fail-closed /mnt capacity check: reject missing, malformed, or empty df output.
-# Images are ALREADY present in /mnt tmpfs. We only require free space for future
-# allocations in /mnt (OverlayFS upper/work directories: 512MB + 64MB buffer = 576MB).
-_MNT_DF_OUT=$(/system/bin/toybox df -m /mnt 2>/dev/null || true)
-if [ -z "$_MNT_DF_OUT" ]; then
-    fatal "Device-side RAM check: df -m /mnt returned empty output. Cannot verify tmpfs capacity. Halting."
-fi
-MNT_FREE_MB=$(echo "$_MNT_DF_OUT" | /system/bin/toybox awk 'NR>1 {print $4}')
-MNT_FREE_MB=$(echo "$MNT_FREE_MB" | /system/bin/toybox tr -d '[:space:]')
-case "$MNT_FREE_MB" in
-    ''|*[!0-9]*)
-        fatal "Device-side RAM check: Failed to parse numeric free capacity from df output ('$_MNT_DF_OUT'). Halting." ;;
-esac
-
-REQUIRED_MNT_FREE_MB=576
-if [ "$MNT_FREE_MB" -lt "$REQUIRED_MNT_FREE_MB" ]; then
-    fatal "Device-side RAM check: /mnt has only ${MNT_FREE_MB}MB free; bringup requires at least ${REQUIRED_MNT_FREE_MB}MB for OverlayFS upper/work headroom. Halting."
-fi
-echo "[STAGE2] Device-side /mnt tmpfs check passed: /mnt has ${MNT_FREE_MB}MB free (required: ${REQUIRED_MNT_FREE_MB}MB)." > /dev/kmsg
-
-# Independent /tmp tmpfs capacity verification (needs at least 64MB for loop extraction)
-_TMP_DF_OUT=$(/system/bin/toybox df -m /tmp 2>/dev/null || true)
-if [ -z "$_TMP_DF_OUT" ]; then
-    fatal "Device-side RAM check: df -m /tmp returned empty output. Halting."
-fi
-TMP_FREE_MB=$(echo "$_TMP_DF_OUT" | /system/bin/toybox awk 'NR>1 {print $4}' | /system/bin/toybox tr -d '[:space:]')
-case "$TMP_FREE_MB" in
-    ''|*[!0-9]*)
-        fatal "Device-side RAM check: Failed to parse numeric free capacity from df /tmp ('$_TMP_DF_OUT'). Halting." ;;
-esac
-if [ "$TMP_FREE_MB" -lt 64 ]; then
-    fatal "Device-side RAM check: /tmp has only ${TMP_FREE_MB}MB free; staging requires at least 64MB. Halting."
-fi
-echo "[STAGE2] Device-side /tmp tmpfs check passed: /tmp has ${TMP_FREE_MB}MB free." > /dev/kmsg
-
-# Strict device-side MemAvailable verification from /proc/meminfo (Fail-Closed)
-if [ ! -f /proc/meminfo ] || [ ! -s /proc/meminfo ]; then
-    fatal "Device-side RAM check: /proc/meminfo is missing or empty! Failing closed to protect hardware."
-fi
-_DEV_MEMINFO=$(cat /proc/meminfo 2>/dev/null || true)
-if [ -z "$_DEV_MEMINFO" ]; then
-    fatal "Device-side RAM check: Unable to read /proc/meminfo! Failing closed."
-fi
-
-_DEV_MEM_TOTAL_KB=$(echo "$_DEV_MEMINFO" | /system/bin/toybox awk '/MemTotal:/ {print $2}' | /system/bin/toybox tr -d '[:space:]')
-case "$_DEV_MEM_TOTAL_KB" in
-    ''|*[!0-9]*)
-        fatal "Device-side RAM check: Missing or non-numeric MemTotal in /proc/meminfo ('$_DEV_MEM_TOTAL_KB'). Halting." ;;
-esac
-if [ "$_DEV_MEM_TOTAL_KB" -gt 100000000 ]; then
-    fatal "Device-side RAM check: MemTotal value overflow: $_DEV_MEM_TOTAL_KB kB. Halting."
-fi
-_DEV_MEM_TOTAL_MB=$((_DEV_MEM_TOTAL_KB / 1024))
-if [ "$_DEV_MEM_TOTAL_MB" -lt 6500 ]; then
-    fatal "Device-side RAM check: MemTotal is ${_DEV_MEM_TOTAL_MB}MB (< 6500MB). Target OnePlus 7T requires 8 GB RAM! Halting."
-fi
-
-_DEV_MEM_AVAIL_KB=$(echo "$_DEV_MEMINFO" | /system/bin/toybox awk '/MemAvailable:/ {print $2}' | /system/bin/toybox tr -d '[:space:]')
-case "$_DEV_MEM_AVAIL_KB" in
-    ''|*[!0-9]*)
-        fatal "Device-side RAM check: Missing or non-numeric MemAvailable in /proc/meminfo ('$_DEV_MEM_AVAIL_KB'). Halting." ;;
-esac
-if [ "$_DEV_MEM_AVAIL_KB" -gt "$_DEV_MEM_TOTAL_KB" ]; then
-    fatal "Device-side RAM check: MemAvailable ($_DEV_MEM_AVAIL_KB kB) exceeds MemTotal ($_DEV_MEM_TOTAL_KB kB). Halting."
-fi
-_DEV_MEM_AVAIL_MB=$((_DEV_MEM_AVAIL_KB / 1024))
-
-# Sum authentic expanded sizes for all 4 mandatory bootstrap APEX modules
-_TOTAL_EXP_APEX_BYTES=0
-for _mod in runtime_apex art_apex i18n_apex tzdata_apex; do
-    _exp_f="/mnt/${_mod}.expanded_size"
-    [ -f "$_exp_f" ] || _exp_f="/tmp/${_mod}.expanded_size"
-    if [ ! -f "$_exp_f" ] || [ ! -s "$_exp_f" ]; then
-        fatal "Device-side RAM check: Missing mandatory APEX metadata $_exp_f! Halting."
-    fi
-    _val=$(cat "$_exp_f" 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
-    case "$_val" in
-        ''|*[!0-9]*)
-            fatal "Device-side RAM check: Malformed non-numeric APEX expanded size in $_exp_f: '$_val'. Halting." ;;
-    esac
-    if [ "$_val" -le 0 ] || [ "$_val" -gt 524288000 ]; then
-        fatal "Device-side RAM check: APEX expanded size in $_exp_f out of range: $_val bytes. Halting."
-    fi
-    _TOTAL_EXP_APEX_BYTES=$((_TOTAL_EXP_APEX_BYTES + _val))
-done
-_EXP_APEX_MB=$(( (_TOTAL_EXP_APEX_BYTES + 1048575) / 1048576 ))
-
-# Memory Model for FUTURE allocations from MemAvailable:
-# Note: Staged images in /mnt are ALREADY resident in RAM and accounted for by kernel VM.
-# We must ONLY budget for future RAM allocations:
-# 1. Expanded APEX tmpfs:              _EXP_APEX_MB (measured)
-# 2. Ephemeral /data tmpfs:            1024 MB
-# 3. OverlayFS upper/work on tmpfs:    512 MB
-# 4. Kernel, GPU, display, runtime:    1536 MB
-# 5. Safety headroom:                  256 MB
-_FUTURE_RAM_REQ_MB=$((_EXP_APEX_MB + 1024 + 512 + 1536 + 256))
-
-if [ "$_DEV_MEM_AVAIL_MB" -lt "$_FUTURE_RAM_REQ_MB" ]; then
-    fatal "Device-side RAM check: Insufficient device RAM! MemAvailable is ${_DEV_MEM_AVAIL_MB}MB, but future bringup allocations require ${_FUTURE_RAM_REQ_MB}MB (APEX: ${_EXP_APEX_MB}MB, /data: 1024MB, overlay: 512MB, kernel/runtime: 1536MB, buffer: 256MB). Halting."
-fi
-echo "[STAGE2] Device-side total RAM verified: ${_DEV_MEM_AVAIL_MB}MB available >= ${_FUTURE_RAM_REQ_MB}MB future required." > /dev/kmsg
+# Execute device-side RAM capacity checks
+validate_device_ram
 
 echo "[STAGE2] Verified: All $DISCOVERED_PHYSICAL physical storage devices and partitions are strictly locked read-only (ro=1)." > /dev/kmsg
 
@@ -224,25 +373,44 @@ echo "[STAGE2] Verified: All $DISCOVERED_PHYSICAL physical storage devices and p
 /system/bin/toybox umount /mnt/system_ro 2>/dev/null || true
 /system/bin/toybox mkdir -p /mnt/sysroot /mnt/system_ro /mnt/overlay_upper /mnt/overlay_work
 
-# 4. Resolve Base System Image
+# 4. Resolve & Strictly Validate Authoritative PARTITION_MAP Manifest
+MAP_FILE="/mnt/PARTITION_MAP"
+[ -f "$MAP_FILE" ] || MAP_FILE="/tmp/PARTITION_MAP"
+parse_and_validate_partition_map "$MAP_FILE"
+
+# 5. Mount Base System Image from Manifest
+# Identify entry in PARTITION_MAP whose target is /mnt/sysroot
+SYSROOT_ENTRY=$(grep ":/mnt/sysroot:" "$MAP_FILE" | head -n 1)
+[ -n "$SYSROOT_ENTRY" ] || fatal "No manifest entry mapping /mnt/sysroot found!"
+
+SYS_IMG_FILE=$(echo "$SYSROOT_ENTRY" | cut -d: -f1 | tr -d '[:space:]')
+SYS_IMG_SHA=$(echo "$SYSROOT_ENTRY" | cut -d: -f4 | tr -d '[:space:]')
+
 SYSTEM_IMG="/mnt/system.img"
-[ -f "$SYSTEM_IMG" ] || SYSTEM_IMG="/tmp/system.img"
-[ -f "$SYSTEM_IMG" ] && [ -s "$SYSTEM_IMG" ] || fatal "Required system image /mnt/system.img not found or 0 bytes!"
+[ -n "$SYS_IMG_FILE" ] && SYSTEM_IMG=$(get_img "$SYS_IMG_FILE")
+[ -n "$SYSTEM_IMG" ] || SYSTEM_IMG=$(get_img "${SYS_IMG_FILE%.erofs.img}.img")
+[ -n "$SYSTEM_IMG" ] || SYSTEM_IMG="/mnt/system.img"
+[ -f "$SYSTEM_IMG" ] && [ -s "$SYSTEM_IMG" ] || fatal "Required base system image ($SYS_IMG_FILE) not found or 0 bytes!"
+
+if [ -n "$SYS_IMG_SHA" ]; then
+    ACTUAL_SYS_SHA=$(/system/bin/toybox sha256sum "$SYSTEM_IMG" | awk '{print $1}')
+    if [ "$ACTUAL_SYS_SHA" != "$SYS_IMG_SHA" ]; then
+        fatal "Base system image SHA-256 mismatch ($ACTUAL_SYS_SHA != $SYS_IMG_SHA)!"
+    fi
+fi
 
 # Mount base system image to /mnt/system_ro (read-only EROFS loop mount)
 mount_or_fail -t erofs -o ro,loop "$SYSTEM_IMG" /mnt/system_ro
 
 # Mount OverlayFS on /mnt/sysroot with upper and work directories on RAM tmpfs (/mnt)
-# Both upperdir and workdir reside on the exact same writable tmpfs filesystem.
 mount_or_fail -t overlay overlay -o lowerdir=/mnt/system_ro,upperdir=/mnt/overlay_upper,workdir=/mnt/overlay_work /mnt/sysroot
 
-# Verify OverlayFS is active in /proc/mounts; never continue with partial fallback
 if ! /system/bin/toybox grep -q " /mnt/sysroot overlay " /proc/mounts 2>/dev/null; then
     fatal "OverlayFS mount verification failed for /mnt/sysroot! Halting."
 fi
 echo "[STAGE2] Mounted writable OverlayFS root at /mnt/sysroot." > /dev/kmsg
 
-# 5. Pre-Create and Validate Every Required Child Mountpoint on Rootfs
+# 6. Pre-Create Required Child Mountpoints on Rootfs
 REQUIRED_MOUNTPOINTS="system_ext vendor odm product my_product my_region apex data dev proc sys linkerconfig mnt"
 for mp in $REQUIRED_MOUNTPOINTS; do
     /system/bin/toybox mkdir -p "/mnt/sysroot/$mp"
@@ -252,7 +420,7 @@ for mp in $REQUIRED_MOUNTPOINTS; do
 done
 echo "[STAGE2] All child mountpoints verified on rootfs." > /dev/kmsg
 
-# 6. Mount Child Partition Images with Source and Mountpoint Validation
+# Helper to mount partition image
 mount_partition() {
     local name="$1"
     local img_path="$2"
@@ -278,7 +446,7 @@ mount_partition() {
     fi
 
     mount_or_fail -t erofs -o ro,loop "$img_path" "$target"
-    
+
     # Verify mount in /proc/mounts
     if ! /system/bin/toybox grep -q " $target erofs " /proc/mounts 2>/dev/null; then
         if [ "$mandatory" -eq 1 ]; then
@@ -288,64 +456,78 @@ mount_partition() {
     echo "[STAGE2] Successfully mounted and verified $name at $target." > /dev/kmsg
 }
 
-# Resolve image paths preferring /mnt/ over /tmp/
-get_img() {
-    local name="$1"
-    if [ -f "/mnt/$name" ] && [ -s "/mnt/$name" ]; then
-        echo "/mnt/$name"
-    elif [ -f "/tmp/$name" ] && [ -s "/tmp/$name" ]; then
-        echo "/tmp/$name"
+# 7. Mount Child Partitions Directly from Authoritative PARTITION_MAP
+ACTIVE_PRODUCT_MOUNTS=""
+MANIFEST_IMAGES=""
+
+while IFS= read -r line || [ -n "$line" ]; do
+    trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$trimmed" in ''|\#*) continue ;; esac
+
+    m_img=$(echo "$trimmed" | cut -d: -f1 | tr -d '[:space:]')
+    m_target=$(echo "$trimmed" | cut -d: -f2 | tr -d '[:space:]')
+    m_nature=$(echo "$trimmed" | cut -d: -f3 | tr -d '[:space:]')
+    m_sha=$(echo "$trimmed" | cut -d: -f4 | tr -d '[:space:]')
+
+    MANIFEST_IMAGES="$MANIFEST_IMAGES $m_img ${m_img%.erofs.img}.img"
+
+    # Skip rootfs (already mounted above)
+    [ "$m_target" = "/mnt/sysroot" ] && continue
+
+    part_name=$(basename "$m_target")
+    resolved_img=$(get_img "$m_img")
+    [ -n "$resolved_img" ] || resolved_img=$(get_img "${m_img%.erofs.img}.img")
+
+    if [ "$m_nature" = "mandatory" ]; then
+        [ -n "$resolved_img" ] || fatal "Mandatory image $m_img for $m_target not found in /mnt or /tmp!"
     else
-        echo ""
+        if [ -z "$resolved_img" ]; then
+            echo "[STAGE2] Optional image $m_img not present, skipping." > /dev/kmsg
+            continue
+        fi
     fi
-}
 
-SYSTEM_EXT_IMG=$(get_img "system_ext.img")
-[ -n "$SYSTEM_EXT_IMG" ] || fatal "Mandatory system_ext.img not found in /mnt/ or /tmp/!"
-mount_partition "system_ext" "$SYSTEM_EXT_IMG" 1
+    if [ -n "$m_sha" ] && [ -f "$resolved_img" ]; then
+        actual_sha=$(/system/bin/toybox sha256sum "$resolved_img" | awk '{print $1}')
+        if [ "$actual_sha" != "$m_sha" ]; then
+            fatal "SHA-256 mismatch on $resolved_img ($actual_sha != $m_sha)!"
+        fi
+    fi
 
-# Product / my_product partition resolution
+    mount_partition "$part_name" "$resolved_img" 1
+
+    case "$m_target" in
+        /mnt/sysroot/product|/mnt/sysroot/my_product)
+            ACTIVE_PRODUCT_MOUNTS="$ACTIVE_PRODUCT_MOUNTS $m_target"
+            ;;
+    esac
+done < "$MAP_FILE"
+
+# Verify duplicate image content if both product and my_product are mounted
 PROD_IMG=$(get_img "product.img")
 MY_PROD_IMG=$(get_img "my_product.img")
-
 if [ -n "$PROD_IMG" ] && [ -n "$MY_PROD_IMG" ]; then
-    # Both images exist. Check SHA-256 to ensure they are genuinely distinct and not duplicate content.
-    PROD_SHA=$(/system/bin/toybox sha256sum "$PROD_IMG" 2>/dev/null | /system/bin/toybox awk '{print $1}')
-    MY_PROD_SHA=$(/system/bin/toybox sha256sum "$MY_PROD_IMG" 2>/dev/null | /system/bin/toybox awk '{print $1}')
-    if [ -n "$PROD_SHA" ] && [ "$PROD_SHA" = "$MY_PROD_SHA" ]; then
-        fatal "CRITICAL DUPLICATION ERROR: $PROD_IMG and $MY_PROD_IMG have identical SHA-256 ($PROD_SHA)! Refusing duplicate mount."
+    P_SHA=$(/system/bin/toybox sha256sum "$PROD_IMG" | awk '{print $1}')
+    MP_SHA=$(/system/bin/toybox sha256sum "$MY_PROD_IMG" | awk '{print $1}')
+    if [ "$P_SHA" = "$MP_SHA" ]; then
+        fatal "CRITICAL DUPLICATION ERROR: $PROD_IMG and $MY_PROD_IMG have identical content! Refusing duplicate mount."
     fi
-    mount_partition "product" "$PROD_IMG" 1
-    mount_partition "my_product" "$MY_PROD_IMG" 1
-    ACTIVE_PRODUCT_MOUNTS="/mnt/sysroot/product /mnt/sysroot/my_product"
-elif [ -n "$MY_PROD_IMG" ]; then
-    # Donor OxygenOS 16 / ColorOS partition layout uses /my_product as the product layer
-    mount_partition "my_product" "$MY_PROD_IMG" 1
-    echo "[STAGE2] Donor uses my_product as product partition. /mnt/sysroot/product left as empty directory." > /dev/kmsg
-    ACTIVE_PRODUCT_MOUNTS="/mnt/sysroot/my_product"
-elif [ -n "$PROD_IMG" ]; then
-    # Standard AOSP layout uses /product as the product layer
-    mount_partition "product" "$PROD_IMG" 1
-    echo "[STAGE2] Standard AOSP product mounted. /mnt/sysroot/my_product left as empty directory." > /dev/kmsg
-    ACTIVE_PRODUCT_MOUNTS="/mnt/sysroot/product"
-else
-    fatal "Neither product.img nor my_product.img found in /mnt/ or /tmp/! Cannot establish product partition."
 fi
 
-REGION_IMG=$(get_img "my_region.img")
-if [ -n "$REGION_IMG" ] && [ -d /mnt/sysroot/my_region ]; then
-    mount_partition "my_region" "$REGION_IMG" 0
-fi
+# Reject any unmapped partition image in /mnt (excluding APEX payload images)
+for staged_img in /mnt/*.img; do
+    [ -f "$staged_img" ] || continue
+    base_staged=$(basename "$staged_img")
+    case "$base_staged" in
+        runtime_apex.img|art_apex.img|i18n_apex.img|tzdata_apex.img) continue ;;
+    esac
+    case " $MANIFEST_IMAGES " in
+        *" $base_staged "*) ;;
+        *) fatal "Unmapped partition image detected in /mnt: $base_staged is NOT in PARTITION_MAP!" ;;
+    esac
+done
 
-VENDOR_IMG=$(get_img "vendor.img")
-[ -n "$VENDOR_IMG" ] || fatal "Mandatory vendor.img not found in /mnt/ or /tmp/!"
-mount_partition "vendor" "$VENDOR_IMG" 1
-
-ODM_IMG=$(get_img "odm.img")
-[ -n "$ODM_IMG" ] || fatal "Mandatory odm.img not found in /mnt/ or /tmp/!"
-mount_partition "odm" "$ODM_IMG" 1
-
-# 7. Strict Android 16 Bootstrap APEX Handling & Canonical Versioned Directories
+# 8. Strict Android 16 Bootstrap APEX Handling & Canonical Versioned Mounts
 echo "[STAGE2] Preparing Android 16 bootstrap APEX environments on tmpfs..." > /dev/kmsg
 mount_or_fail -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/apex
 
@@ -354,7 +536,6 @@ populate_apex() {
     local img_name="$2"
     local mandatory="${3:-1}"
 
-    # 1. Resolve image path
     local img_path=$(get_img "$img_name")
     if [ "$mandatory" -eq 1 ]; then
         if [ -z "$img_path" ] || [ ! -s "$img_path" ]; then
@@ -362,7 +543,6 @@ populate_apex() {
         fi
     fi
 
-    # 2. Extract and strictly validate version code
     local version=""
     if [ -f "/mnt/${img_name%.img}.version" ]; then
         version=$(cat "/mnt/${img_name%.img}.version" | tr -d '[:space:]')
@@ -381,7 +561,6 @@ populate_apex() {
         [ -z "$version" ] && version="1"
     fi
 
-    # 3. Extract and strictly validate filesystem type
     local fstype=""
     if [ -f "/mnt/${img_name%.img}.fstype" ]; then
         fstype=$(cat "/mnt/${img_name%.img}.fstype" | tr -d '[:space:]')
@@ -400,13 +579,13 @@ populate_apex() {
         [ -z "$fstype" ] && fstype="erofs"
     fi
 
-    # 4. Canonical AOSP structure:
-    # Payload directory: /mnt/sysroot/apex/${mod_name}@${version}
-    # Active symlink:    /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
+    # Canonical AOSP structure:
+    # Versioned payload directory: /mnt/sysroot/apex/${mod_name}@${version}
+    # Active APEX mountpoint:      /mnt/sysroot/apex/${mod_name} (bind-mounted to versioned dir)
     local versioned_dir="/mnt/sysroot/apex/${mod_name}@${version}"
-    local active_symlink="/mnt/sysroot/apex/${mod_name}"
+    local active_mount="/mnt/sysroot/apex/${mod_name}"
 
-    /system/bin/toybox mkdir -p "$versioned_dir"
+    /system/bin/toybox mkdir -p "$versioned_dir" "$active_mount"
     /system/bin/toybox mkdir -p "/tmp/apex_stage_${mod_name}"
 
     echo "[STAGE2] Staging $mod_name to $versioned_dir from image $img_path (fstype: $fstype, version: $version)..." > /dev/kmsg
@@ -430,12 +609,10 @@ populate_apex() {
         fatal "APEX staging for $mod_name: Invalid non-positive expanded size in $exp_meta_file: $mod_exp_bytes bytes!"
     fi
 
-    # Verify /mnt/sysroot/apex is indeed tmpfs
     if ! /system/bin/toybox mount | grep -q " /mnt/sysroot/apex type tmpfs "; then
         fatal "APEX staging for $mod_name: /mnt/sysroot/apex is NOT mounted as tmpfs!"
     fi
 
-    # Parse df -k /mnt/sysroot/apex strictly
     local apex_df_out
     apex_df_out=$(/system/bin/toybox df -k /mnt/sysroot/apex 2>/dev/null || true)
     if [ -z "$apex_df_out" ]; then
@@ -448,53 +625,52 @@ populate_apex() {
             fatal "APEX staging for $mod_name: Failed to parse numeric free capacity from df ('$apex_df_out')! Failing closed." ;;
     esac
     local apex_free_bytes=$(( apex_free_kb * 1024 ))
-    # Required capacity: module uncompressed payload size + 5 MB headroom (5242880 bytes)
     local required_apex_bytes=$(( mod_exp_bytes + 5242880 ))
 
     if [ "$apex_free_bytes" -lt "$required_apex_bytes" ]; then
-        fatal "APEX staging for $mod_name: Insufficient free capacity in /mnt/sysroot/apex tmpfs! Free: ${apex_free_bytes} bytes, required: ${required_apex_bytes} bytes (payload: ${mod_exp_bytes} bytes + 5MB margin). Halting."
+        fatal "APEX staging for $mod_name: Insufficient free capacity in /mnt/sysroot/apex tmpfs! Free: ${apex_free_bytes} bytes, required: ${required_apex_bytes} bytes. Halting."
     fi
 
     /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy $mod_name payload to $versioned_dir!"
     /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
 
-    # Verify destination payload is non-empty
     if [ -z "$(/system/bin/toybox ls -A "$versioned_dir" 2>/dev/null)" ]; then
         fatal "APEX staging for $mod_name: Payload directory $versioned_dir is empty after copy!"
     fi
 
-    # 5. Establish canonical active symlink pointing to versioned payload directory
-    /system/bin/toybox rm -rf "$active_symlink" 2>/dev/null || true
-    (cd /mnt/sysroot/apex && /system/bin/toybox ln -sfn "${mod_name}@${version}" "$mod_name")
-
-    # Verify active symlink points to actual versioned directory
-    local symlink_target
-    symlink_target=$(readlink "$active_symlink" 2>/dev/null || true)
-    if [ "$symlink_target" != "${mod_name}@${version}" ]; then
-        fatal "Active symlink $active_symlink does not point to ${mod_name}@${version} (points to '$symlink_target')!"
-    fi
-    if [ ! -d "$active_symlink" ]; then
-        fatal "Active symlink $active_symlink does not resolve to a directory!"
+    # Establish canonical active bind mount (Android 13+ standard)
+    mount_or_fail --bind "$versioned_dir" "$active_mount"
+    if ! /system/bin/toybox grep -q " $active_mount " /proc/mounts 2>/dev/null; then
+        fatal "Active APEX mount verification failed for $active_mount in /proc/mounts!"
     fi
 
     # Establish backward-compatibility convenience link @1 if version != 1
     if [ "$version" != "1" ]; then
+        /system/bin/toybox rm -rf "/mnt/sysroot/apex/${mod_name}@1" 2>/dev/null || true
         (cd /mnt/sysroot/apex && /system/bin/toybox ln -sfn "${mod_name}@${version}" "${mod_name}@1" 2>/dev/null || true)
     fi
+
+    echo "[STAGE2] Verified active APEX mount: $active_mount -> $versioned_dir (version: $version)" > /dev/kmsg
 }
 
-# Populate all 4 required Android bootstrap APEX modules
+# Populate All 4 Mandatory Bootstrap APEX Modules
 populate_apex "com.android.runtime" "runtime_apex.img" 1
 populate_apex "com.android.art" "art_apex.img" 1
 populate_apex "com.android.i18n" "i18n_apex.img" 1
 populate_apex "com.android.tzdata" "tzdata_apex.img" 1
 
-# Strict Validation of Authentic Runtime Bionic Binaries & Libraries
-[ -f /mnt/sysroot/apex/com.android.runtime/bin/linker64 ] || fatal "Bionic linker64 is MISSING from runtime APEX!"
-[ -x /mnt/sysroot/apex/com.android.runtime/bin/linker64 ] || fatal "Bionic linker64 is not executable in runtime APEX!"
-[ -f /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libc.so ] || fatal "Bionic libc.so is MISSING from runtime APEX!"
-[ -f /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libm.so ] || fatal "Bionic libm.so is MISSING from runtime APEX!"
-[ -f /mnt/sysroot/apex/com.android.runtime/lib64/bionic/libdl.so ] || fatal "Bionic libdl.so is MISSING from runtime APEX!"
+# Generate canonical active APEX info list for Android 16 userspace
+cat > /mnt/sysroot/apex/apex-info-list.xml << 'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+  <apex-info moduleName="com.android.runtime" isFactory="true" isActive="true" />
+  <apex-info moduleName="com.android.art" isFactory="true" isActive="true" />
+  <apex-info moduleName="com.android.i18n" isFactory="true" isActive="true" />
+  <apex-info moduleName="com.android.tzdata" isFactory="true" isActive="true" />
+</apex-info-list>
+EOF
+chmod 0644 /mnt/sysroot/apex/apex-info-list.xml
+cp /mnt/sysroot/apex/apex-info-list.xml /mnt/sysroot/apex/.bootstrap-apex-info-list.xml 2>/dev/null || true
 
 # Strict Validation of Authentic ART, I18N, and TZDATA Modules
 [ -f /mnt/sysroot/apex/com.android.art/lib64/libart.so ] || fatal "ART libart.so is MISSING from art APEX!"
@@ -503,7 +679,7 @@ populate_apex "com.android.tzdata" "tzdata_apex.img" 1
 
 echo "[STAGE2] Strict verification passed: Authentic Bionic, ART, I18N, and TZDATA APEX environments ready." > /dev/kmsg
 
-# 8. Linker Configuration & Runtime Directories
+# 9. Linker Configuration & Runtime Directories
 mount_or_fail -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/linkerconfig
 /system/bin/toybox mkdir -p /mnt/sysroot/linkerconfig/bootstrap /mnt/sysroot/linkerconfig/default
 echo "#" > /mnt/sysroot/linkerconfig/bootstrap/ld.config.txt
@@ -516,7 +692,7 @@ chmod 644 /mnt/sysroot/linkerconfig/ld.config.txt
 mount_or_fail -t tmpfs -o mode=0755,nosuid,nodev tmpfs /mnt/sysroot/mnt
 /system/bin/toybox mkdir -p /mnt/sysroot/mnt/vendor/persist
 
-# 9. Ephemeral /data (1024 MB RAM tmpfs)
+# 10. Ephemeral /data (1024 MB RAM tmpfs)
 echo "[STAGE2] Initializing RAM tmpfs for /data (1024 MB)..." > /dev/kmsg
 mount_or_fail -t tmpfs -o rw,nosuid,nodev,noatime,mode=0771,size=1024M tmpfs /mnt/sysroot/data
 /system/bin/toybox mkdir -p /mnt/sysroot/data/system /mnt/sysroot/data/misc /mnt/sysroot/data/user /mnt/sysroot/data/user_de /mnt/sysroot/data/local /mnt/sysroot/data/local/tmp /mnt/sysroot/data/media /mnt/sysroot/data/persist_log
@@ -524,7 +700,7 @@ chmod 0775 /mnt/sysroot/data/local/tmp
 chmod 0700 /mnt/sysroot/data/system
 chmod 01771 /mnt/sysroot/data/misc
 
-# 10. Bind Core Kernel Interfaces
+# 11. Bind Core Kernel Interfaces
 mount_or_fail --bind /dev /mnt/sysroot/dev
 mount_or_fail -t devpts devpts /mnt/sysroot/dev/pts
 mount_or_fail -t proc proc /mnt/sysroot/proc
@@ -546,7 +722,7 @@ mount_or_fail -t tmpfs tmpfs /mnt/sysroot/dev/socket
 /system/bin/toybox mkdir -p /mnt/sysroot/dev/graphics
 /system/bin/toybox ln -s /dev/dri/card0 /mnt/sysroot/dev/graphics/fb0 2>/dev/null || true
 
-# 11. Display Subsystem Diagnostics & AMOLED Configuration
+# 12. Display Subsystem Diagnostics & AMOLED Configuration
 echo "[STAGE2] Running display subsystem diagnostics..." > /dev/kmsg
 if [ -c /mnt/sysroot/dev/dri/card0 ] || [ -c /dev/dri/card0 ]; then
     echo "[STAGE2] DRM display controller verified: /dev/dri/card0 present." > /dev/kmsg
@@ -555,7 +731,7 @@ else
 fi
 
 if [ -c /mnt/sysroot/dev/kgsl-3d0 ] || [ -c /dev/kgsl-3d0 ]; then
-    echo "[STAGE2] Adreno 640 GPU controller verified: /dev/kgsl-3d0 present." > /dev/kmsg
+    echo "[STAGE2] Adreno 640 GPU accelerator verified: /dev/kgsl-3d0 present." > /dev/kmsg
 else
     echo "[STAGE2 WARNING] Adreno /dev/kgsl-3d0 node missing! 3D GPU acceleration may fall back to swiftshader." > /dev/kmsg
 fi
@@ -575,7 +751,7 @@ if [ -f /mnt/sysroot/vendor/bin/hw/android.hardware.graphics.composer@2.4-servic
     echo "[STAGE2] Hardware Composer service binary verified in vendor partition." > /dev/kmsg
 fi
 
-# 12. Final Mount Layout Verification
+# 13. Final Mount Layout Verification
 echo "[STAGE2] Verifying complete mount layout in /proc/mounts..." > /dev/kmsg
 MANDATORY_MOUNTS="/mnt/sysroot /mnt/sysroot/system_ext /mnt/sysroot/vendor /mnt/sysroot/odm $ACTIVE_PRODUCT_MOUNTS /mnt/sysroot/apex /mnt/sysroot/data /mnt/sysroot/dev /mnt/sysroot/proc /mnt/sysroot/sys /mnt/sysroot/linkerconfig"
 for target in $MANDATORY_MOUNTS; do
@@ -585,7 +761,7 @@ for target in $MANDATORY_MOUNTS; do
 done
 echo "[STAGE2] All mandatory filesystems verified in /proc/mounts." > /dev/kmsg
 
-# 13. Stage-2 Completion & Watchdog Handover
+# 14. Stage-2 Completion & Watchdog Handover
 echo "[STAGE2] Signaling Stage-2 bringup completion to watchdog (/mnt/stage2_done)..." > /dev/kmsg
 echo "done" > /mnt/stage2_done 2>/dev/null || true
 echo "done" > /tmp/stage2_done 2>/dev/null || true
@@ -599,8 +775,8 @@ fi
 
 echo "[STAGE2] Handing over to Android init health monitor (watching sys.boot_completed=1)..." > /dev/kmsg
 
-# 14. Android Init Handover (PID 1 preserved via exec)
-echo "[STAGE2] ALL RAM FILESYSTEMS READY. EXECUTING ANDROID 16 INIT SECOND_STAGE AS PID 1..." > /dev/kmsg
+# 15. Android Init Handover (PID 1 preserved via exec)
+echo "[STAGE2] ALL RAM FILESYSTEMS READY. EXECUTING ANDROID 16 INIT SELINUX_SETUP AS PID 1..." > /dev/kmsg
 
 # Stop Stage-1 adbd and unbind USB gadget controller cleanly
 killall adbd 2>/dev/null || true
@@ -614,5 +790,13 @@ export ANDROID_STORAGE=/storage
 export ANDROID_ART_ROOT=/apex/com.android.art
 export ANDROID_I18N_ROOT=/apex/com.android.i18n
 export ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
+export SELINUX_STARTED_AT="$(/system/bin/toybox date +%s%N 2>/dev/null || echo 0)"
 
-exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage
+if [ ! -x /mnt/sysroot/system/bin/init ]; then
+    fatal "Target Android 16 init binary (/mnt/sysroot/system/bin/init) is missing or not executable!"
+fi
+
+# Hand over execution to Android init selinux_setup as PID 1
+# Android 16 AOSP init executes SetupSelinux, compiles/loads the policy, sets PID 1 context to u:r:init:s0,
+# and then calls execv("/system/bin/init", {"/system/bin/init", "second_stage", nullptr}).
+exec /system/bin/chroot /mnt/sysroot /system/bin/init "${INIT_ENTRY_STAGE:-selinux_setup}"

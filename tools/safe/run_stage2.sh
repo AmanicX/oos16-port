@@ -99,42 +99,138 @@ if [ -n "$WRITABLE_MOUNTS" ]; then
 fi
 echo "Verified: Zero physical storage devices mounted writable."
 
-# 4. Mandatory & Optional Staged Images Discovery & Metadata Validation
-echo "4. Validating staged images and calculating required memory budget..."
-MANDATORY_IMAGES=(
-    "system.erofs.img:/mnt/system.img"
-    "system_ext.erofs.img:/mnt/system_ext.img"
-    "vendor.erofs.img:/mnt/vendor.img"
-    "odm.erofs.img:/mnt/odm.img"
-)
+# 4. Authoritative PARTITION_MAP Manifest Discovery & Staged Images Validation
+echo "4. Validating authoritative partition map and calculating required memory budget..."
 
-# Product image resolution (my_product.erofs.img vs product.erofs.img)
-HAS_MY_PRODUCT=0
+MAP_PATH="$IMAGES_DIR/PARTITION_MAP"
+if [ ! -f "$MAP_PATH" ] || [ ! -s "$MAP_PATH" ]; then
+    echo "CRITICAL ERROR: Mandatory partition manifest $MAP_PATH is missing or empty!" >&2
+    exit 1
+fi
+
+ALLOWLIST=" /mnt/sysroot /mnt/sysroot/system_ext /mnt/sysroot/vendor /mnt/sysroot/odm /mnt/sysroot/product /mnt/sysroot/my_product /mnt/sysroot/my_region "
+SEEN_TARGETS=""
+SEEN_IMAGES=""
+HAS_SYSROOT=0
+HAS_SYSTEM_EXT=0
+HAS_VENDOR=0
+HAS_ODM=0
 HAS_PRODUCT=0
-[ -f "$IMAGES_DIR/my_product.erofs.img" ] && HAS_MY_PRODUCT=1
-[ -f "$IMAGES_DIR/product.erofs.img" ] && HAS_PRODUCT=1
+HAS_MY_PRODUCT=0
 
-if [ "$HAS_MY_PRODUCT" -eq 1 ] && [ "$HAS_PRODUCT" -eq 1 ]; then
-    MY_PROD_SHA=$(sha256sum "$IMAGES_DIR/my_product.erofs.img" | awk '{print $1}')
-    PROD_SHA=$(sha256sum "$IMAGES_DIR/product.erofs.img" | awk '{print $1}')
-    if [ "$MY_PROD_SHA" = "$PROD_SHA" ]; then
-        echo "CRITICAL ERROR: Ambiguous duplicate image content! product.erofs.img and my_product.erofs.img have identical SHA-256 ($PROD_SHA). Rejecting duplicate mapping." >&2
+MANDATORY_IMAGES=()
+OPTIONAL_IMAGES=()
+
+# Transfer the authoritative manifest itself
+MANDATORY_IMAGES+=("PARTITION_MAP:/mnt/PARTITION_MAP")
+
+while IFS= read -r line || [ -n "$line" ]; do
+    trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$trimmed" in
+        ''|\#*) continue ;;
+    esac
+
+    img=$(echo "$trimmed" | cut -d: -f1 | tr -d '[:space:]')
+    target=$(echo "$trimmed" | cut -d: -f2 | tr -d '[:space:]')
+    nature=$(echo "$trimmed" | cut -d: -f3 | tr -d '[:space:]')
+    sha=$(echo "$trimmed" | cut -d: -f4 | tr -d '[:space:]')
+
+    if [ -z "$img" ] || [ -z "$target" ] || [ -z "$nature" ]; then
+        echo "CRITICAL ERROR: Malformed manifest entry in $MAP_PATH: '$line'!" >&2
         exit 1
     fi
-    echo "Found independent product.erofs.img and my_product.erofs.img. Staging both."
-    MANDATORY_IMAGES+=(
-        "product.erofs.img:/mnt/product.img"
-        "my_product.erofs.img:/mnt/my_product.img"
-    )
-elif [ "$HAS_MY_PRODUCT" -eq 1 ]; then
-    echo "Found donor my_product.erofs.img. Staging as /mnt/my_product.img."
-    MANDATORY_IMAGES+=("my_product.erofs.img:/mnt/my_product.img")
-elif [ "$HAS_PRODUCT" -eq 1 ]; then
-    echo "Found standard product.erofs.img. Staging as /mnt/product.img."
-    MANDATORY_IMAGES+=("product.erofs.img:/mnt/product.img")
-else
-    echo "CRITICAL ERROR: Neither my_product.erofs.img nor product.erofs.img found in $IMAGES_DIR!" >&2
+
+    # Allowlist check
+    case "$ALLOWLIST" in
+        *" $target "*) ;;
+        *)
+            echo "CRITICAL ERROR: Target mountpoint '$target' in $MAP_PATH is NOT allowed!" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ "$nature" != "mandatory" ] && [ "$nature" != "optional" ]; then
+        echo "CRITICAL ERROR: Invalid nature '$nature' in $MAP_PATH entry '$line' (must be mandatory or optional)!" >&2
+        exit 1
+    fi
+
+    case " $SEEN_TARGETS " in
+        *" $target "*)
+            echo "CRITICAL ERROR: Duplicate target mountpoint '$target' in $MAP_PATH!" >&2
+            exit 1
+            ;;
+    esac
+    SEEN_TARGETS="$SEEN_TARGETS $target"
+
+    case " $SEEN_IMAGES " in
+        *" $img "*)
+            echo "CRITICAL ERROR: Duplicate image filename '$img' in $MAP_PATH!" >&2
+            exit 1
+            ;;
+    esac
+    SEEN_IMAGES="$SEEN_IMAGES $img"
+
+    SRC_FILE="$IMAGES_DIR/$img"
+    if [ ! -f "$SRC_FILE" ] || [ ! -s "$SRC_FILE" ]; then
+        if [ "$nature" = "mandatory" ]; then
+            echo "CRITICAL ERROR: Mandatory partition image $SRC_FILE does not exist or is 0 bytes!" >&2
+            exit 1
+        else
+            echo "Note: Optional partition image $SRC_FILE not found, skipping."
+            continue
+        fi
+    fi
+
+    if [ -n "$sha" ]; then
+        act_sha=$(sha256sum "$SRC_FILE" | awk '{print $1}')
+        if [ "$act_sha" != "$sha" ]; then
+            echo "CRITICAL ERROR: SHA-256 mismatch for $SRC_FILE ($act_sha != $sha)!" >&2
+            exit 1
+        fi
+    fi
+
+    # Derive device staging path (/mnt/<base>.img)
+    dest_name="$img"
+    case "$img" in
+        *.erofs.img) dest_name="${img%.erofs.img}.img" ;;
+    esac
+
+    if [ "$nature" = "mandatory" ]; then
+        MANDATORY_IMAGES+=("$img:/mnt/$dest_name")
+    else
+        OPTIONAL_IMAGES+=("$img:/mnt/$dest_name")
+    fi
+
+    case "$target" in
+        /mnt/sysroot) HAS_SYSROOT=1 ;;
+        /mnt/sysroot/system_ext) HAS_SYSTEM_EXT=1 ;;
+        /mnt/sysroot/vendor) HAS_VENDOR=1 ;;
+        /mnt/sysroot/odm) HAS_ODM=1 ;;
+        /mnt/sysroot/product) HAS_PRODUCT=1 ;;
+        /mnt/sysroot/my_product) HAS_MY_PRODUCT=1 ;;
+    esac
+done < "$MAP_PATH"
+
+# Mandatory partition mappings enforcement
+[ "$HAS_SYSROOT" -eq 1 ] || { echo "CRITICAL ERROR: Manifest $MAP_PATH missing /mnt/sysroot mapping!" >&2; exit 1; }
+[ "$HAS_SYSTEM_EXT" -eq 1 ] || { echo "CRITICAL ERROR: Manifest $MAP_PATH missing /mnt/sysroot/system_ext mapping!" >&2; exit 1; }
+[ "$HAS_VENDOR" -eq 1 ] || { echo "CRITICAL ERROR: Manifest $MAP_PATH missing /mnt/sysroot/vendor mapping!" >&2; exit 1; }
+[ "$HAS_ODM" -eq 1 ] || { echo "CRITICAL ERROR: Manifest $MAP_PATH missing /mnt/sysroot/odm mapping!" >&2; exit 1; }
+if [ "$HAS_PRODUCT" -eq 0 ] && [ "$HAS_MY_PRODUCT" -eq 0 ]; then
+    echo "CRITICAL ERROR: Manifest $MAP_PATH must map at least one product partition (/mnt/sysroot/product or /mnt/sysroot/my_product)!" >&2
     exit 1
+fi
+
+# Reject duplicate image content if both product and my_product are staged
+if [ -f "$IMAGES_DIR/product.erofs.img" ] && [ -f "$IMAGES_DIR/my_product.erofs.img" ]; then
+    P_SHA=$(sha256sum "$IMAGES_DIR/product.erofs.img" | awk '{print $1}')
+    MP_SHA=$(sha256sum "$IMAGES_DIR/my_product.erofs.img" | awk '{print $1}')
+    if [ "$P_SHA" = "$MP_SHA" ]; then
+        echo "CRITICAL ERROR: Ambiguous duplicate image content! product.erofs.img and my_product.erofs.img have identical SHA-256 ($P_SHA). Rejecting duplicate mapping." >&2
+        exit 1
+    else
+        echo "Found independent product.erofs.img and my_product.erofs.img (distinct SHA-256 hashes verified)."
+    fi
 fi
 
 # All 4 bootstrap APEX modules are MANDATORY with validated metadata
@@ -195,17 +291,6 @@ for apex_mod in "runtime_apex" "art_apex" "i18n_apex" "tzdata_apex"; do
     fi
     MANDATORY_IMAGES+=("${apex_mod}.expanded_size:/mnt/${apex_mod}.expanded_size")
 done
-
-# Optional partition map manifest
-if [ -f "$IMAGES_DIR/PARTITION_MAP" ]; then
-    MANDATORY_IMAGES+=("PARTITION_MAP:/mnt/PARTITION_MAP")
-fi
-
-# Optional partition images
-OPTIONAL_IMAGES=()
-if [ -f "$IMAGES_DIR/my_region.erofs.img" ]; then
-    OPTIONAL_IMAGES+=("my_region.erofs.img:/mnt/my_region.img")
-fi
 
 ALL_STAGED=("${MANDATORY_IMAGES[@]}" "${OPTIONAL_IMAGES[@]}")
 

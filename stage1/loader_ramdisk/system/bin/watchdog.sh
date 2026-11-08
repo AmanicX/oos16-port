@@ -35,6 +35,13 @@ validate_timeout() {
             ;;
     esac
 
+    # Guard against shell arithmetic overflow with large digit strings (> 5 digits exceeds 86400)
+    if [ "${#raw_val}" -gt 5 ]; then
+        log_msg "[WATCHDOG WARN] $var_name '$raw_val' exceeds maximum (${max_val}s). Falling back to safe default (${default_val}s)."
+        echo "$default_val"
+        return 0
+    fi
+
     if [ "$raw_val" -le 0 ]; then
         log_msg "[WATCHDOG WARN] Non-positive $var_name '$raw_val'. Falling back to safe default (${default_val}s)."
         echo "$default_val"
@@ -49,35 +56,82 @@ validate_timeout() {
     fi
 }
 
-TIMEOUT=$(validate_timeout "WATCHDOG_TIMEOUT" "${WATCHDOG_TIMEOUT:-60}" 60 1 86400)
-STAGE2_TIMEOUT=$(validate_timeout "WATCHDOG_STAGE2_TIMEOUT" "${WATCHDOG_STAGE2_TIMEOUT:-120}" 120 1 86400)
+TIMEOUT=$(validate_timeout "WATCHDOG_TIMEOUT" "${WATCHDOG_TIMEOUT-60}" 60 1 86400)
+STAGE2_TIMEOUT=$(validate_timeout "WATCHDOG_STAGE2_TIMEOUT" "${WATCHDOG_STAGE2_TIMEOUT-120}" 120 1 86400)
 # Default first boot health timeout: 600s (10 minutes)
-HEALTH_TIMEOUT=$(validate_timeout "WATCHDOG_HEALTH_TIMEOUT" "${WATCHDOG_HEALTH_TIMEOUT:-600}" 600 1 86400)
+HEALTH_TIMEOUT=$(validate_timeout "WATCHDOG_HEALTH_TIMEOUT" "${WATCHDOG_HEALTH_TIMEOUT-600}" 600 1 86400)
 
-RAW_SLEEP="${WATCHDOG_SLEEP_INTERVAL:-1}"
-case "$RAW_SLEEP" in
-    ''|*[!0-9.]*)
-        log_msg "[WATCHDOG WARN] Invalid non-numeric WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP'. Falling back to safe default (1s)."
-        SLEEP_INTERVAL=1
-        ;;
-    *.*.*)
-        log_msg "[WATCHDOG WARN] Malformed WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP' (multiple decimal points). Falling back to default (1s)."
-        SLEEP_INTERVAL=1
-        ;;
-    *)
-        _int_part="${RAW_SLEEP%%.*}"
-        [ -z "$_int_part" ] && _int_part=0
-        if [ "$_int_part" -ge 60 ]; then
-            log_msg "[WATCHDOG WARN] WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP' exceeds maximum (60s). Falling back to default (1s)."
-            SLEEP_INTERVAL=1
-        elif [ "$RAW_SLEEP" = "0" ] || [ "$RAW_SLEEP" = "0.0" ] || [ "$RAW_SLEEP" = "0.00" ]; then
-            log_msg "[WATCHDOG WARN] Zero WATCHDOG_SLEEP_INTERVAL '$RAW_SLEEP' prohibited. Falling back to default (1s)."
-            SLEEP_INTERVAL=1
-        else
-            SLEEP_INTERVAL="$RAW_SLEEP"
-        fi
-        ;;
-esac
+RAW_SLEEP="${WATCHDOG_SLEEP_INTERVAL-1}"
+validate_sleep_interval() {
+    local raw="$1"
+    case "$raw" in
+        ''|*[!0-9.]*)
+            log_msg "[WATCHDOG WARN] Invalid non-numeric WATCHDOG_SLEEP_INTERVAL '$raw'. Falling back to default (1s)."
+            echo "1"
+            return 0
+            ;;
+        *.*.*)
+            log_msg "[WATCHDOG WARN] Malformed WATCHDOG_SLEEP_INTERVAL '$raw' (multiple decimal points). Falling back to default (1s)."
+            echo "1"
+            return 0
+            ;;
+        .*)
+            log_msg "[WATCHDOG WARN] Malformed WATCHDOG_SLEEP_INTERVAL '$raw' (leading decimal point prohibited). Falling back to default (1s)."
+            echo "1"
+            return 0
+            ;;
+        *.)
+            log_msg "[WATCHDOG WARN] Malformed WATCHDOG_SLEEP_INTERVAL '$raw' (trailing decimal point prohibited). Falling back to default (1s)."
+            echo "1"
+            return 0
+            ;;
+    esac
+
+    local int_part="${raw%%.*}"
+    local frac_part=""
+    case "$raw" in
+        *.*) frac_part="${raw#*.}" ;;
+    esac
+
+    if [ "${#int_part}" -gt 2 ]; then
+        log_msg "[WATCHDOG WARN] WATCHDOG_SLEEP_INTERVAL '$raw' exceeds maximum (60s). Falling back to default (1s)."
+        echo "1"
+        return 0
+    fi
+
+    local int_num=$((10#$int_part))
+    local all_zero=1
+    if [ "$int_num" -gt 0 ]; then
+        all_zero=0
+    elif [ -n "$frac_part" ]; then
+        case "$frac_part" in
+            *[!0]*) all_zero=0 ;;
+        esac
+    fi
+
+    if [ "$all_zero" -eq 1 ]; then
+        log_msg "[WATCHDOG WARN] Zero WATCHDOG_SLEEP_INTERVAL '$raw' prohibited. Falling back to default (1s)."
+        echo "1"
+        return 0
+    fi
+
+    if [ "$int_num" -gt 60 ]; then
+        log_msg "[WATCHDOG WARN] WATCHDOG_SLEEP_INTERVAL '$raw' exceeds maximum (60s). Falling back to default (1s)."
+        echo "1"
+        return 0
+    elif [ "$int_num" -eq 60 ] && [ -n "$frac_part" ]; then
+        case "$frac_part" in
+            *[!0]*)
+                log_msg "[WATCHDOG WARN] WATCHDOG_SLEEP_INTERVAL '$raw' exceeds maximum (60s). Falling back to default (1s)."
+                echo "1"
+                return 0
+                ;;
+        esac
+    fi
+
+    echo "$raw"
+}
+SLEEP_INTERVAL=$(validate_sleep_interval "$RAW_SLEEP")
 
 RAW_MAX_TICKS="${WATCHDOG_MAX_TICKS:-0}"
 case "$RAW_MAX_TICKS" in
@@ -86,8 +140,8 @@ case "$RAW_MAX_TICKS" in
         MAX_TICKS=0
         ;;
     *)
-        if [ "$RAW_MAX_TICKS" -lt 0 ]; then
-            log_msg "[WATCHDOG WARN] Negative WATCHDOG_MAX_TICKS '$RAW_MAX_TICKS'. Falling back to safe default (0)."
+        if [ "${#RAW_MAX_TICKS}" -gt 7 ]; then
+            log_msg "[WATCHDOG WARN] WATCHDOG_MAX_TICKS '$RAW_MAX_TICKS' exceeds 1000000. Falling back to default (0)."
             MAX_TICKS=0
         elif [ "$RAW_MAX_TICKS" -gt 1000000 ]; then
             log_msg "[WATCHDOG WARN] WATCHDOG_MAX_TICKS '$RAW_MAX_TICKS' exceeds 1000000. Falling back to default (0)."

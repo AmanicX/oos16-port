@@ -4,7 +4,7 @@
 # OxygenOS 16 (Android 16 / SDK 36 / Baklava) on OnePlus 7T (HD1901 / hotdogb)
 #
 # Provenance:
-# - Donor ROM: OnePlus 9 Pro OxygenOS 16 (ota_full-LE2113_16.0.10.500.zip)
+# - Donor ROM: OnePlus 9 (lemonade / LE2113) OxygenOS 16 (ota_full-LE2113_16.0.10.500.zip)
 # - Device Base: LineageOS 23.2 (hotdogb) / crDroid 12.x vendor/odm
 # - Injections:
 #   * Google Photos Unlimited Original Quality Backup (pixel_2016_experience.xml)
@@ -471,18 +471,40 @@ extract_and_stage_apex "art" "art_apex" 1
 extract_and_stage_apex "i18n" "i18n_apex" 1
 extract_and_stage_apex "tzdata" "tzdata_apex" 1
 
-# Generate explicit partition-to-mountpoint mapping manifest
-echo "Generating explicit partition-to-mountpoint mapping manifest (PARTITION_MAP)..."
+# Generate authoritative partition-to-mountpoint mapping manifest dynamically
+echo "Generating authoritative partition-to-mountpoint mapping manifest (PARTITION_MAP)..."
 cat > "$STAGING_DIR/PARTITION_MAP" << 'EOF'
-# OxygenOS 16 / ColorOS RAM Bringup Partition Map Manifest
-# Format: image_filename:target_mountpoint:nature
-system.erofs.img:/mnt/sysroot:mandatory
-system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory
-vendor.erofs.img:/mnt/sysroot/vendor:mandatory
-odm.erofs.img:/mnt/sysroot/odm:mandatory
-my_product.erofs.img:/mnt/sysroot/my_product:mandatory
-my_region.erofs.img:/mnt/sysroot/my_region:optional
+# OxygenOS 16 / ColorOS Authoritative Partition Map Manifest
+# Format: image_filename:target_mountpoint:nature:sha256
 EOF
+
+for part_def in "${PARTITIONS[@]}"; do
+    NAME=$(echo "$part_def" | cut -d: -f1)
+    MANDATORY=$(echo "$part_def" | cut -d: -f3)
+    STAGE_IMG="$STAGING_DIR/$NAME.erofs.img"
+    [ -f "$STAGE_IMG" ] || continue
+
+    target_mp=""
+    nature="mandatory"
+    [ "$MANDATORY" -eq 0 ] && nature="optional"
+
+    case "$NAME" in
+        system) target_mp="/mnt/sysroot" ;;
+        system_ext) target_mp="/mnt/sysroot/system_ext" ;;
+        vendor) target_mp="/mnt/sysroot/vendor" ;;
+        odm) target_mp="/mnt/sysroot/odm" ;;
+        product) target_mp="/mnt/sysroot/product" ;;
+        my_product) target_mp="/mnt/sysroot/my_product" ;;
+        my_region) target_mp="/mnt/sysroot/my_region" ;;
+        *)
+            echo "CRITICAL BUILD ERROR: Unknown partition $NAME has no mapped mountpoint!" >&2
+            exit 1
+            ;;
+    esac
+
+    img_sha=$(sha256sum "$STAGE_IMG" | awk '{print $1}')
+    echo "$NAME.erofs.img:$target_mp:$nature:$img_sha" >> "$STAGING_DIR/PARTITION_MAP"
+done
 
 # 8. Staging Verification & Pre-Publish Validation
 echo "Verifying staged images before atomic publication..."

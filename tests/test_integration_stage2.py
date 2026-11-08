@@ -296,7 +296,14 @@ sys.exit(0)
             with open(os.path.join(img_dir, f"{apex}.expanded_size"), "w") as f:
                 f.write("20971520\n")
         with open(os.path.join(img_dir, "PARTITION_MAP"), "w") as f:
-            f.write("system.erofs.img:/mnt/sysroot:mandatory\n")
+            f.write(
+                "system.erofs.img:/mnt/sysroot:mandatory\n"
+                "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
+                "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
+                "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
+                "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
+                "my_region.erofs.img:/mnt/sysroot/my_region:optional\n"
+            )
 
     def run_stage2_runner(self, images_dir, mock_adb):
         env = os.environ.copy()
@@ -890,8 +897,8 @@ exit 1
 
         # Verify Stage-1 supervisor replaces itself via exec to maintain PID 1
         self.assertIn("exec /system/bin/sh /system/bin/stage2_init.sh", loader_content)
-        # Verify Stage-2 replaces itself with Android init second_stage via exec as PID 1
-        self.assertIn("exec /system/bin/chroot /mnt/sysroot /system/bin/init second_stage", stage2_content)
+        # Verify Stage-2 replaces itself with Android init selinux_setup via exec as PID 1
+        self.assertIn('exec /system/bin/chroot /mnt/sysroot /system/bin/init "${INIT_ENTRY_STAGE:-selinux_setup}"', stage2_content)
 
         # Verify native_ramdisk/init is an executable script supervisor, not a recovery init symlink
         self.assertTrue(os.path.isfile(native_init))
@@ -929,8 +936,8 @@ exit 1
 
         # Verify versioned payload directory: /mnt/sysroot/apex/${mod_name}@${version}
         self.assertIn('versioned_dir="/mnt/sysroot/apex/${mod_name}@${version}"', content)
-        # Verify active symlink: /mnt/sysroot/apex/${mod_name} -> ${mod_name}@${version}
-        self.assertIn('ln -sfn "${mod_name}@${version}" "$mod_name"', content)
+        # Verify active bind mount: /mnt/sysroot/apex/${mod_name} -> versioned dir
+        self.assertIn('mount_or_fail --bind "$versioned_dir" "$active_mount"', content)
         # Verify strict version validation without silent fallbacks
         self.assertIn("grep -qE '^[1-9][0-9]*$'", content)
         self.assertIn('Mandatory APEX metadata .version for $mod_name', content)
@@ -1221,6 +1228,8 @@ exit 1
             f.write(identical_data)
         with open(os.path.join(test_images, "product.erofs.img"), "wb") as f:
             f.write(identical_data)
+        with open(os.path.join(test_images, "PARTITION_MAP"), "a") as f:
+            f.write("product.erofs.img:/mnt/sysroot/product:mandatory\n")
 
         mock_adb = self.create_mock_adb({"ro_status": "1"})
         res = self.run_stage2_runner(test_images, mock_adb)
@@ -1236,6 +1245,8 @@ exit 1
             f.write(b"MY_PRODUCT_CONTENT_UNIQUE")
         with open(os.path.join(test_images, "product.erofs.img"), "wb") as f:
             f.write(b"PRODUCT_CONTENT_UNIQUE")
+        with open(os.path.join(test_images, "PARTITION_MAP"), "a") as f:
+            f.write("product.erofs.img:/mnt/sysroot/product:mandatory\n")
 
         mock_adb = self.create_mock_adb({
             "ro_status": "1",
@@ -1250,14 +1261,16 @@ exit 1
 
     def run_stage2_ram_check_script(self, meminfo_content, mnt_free_mb, tmp_free_mb, apex_sizes, omit_meminfo=False):
         """
-        Executes the actual stage2_init.sh RAM checking logic in an isolated subshell environment.
+        Executes the real scripts/stage2_init.sh validate_device_ram check in an isolated subshell environment.
         """
         sub_dir = tempfile.mkdtemp(prefix="stage2_ram_check_")
         try:
             mnt_dir = os.path.join(sub_dir, "mnt")
             tmp_dir = os.path.join(sub_dir, "tmp")
+            mock_bin = os.path.join(sub_dir, "bin")
             os.makedirs(mnt_dir, exist_ok=True)
             os.makedirs(tmp_dir, exist_ok=True)
+            os.makedirs(mock_bin, exist_ok=True)
 
             meminfo_file = os.path.join(sub_dir, "meminfo")
             if not omit_meminfo and meminfo_content is not None:
@@ -1269,80 +1282,49 @@ exit 1
                     with open(os.path.join(mnt_dir, f"{mod}.expanded_size"), "w") as f:
                         f.write(str(sz))
 
-            script = f"""
-fatal() {{
-    echo "[FATAL] $1" >&2
-    exit 42
-}}
+            # Mock df / toybox script returning configured free space
+            mock_df = os.path.join(mock_bin, "df")
+            with open(mock_df, "w") as f:
+                f.write(f"""#!/bin/sh
+target="$2"
+[ -z "$target" ] && target="$1"
+bname=$(basename "$target")
+if [ "$bname" = "tmp" ]; then
+    cat <<EOF
+Filesystem 1M-blocks Used Available Use% Mounted on
+tmpfs 512 0 {tmp_free_mb} 0% $target
+EOF
+else
+    cat <<EOF
+Filesystem 1M-blocks Used Available Use% Mounted on
+tmpfs 6500 0 {mnt_free_mb} 0% $target
+EOF
+fi
+exit 0
+""")
+            os.chmod(mock_df, stat.S_IRWXU)
 
-MNT_FREE_MB="{mnt_free_mb}"
-REQUIRED_MNT_FREE_MB=576
-if [ "$MNT_FREE_MB" -lt "$REQUIRED_MNT_FREE_MB" ]; then
-    fatal "/mnt has only ${{MNT_FREE_MB}}MB free; requires ${{REQUIRED_MNT_FREE_MB}}MB"
+            mock_toybox = os.path.join(mock_bin, "toybox")
+            with open(mock_toybox, "w") as f:
+                f.write(f"""#!/bin/sh
+if [ "$1" = "df" ]; then
+    shift
+    exec "{mock_df}" "$@"
 fi
+exec "$@"
+""")
+            os.chmod(mock_toybox, stat.S_IRWXU)
 
-TMP_FREE_MB="{tmp_free_mb}"
-if [ "$TMP_FREE_MB" -lt 64 ]; then
-    fatal "/tmp has only ${{TMP_FREE_MB}}MB free; requires 64MB"
-fi
+            env = os.environ.copy()
+            env["PATH"] = f"{mock_bin}:{env.get('PATH', '')}"
+            env["MEMINFO_FILE"] = meminfo_file
+            env["MNT_DIR"] = mnt_dir
+            env["TMP_DIR"] = tmp_dir
+            env["STAGE2_TEST_MODE"] = "1"
+            env["TOYBOX_CMD"] = mock_toybox
 
-MEMINFO_PATH="{meminfo_file}"
-if [ ! -f "$MEMINFO_PATH" ] || [ ! -s "$MEMINFO_PATH" ]; then
-    fatal "/proc/meminfo is missing or empty"
-fi
-_DEV_MEMINFO=$(cat "$MEMINFO_PATH" 2>/dev/null || true)
-if [ -z "$_DEV_MEMINFO" ]; then
-    fatal "Unable to read /proc/meminfo"
-fi
-
-_DEV_MEM_TOTAL_KB=$(echo "$_DEV_MEMINFO" | awk '/MemTotal:/ {{print $2}}' | tr -d '[:space:]')
-case "$_DEV_MEM_TOTAL_KB" in
-    ''|*[!0-9]*)
-        fatal "Missing or non-numeric MemTotal" ;;
-esac
-if [ "$_DEV_MEM_TOTAL_KB" -gt 100000000 ]; then
-    fatal "MemTotal overflow"
-fi
-_DEV_MEM_TOTAL_MB=$((_DEV_MEM_TOTAL_KB / 1024))
-if [ "$_DEV_MEM_TOTAL_MB" -lt 6500 ]; then
-    fatal "MemTotal is ${{_DEV_MEM_TOTAL_MB}}MB (< 6500MB)"
-fi
-
-_DEV_MEM_AVAIL_KB=$(echo "$_DEV_MEMINFO" | awk '/MemAvailable:/ {{print $2}}' | tr -d '[:space:]')
-case "$_DEV_MEM_AVAIL_KB" in
-    ''|*[!0-9]*)
-        fatal "Missing or non-numeric MemAvailable" ;;
-esac
-if [ "$_DEV_MEM_AVAIL_KB" -gt "$_DEV_MEM_TOTAL_KB" ]; then
-    fatal "MemAvailable exceeds MemTotal"
-fi
-_DEV_MEM_AVAIL_MB=$((_DEV_MEM_AVAIL_KB / 1024))
-
-_TOTAL_EXP_APEX_BYTES=0
-for _mod in runtime_apex art_apex i18n_apex tzdata_apex; do
-    _exp_f="{mnt_dir}/${{_mod}}.expanded_size"
-    if [ ! -f "$_exp_f" ] || [ ! -s "$_exp_f" ]; then
-        fatal "Missing mandatory APEX metadata $_exp_f"
-    fi
-    _val=$(cat "$_exp_f" 2>/dev/null | tr -d '[:space:]')
-    case "$_val" in
-        ''|*[!0-9]*)
-            fatal "Malformed non-numeric APEX expanded size in $_exp_f: '$_val'" ;;
-    esac
-    if [ "$_val" -le 0 ] || [ "$_val" -gt 524288000 ]; then
-        fatal "APEX expanded size in $_exp_f out of range"
-    fi
-    _TOTAL_EXP_APEX_BYTES=$((_TOTAL_EXP_APEX_BYTES + _val))
-done
-_EXP_APEX_MB=$(( (_TOTAL_EXP_APEX_BYTES + 1048575) / 1048576 ))
-_FUTURE_RAM_REQ_MB=$((_EXP_APEX_MB + 1024 + 512 + 1536 + 256))
-
-if [ "$_DEV_MEM_AVAIL_MB" -lt "$_FUTURE_RAM_REQ_MB" ]; then
-    fatal "Insufficient device RAM! MemAvailable is ${{_DEV_MEM_AVAIL_MB}}MB, required ${{_FUTURE_RAM_REQ_MB}}MB"
-fi
-echo "SUCCESS"
-"""
-            return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            stage2_path = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+            return subprocess.run(["/bin/sh", stage2_path, "--check-ram"], env=env, capture_output=True, text=True)
         finally:
             shutil.rmtree(sub_dir, ignore_errors=True)
 
@@ -1351,7 +1333,7 @@ echo "SUCCESS"
         default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
         res = self.run_stage2_ram_check_script(None, 1000, 100, default_apex, omit_meminfo=True)
         self.assertEqual(res.returncode, 42)
-        self.assertIn("/proc/meminfo is missing or empty", res.stderr)
+        self.assertIn("is missing or empty", res.stderr)
 
     def test_stage2_device_ram_check_missing_memavailable_fatal(self):
         """Verify device-side RAM check halts fail-closed if MemAvailable is missing."""
@@ -1375,7 +1357,7 @@ echo "SUCCESS"
         default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
         res = self.run_stage2_ram_check_script(mem_data, 1000, 100, default_apex)
         self.assertEqual(res.returncode, 0)
-        self.assertIn("SUCCESS", res.stdout)
+        self.assertIn("Device-side total RAM verified", res.stdout)
 
     def test_stage2_device_ram_check_mnt_insufficient_capacity_fatal(self):
         """Verify device-side RAM check fails if /mnt has less than 576MB free."""
@@ -1383,7 +1365,8 @@ echo "SUCCESS"
         default_apex = {"runtime_apex": 20000000, "art_apex": 40000000, "i18n_apex": 20000000, "tzdata_apex": 1000000}
         res = self.run_stage2_ram_check_script(mem_data, 500, 100, default_apex)
         self.assertEqual(res.returncode, 42)
-        self.assertIn("/mnt has only 500MB free; requires 576MB", res.stderr)
+        self.assertIn("has only 500MB free", res.stderr)
+        self.assertIn("requires at least 576MB", res.stderr)
 
     def test_stage2_device_ram_check_missing_apex_metadata_fatal(self):
         """Verify device-side RAM check fails if any mandatory APEX metadata is missing."""
@@ -1392,6 +1375,76 @@ echo "SUCCESS"
         res = self.run_stage2_ram_check_script(mem_data, 1000, 100, incomplete_apex)
         self.assertEqual(res.returncode, 42)
         self.assertIn("Missing mandatory APEX metadata", res.stderr)
+
+    def run_stage2_manifest_check(self, manifest_content):
+        """Helper to invoke production parse_and_validate_partition_map via scripts/stage2_init.sh."""
+        sub_dir = tempfile.mkdtemp(prefix="stage2_manifest_")
+        try:
+            map_file = os.path.join(sub_dir, "PARTITION_MAP")
+            if manifest_content is not None:
+                with open(map_file, "w") as f:
+                    f.write(manifest_content)
+            env = os.environ.copy()
+            env["STAGE2_TEST_MODE"] = "1"
+            stage2_path = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
+            return subprocess.run(["/bin/sh", stage2_path, "--parse-manifest", map_file], env=env, capture_output=True, text=True)
+        finally:
+            shutil.rmtree(sub_dir, ignore_errors=True)
+
+    def test_stage2_manifest_validation_success(self):
+        """Verify authoritative PARTITION_MAP strictly succeeds with full valid mapping."""
+        valid_map = (
+            "system.erofs.img:/mnt/sysroot:mandatory\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
+            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
+            "my_region.erofs.img:/mnt/sysroot/my_region:optional\n"
+        )
+        res = self.run_stage2_manifest_check(valid_map)
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stdout}\n{res.stderr}")
+        self.assertIn("Partition manifest", res.stdout)
+        self.assertIn("strictly validated", res.stdout)
+
+    def test_stage2_manifest_disallowed_target_fatal(self):
+        """Verify manifest parser rejects mountpoints not present in explicit allowlist."""
+        invalid_map = (
+            "system.erofs.img:/mnt/sysroot:mandatory\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
+            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
+            "evil.img:/mnt/sysroot/evil_dir:mandatory\n"
+        )
+        res = self.run_stage2_manifest_check(invalid_map)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("is NOT in the allowed mountpoints list", res.stderr)
+
+    def test_stage2_manifest_missing_mandatory_mapping_fatal(self):
+        """Verify manifest parser halts fail-closed if mandatory partition (e.g. vendor) is missing."""
+        missing_vendor_map = (
+            "system.erofs.img:/mnt/sysroot:mandatory\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
+        )
+        res = self.run_stage2_manifest_check(missing_vendor_map)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("Mandatory manifest mapping for /mnt/sysroot/vendor missing", res.stderr)
+
+    def test_stage2_manifest_duplicate_target_fatal(self):
+        """Verify manifest parser rejects duplicate target mountpoints."""
+        dup_target_map = (
+            "system.erofs.img:/mnt/sysroot:mandatory\n"
+            "system2.erofs.img:/mnt/sysroot:mandatory\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
+            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
+        )
+        res = self.run_stage2_manifest_check(dup_target_map)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("Target mountpoint '/mnt/sysroot' mapped multiple times", res.stderr)
 
     def test_stage2_device_duplicate_product_sha_rejected(self):
         """Verify stage2_init.sh duplicate detection rejects identical content between product and my_product."""

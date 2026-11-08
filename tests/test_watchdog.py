@@ -452,7 +452,7 @@ exit 0
             "WATCHDOG_SLEEP_INTERVAL": "0",
             "WATCHDOG_MAX_TICKS": "1",
         }, timeout_sec=3)
-        self.assertIn("[WATCHDOG WARN] Invalid WATCHDOG_STAGE2_TIMEOUT '-50'", res.stderr)
+        self.assertIn("WATCHDOG_STAGE2_TIMEOUT '-50'", res.stderr)
         self.assertIn("[WATCHDOG WARN] WATCHDOG_HEALTH_TIMEOUT '999999' exceeds maximum", res.stderr)
         self.assertIn("[WATCHDOG WARN] Zero WATCHDOG_SLEEP_INTERVAL '0' prohibited", res.stderr)
 
@@ -464,6 +464,44 @@ exit 0
             "WATCHDOG_MAX_TICKS": "1"
         }, timeout_sec=2)
         self.assertIn("multiple decimal points", res.stderr)
+
+    def test_watchdog_numeric_grammar_and_boundaries(self):
+        """
+        Verify specific boundary and invalid values requested by safety audit:
+        '.', '.5', '1.', '0.001', '0', '60', '60.1', '999999999999999999999999', negative values, empty.
+        """
+        cases = [
+            (".", "leading decimal point prohibited"),
+            (".5", "leading decimal point prohibited"),
+            ("1.", "trailing decimal point prohibited"),
+            ("0", "Zero WATCHDOG_SLEEP_INTERVAL '0' prohibited"),
+            ("0.0", "Zero WATCHDOG_SLEEP_INTERVAL '0.0' prohibited"),
+            ("60.1", "exceeds maximum"),
+            ("-5", "Invalid non-numeric"),
+            ("", "Invalid non-numeric"),
+            ("1.2.3.4", "multiple decimal points"),
+        ]
+        for val, expected_err in cases:
+            res = self.run_watchdog({
+                "WATCHDOG_SLEEP_INTERVAL": val,
+                "WATCHDOG_MAX_TICKS": "1"
+            }, timeout_sec=2)
+            self.assertIn(expected_err, res.stderr, f"Failed for WATCHDOG_SLEEP_INTERVAL='{val}'")
+
+        # Test valid boundaries: 0.001 and 60 must NOT log a warning
+        for val in ["0.001", "60", "0.5", "1"]:
+            res = self.run_watchdog({
+                "WATCHDOG_SLEEP_INTERVAL": val,
+                "WATCHDOG_MAX_TICKS": "1"
+            }, timeout_sec=2)
+            self.assertNotIn("WATCHDOG_SLEEP_INTERVAL", res.stderr, f"Unexpected warning for valid '{val}'")
+
+        # Test overflow on integer timeout: 999999999999999999999999
+        res_overflow = self.run_watchdog({
+            "WATCHDOG_TIMEOUT": "999999999999999999999999",
+            "WATCHDOG_MAX_TICKS": "1"
+        }, timeout_sec=2)
+        self.assertIn("exceeds maximum (86400s)", res_overflow.stderr)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

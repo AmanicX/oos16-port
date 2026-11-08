@@ -129,7 +129,7 @@ func TestValidateOrCreateLegacyNodeSymlinkHandling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Stale symlink to regular file should be removed and recreated in test mode
+	// Stale symlink to regular file should be atomically replaced in test mode
 	res, err := validateOrCreateLegacyNode(symlinkPath, 10, 237, true)
 	if err != nil {
 		t.Fatalf("validateOrCreateLegacyNode failed on stale symlink: %v", err)
@@ -174,12 +174,13 @@ func TestSafeSymlinkRefuseOverwrite(t *testing.T) {
 	}
 }
 
-func TestSafeSymlinkRealCharDevice(t *testing.T) {
+func TestSafeSymlinkRealCharDeviceAndAtomicReplacement(t *testing.T) {
 	// On Linux host, /dev/null is character device
 	if fi, err := os.Stat("/dev/null"); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
 		tmpDir := t.TempDir()
 		symlinkDest := filepath.Join(tmpDir, "binder_symlink")
 
+		// 1. Create initial valid symlink
 		res, err := safeSymlink("/dev/null", symlinkDest)
 		if err != nil {
 			t.Fatalf("safeSymlink to /dev/null failed: %v", err)
@@ -188,7 +189,7 @@ func TestSafeSymlinkRealCharDevice(t *testing.T) {
 			t.Errorf("Expected ResultCreated on first symlink, got %v", res)
 		}
 
-		// Calling safeSymlink again on existing identical symlink should be idempotent ResultAlreadyValid
+		// 2. Calling safeSymlink again on existing identical symlink should be idempotent ResultAlreadyValid
 		res2, err := safeSymlink("/dev/null", symlinkDest)
 		if err != nil {
 			t.Fatalf("Idempotent safeSymlink failed: %v", err)
@@ -197,13 +198,61 @@ func TestSafeSymlinkRealCharDevice(t *testing.T) {
 			t.Errorf("Expected ResultAlreadyValid on second symlink, got %v", res2)
 		}
 
-		// Destination conflicting with /dev/zero (different char device)
+		// 3. Stale symlink pointing to nonexistent path: should be atomically replaced
+		staleSym := filepath.Join(tmpDir, "stale_sym")
+		_ = os.Symlink(filepath.Join(tmpDir, "nonexistent_target"), staleSym)
+		res3, err := safeSymlink("/dev/null", staleSym)
+		if err != nil {
+			t.Fatalf("safeSymlink failed on stale symlink: %v", err)
+		}
+		if res3 != ResultCreated {
+			t.Errorf("Expected ResultCreated on replacing stale symlink, got %v", res3)
+		}
+		target, err := os.Readlink(staleSym)
+		if err != nil {
+			t.Fatalf("Failed to readlink %s: %v", staleSym, err)
+		}
+		resolvedTarget := target
+		if !filepath.IsAbs(target) {
+			resolvedTarget = filepath.Clean(filepath.Join(filepath.Dir(staleSym), target))
+		}
+		if resolvedTarget != "/dev/null" {
+			t.Errorf("Expected target resolving to /dev/null, got %s (raw %s)", resolvedTarget, target)
+		}
+
+		// 4. Destination conflicting with /dev/zero (different char device)
 		if zfi, err := os.Stat("/dev/zero"); err == nil && (zfi.Mode()&os.ModeCharDevice != 0) {
 			_, err := safeSymlink("/dev/null", "/dev/zero")
 			if err == nil {
 				t.Fatalf("Expected error when destination is conflicting char device (/dev/zero), got nil")
 			}
 		}
+	}
+}
+
+func TestSafeSymlinkPreservesOnFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	staleSymlink := filepath.Join(tmpDir, "stale_symlink")
+	_ = os.Symlink(filepath.Join(tmpDir, "dead_link"), staleSymlink)
+
+	// Attempting to replace with nonexistent source must fail
+	nonexistentSrc := filepath.Join(tmpDir, "nonexistent_source")
+	_, err := safeSymlink(nonexistentSrc, staleSymlink)
+	if err == nil {
+		t.Fatalf("Expected error when source does not exist, got nil")
+	}
+
+	// Verify destination symlink was NOT destroyed before failure
+	lfi, lerr := os.Lstat(staleSymlink)
+	if lerr != nil {
+		t.Fatalf("Destination stale symlink was prematurely removed: %v", lerr)
+	}
+	if lfi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("Destination is no longer a symlink!")
+	}
+	target, _ := os.Readlink(staleSymlink)
+	if target != filepath.Join(tmpDir, "dead_link") {
+		t.Fatalf("Original stale symlink target corrupted!")
 	}
 }
 
@@ -264,6 +313,76 @@ func TestRollbackPreservesPreExisting(t *testing.T) {
 	}
 	if _, err := os.Lstat(preExistingSymlink); err != nil {
 		t.Errorf("Pre-existing symlink was erroneously removed: %v", err)
+	}
+}
+
+func TestRunInitFullLifecycleAndRollback(t *testing.T) {
+	tmpDir := t.TempDir()
+	devDir := filepath.Join(tmpDir, "dev")
+	mountDir := filepath.Join(devDir, "binderfs")
+	sysDir := filepath.Join(tmpDir, "sys")
+	procDir := filepath.Join(tmpDir, "proc")
+
+	os.MkdirAll(mountDir, 0755)
+	os.MkdirAll(filepath.Join(sysDir, "class/misc"), 0755)
+	os.MkdirAll(procDir, 0755)
+
+	// Set up mock proc files
+	os.WriteFile(filepath.Join(procDir, "filesystems"), []byte("nodev\tbinder\n"), 0644)
+	os.WriteFile(filepath.Join(procDir, "mounts"), []byte("binder /dev/binderfs binder rw,relatime 0 0\n"), 0644)
+
+	// Set up mock sysfs for legacy binder and hwbinder, but intentionally omit vndbinder to trigger failure
+	for _, dev := range []string{"binder", "hwbinder"} {
+		mDir := filepath.Join(sysDir, "class/misc", dev)
+		os.MkdirAll(mDir, 0755)
+		os.WriteFile(filepath.Join(mDir, "dev"), []byte("10:237\n"), 0644)
+	}
+
+	// Pre-existing valid file in dev
+	preExisting := filepath.Join(devDir, "pre_existing")
+	os.WriteFile(preExisting, []byte("untouched"), 0644)
+
+	// Executing runInit with missing vndbinder MUST fail and rollback created items
+	err := runInit(filepath.Join(mountDir, "binder-control"), mountDir, devDir, sysDir, procDir, true)
+	if err == nil {
+		t.Fatalf("Expected runInit to fail when vndbinder is missing, got nil")
+	}
+
+	// Verify rollback cleaned up newly allocated nodes in devDir
+	if _, err := os.Stat(filepath.Join(devDir, "binder")); !os.IsNotExist(err) {
+		t.Errorf("Expected newly created /dev/binder to be rolled back on failure")
+	}
+	if _, err := os.Stat(filepath.Join(devDir, "hwbinder")); !os.IsNotExist(err) {
+		t.Errorf("Expected newly created /dev/hwbinder to be rolled back on failure")
+	}
+
+	// Verify pre-existing file remains intact
+	content, err := os.ReadFile(preExisting)
+	if err != nil || string(content) != "untouched" {
+		t.Errorf("Pre-existing file was affected during rollback: %v", err)
+	}
+
+	// Now add vndbinder sysfs entry and verify successful execution
+	vndDir := filepath.Join(sysDir, "class/misc/vndbinder")
+	os.MkdirAll(vndDir, 0755)
+	os.WriteFile(filepath.Join(vndDir, "dev"), []byte("10:238\n"), 0644)
+
+	err2 := runInit(filepath.Join(mountDir, "binder-control"), mountDir, devDir, sysDir, procDir, true)
+	if err2 != nil {
+		t.Fatalf("Expected runInit to succeed with all 3 devices, got error: %v", err2)
+	}
+
+	// Verify all 3 devices exist in devDir
+	for _, dev := range []string{"binder", "hwbinder", "vndbinder"} {
+		if _, err := os.Stat(filepath.Join(devDir, dev)); err != nil {
+			t.Errorf("Expected /dev/%s to exist after successful runInit: %v", dev, err)
+		}
+	}
+
+	// Re-running runInit should be idempotent and succeed
+	err3 := runInit(filepath.Join(mountDir, "binder-control"), mountDir, devDir, sysDir, procDir, true)
+	if err3 != nil {
+		t.Fatalf("Expected idempotent runInit to succeed, got error: %v", err3)
 	}
 }
 

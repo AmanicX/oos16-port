@@ -36,8 +36,11 @@ verify: arm64
 	@echo "Verification passed: binderfs_init_arm64 is static ELF 64-bit ARM aarch64."
 
 install: arm64 verify
+	mkdir -p ../build
+	cp binderfs_init_arm64 ../build/binderfs_init_arm64
 	cp binderfs_init_arm64 ../stage1/loader_ramdisk/system/bin/binderfs_init
 	cp binderfs_init_arm64 ../stage1/native_ramdisk/system/bin/binderfs_init
+	chmod 0755 ../build/binderfs_init_arm64
 	chmod 0755 ../stage1/loader_ramdisk/system/bin/binderfs_init
 	chmod 0755 ../stage1/native_ramdisk/system/bin/binderfs_init
 	cmp -s ../stage1/loader_ramdisk/system/bin/binderfs_init ../stage1/native_ramdisk/system/bin/binderfs_init

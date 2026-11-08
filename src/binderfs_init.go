@@ -74,7 +74,6 @@ func parseSysfsDev(content string) (uint32, uint32, error) {
 	if maj > 0xfffff {
 		return 0, 0, fmt.Errorf("major %d exceeds supported limit (0xfffff)", maj)
 	}
-	// Linux maximum minor on new encoding: 20 bits (0xfffff)
 	if min > 0xfffff {
 		return 0, 0, fmt.Errorf("minor %d exceeds supported limit (0xfffff)", min)
 	}
@@ -123,7 +122,7 @@ const (
 	ResultCreated
 )
 
-// validateOrCreateLegacyNode safely creates a character device node without overwriting unrelated files
+// validateOrCreateLegacyNode atomically creates a character device node without destroying existing nodes before replacement
 func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool) (OpResult, error) {
 	devNum, err := mkdev(maj, min)
 	if err != nil {
@@ -145,9 +144,7 @@ func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool)
 					}
 				}
 			}
-			if err := os.Remove(destNode); err != nil {
-				return 0, fmt.Errorf("failed to remove stale symlink %s: %w", destNode, err)
-			}
+			// Stale symlink: do not remove destNode immediately. Create replacement first, then atomic rename.
 		} else if fi.Mode()&os.ModeCharDevice != 0 {
 			st, ok := fi.Sys().(*syscall.Stat_t)
 			if !ok || st == nil {
@@ -169,23 +166,35 @@ func validateOrCreateLegacyNode(destNode string, maj, min uint32, testMode bool)
 		}
 	}
 
+	// Create replacement in temporary file to ensure atomic replacement without pre-destroying destNode
+	tmpNode := fmt.Sprintf("%s.tmp.%d", destNode, os.Getpid())
+	_ = os.Remove(tmpNode)
+
 	if testMode {
-		if err := os.WriteFile(destNode, []byte("test-legacy"), 0666); err != nil {
-			return 0, err
+		if err := os.WriteFile(tmpNode, []byte("test-legacy"), 0666); err != nil {
+			return 0, fmt.Errorf("failed to write test-legacy node %s: %w", tmpNode, err)
 		}
-		return ResultCreated, nil
+	} else {
+		if err := syscall.Mknod(tmpNode, syscall.S_IFCHR|0666, devNum); err != nil {
+			_ = os.Remove(tmpNode)
+			return 0, fmt.Errorf("mknod failed for %s (dev %d): %w", tmpNode, devNum, err)
+		}
+		if err := os.Chmod(tmpNode, 0666); err != nil {
+			_ = os.Remove(tmpNode)
+			return 0, fmt.Errorf("chmod failed for %s: %w", tmpNode, err)
+		}
 	}
 
-	if err := syscall.Mknod(destNode, syscall.S_IFCHR|0666, devNum); err != nil {
-		return 0, fmt.Errorf("mknod failed for %s (dev %d): %w", destNode, devNum, err)
+	if err := os.Rename(tmpNode, destNode); err != nil {
+		_ = os.Remove(tmpNode)
+		return 0, fmt.Errorf("atomic rename %s -> %s failed: %w", tmpNode, destNode, err)
 	}
-	if err := os.Chmod(destNode, 0666); err != nil {
-		return 0, fmt.Errorf("chmod failed for %s: %w", destNode, err)
-	}
+
 	return ResultCreated, nil
 }
 
-// safeSymlink creates a symlink from destNode to srcNode, strictly validating types
+// safeSymlink creates an atomic symlink from destNode to srcNode, strictly validating types
+// and replacing stale symlinks atomically without destroying the destination before creation succeeds.
 func safeSymlink(srcNode, destNode string) (OpResult, error) {
 	fi, err := os.Stat(srcNode)
 	if err != nil {
@@ -215,9 +224,7 @@ func safeSymlink(srcNode, destNode string) (OpResult, error) {
 					return ResultAlreadyValid, nil
 				}
 			}
-			if err := os.Remove(destNode); err != nil {
-				return 0, fmt.Errorf("failed to remove existing symlink %s: %w", destNode, err)
-			}
+			// Stale symlink: proceed with atomic replacement via temporary symlink and rename
 		} else if lfi.Mode()&os.ModeCharDevice != 0 {
 			dstStat, dstOk := lfi.Sys().(*syscall.Stat_t)
 			if srcOk && dstOk && srcStat != nil && dstStat != nil && srcStat.Rdev == dstStat.Rdev {
@@ -235,12 +242,23 @@ func safeSymlink(srcNode, destNode string) (OpResult, error) {
 		relPath = rel
 	}
 
-	if err := os.Symlink(relPath, destNode); err != nil {
-		return 0, fmt.Errorf("symlink %s -> %s failed: %w", destNode, relPath, err)
+	// Create temporary symlink first to guarantee atomic replacement
+	tmpSymlink := fmt.Sprintf("%s.tmp.%d", destNode, os.Getpid())
+	_ = os.Remove(tmpSymlink)
+
+	if err := os.Symlink(relPath, tmpSymlink); err != nil {
+		return 0, fmt.Errorf("symlink creation for %s -> %s failed: %w", tmpSymlink, relPath, err)
 	}
 	if err := os.Chmod(srcNode, 0666); err != nil && !os.IsPermission(err) {
+		_ = os.Remove(tmpSymlink)
 		return 0, fmt.Errorf("chmod source node %s failed: %w", srcNode, err)
 	}
+
+	if err := os.Rename(tmpSymlink, destNode); err != nil {
+		_ = os.Remove(tmpSymlink)
+		return 0, fmt.Errorf("atomic rename %s -> %s failed: %w", tmpSymlink, destNode, err)
+	}
+
 	return ResultCreated, nil
 }
 
@@ -257,43 +275,37 @@ func rollbackCreated(newlyAllocated, newlySymlinked, newlyLegacy []string) {
 	}
 }
 
-func main() {
-	controlPath := flag.String("control", "/dev/binderfs/binder-control", "Path to binder-control device")
-	mountPath := flag.String("mount", "/dev/binderfs", "Path to binderfs mountpoint")
-	devDir := flag.String("dev", "/dev", "Path to /dev directory for symlinks")
-	sysDir := flag.String("sys", "/sys", "Path to /sys directory for legacy sysfs fallback")
-	procDir := flag.String("proc", "/proc", "Path to /proc directory")
-	unitTestMode := flag.Bool("unit-test", false, "Unit test execution flag (isolated, no live kernel calls)")
-	flag.Parse()
-
+// runInit coordinates BinderFS and legacy node setup with transactional rollback on failure
+func runInit(controlPath, mountPath, devDir, sysDir, procDir string, unitTestMode bool) error {
 	devices := []string{"binder", "hwbinder", "vndbinder"}
 	logKmsg("[BINDERFS_INIT] Starting dynamic Binder device initialization...")
 
 	// 1. Verify kernel driver support
-	binderfsSupported := isBinderfsSupported(*procDir)
-	binderfsMounted := isBinderfsMounted(*mountPath, *procDir)
+	binderfsSupported := isBinderfsSupported(procDir)
+	binderfsMounted := isBinderfsMounted(mountPath, procDir)
 
 	if !binderfsSupported {
 		logKmsg("[BINDERFS_INIT INFO] Kernel /proc/filesystems does not report 'binder' filesystem. Will attempt direct control node or legacy fallback.")
 	} else if !binderfsMounted {
-		logKmsg(fmt.Sprintf("[BINDERFS_INIT WARNING] Binderfs filesystem supported but %s is not mounted as binderfs!", *mountPath))
+		logKmsg(fmt.Sprintf("[BINDERFS_INIT WARNING] Binderfs filesystem supported but %s is not mounted as binderfs!", mountPath))
 	} else {
-		logKmsg(fmt.Sprintf("[BINDERFS_INIT] Verified binderfs filesystem mounted at %s.", *mountPath))
+		logKmsg(fmt.Sprintf("[BINDERFS_INIT] Verified binderfs filesystem mounted at %s.", mountPath))
 	}
 
 	var newlyAllocated []string
 	var newlySymlinked []string
 	var newlyLegacy []string
-	controlFd, err := syscall.Open(*controlPath, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+
+	controlFd, err := syscall.Open(controlPath, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
 	controlAvailable := (err == nil)
 	if controlAvailable {
 		defer syscall.Close(controlFd)
-		logKmsg(fmt.Sprintf("[BINDERFS_INIT] Opened binder-control at %s", *controlPath))
+		logKmsg(fmt.Sprintf("[BINDERFS_INIT] Opened binder-control at %s", controlPath))
 
 		for _, name := range devices {
-			targetNode := filepath.Join(*mountPath, name)
+			targetNode := filepath.Join(mountPath, name)
 			if fi, err := os.Stat(targetNode); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
-				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Device %s already exists in %s (preserving existing node)", name, *mountPath))
+				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Device %s already exists in %s (preserving existing node)", name, mountPath))
 				continue
 			}
 
@@ -302,7 +314,7 @@ func main() {
 
 			var r1 uintptr
 			var errSys error
-			if *unitTestMode {
+			if unitTestMode {
 				r1 = 0
 				_ = os.WriteFile(targetNode, []byte("unit-test"), 0666)
 			} else {
@@ -326,13 +338,13 @@ func main() {
 			}
 		}
 	} else {
-		logKmsg(fmt.Sprintf("[BINDERFS_INIT WARNING] Cannot open %s: %v. Checking legacy sysfs fallback.", *controlPath, err))
+		logKmsg(fmt.Sprintf("[BINDERFS_INIT WARNING] Cannot open %s: %v. Checking legacy sysfs fallback.", controlPath, err))
 	}
 
 	// 2. Establish symlinks /dev/<name> -> /dev/binderfs/<name> or legacy sysfs fallback
 	for _, name := range devices {
-		srcNode := filepath.Join(*mountPath, name)
-		destNode := filepath.Join(*devDir, name)
+		srcNode := filepath.Join(mountPath, name)
+		destNode := filepath.Join(devDir, name)
 
 		if fi, err := os.Lstat(srcNode); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
 			res, err := safeSymlink(srcNode, destNode)
@@ -348,7 +360,7 @@ func main() {
 			}
 		} else {
 			// Check legacy sysfs fallback: /sys/class/misc/<name>/dev
-			sysDev := filepath.Join(*sysDir, "class/misc", name, "dev")
+			sysDev := filepath.Join(sysDir, "class/misc", name, "dev")
 			content, err := os.ReadFile(sysDev)
 			if err == nil {
 				maj, min, err := parseSysfsDev(string(content))
@@ -357,7 +369,7 @@ func main() {
 					continue
 				}
 				logKmsg(fmt.Sprintf("[BINDERFS_INIT] Discovered legacy binder '%s' via sysfs (%d:%d)", name, maj, min))
-				res, err := validateOrCreateLegacyNode(destNode, maj, min, *unitTestMode)
+				res, err := validateOrCreateLegacyNode(destNode, maj, min, unitTestMode)
 				if err != nil {
 					logKmsg(fmt.Sprintf("[BINDERFS_INIT ERROR] validateOrCreateLegacyNode failed for %s: %v", destNode, err))
 				} else {
@@ -375,7 +387,7 @@ func main() {
 	// 3. Strict Verification: All three devices must exist, be character devices, and openable O_RDWR
 	allOk := true
 	for _, name := range devices {
-		devPath := filepath.Join(*devDir, name)
+		devPath := filepath.Join(devDir, name)
 		fi, err := os.Stat(devPath)
 		if err != nil {
 			logKmsg(fmt.Sprintf("[BINDERFS_INIT FATAL] Binder device %s does NOT exist!", devPath))
@@ -383,13 +395,13 @@ func main() {
 			continue
 		}
 
-		if !*unitTestMode && (fi.Mode()&os.ModeCharDevice == 0) {
+		if !unitTestMode && (fi.Mode()&os.ModeCharDevice == 0) {
 			logKmsg(fmt.Sprintf("[BINDERFS_INIT FATAL] Device %s is NOT a character device! Mode: %s", devPath, fi.Mode()))
 			allOk = false
 			continue
 		}
 
-		if !*unitTestMode {
+		if !unitTestMode {
 			fd, err := syscall.Open(devPath, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 			if err != nil {
 				logKmsg(fmt.Sprintf("[BINDERFS_INIT FATAL] Failed to open %s with O_RDWR: %v", devPath, err))
@@ -404,10 +416,25 @@ func main() {
 	if !allOk {
 		// Clean up ONLY resources created by this execution without deleting pre-existing valid nodes
 		rollbackCreated(newlyAllocated, newlySymlinked, newlyLegacy)
-		logKmsg("[BINDERFS_INIT FATAL] Critical Binder IPC device initialization FAILED! Newly created resources cleaned up.")
-		os.Exit(1)
+		return fmt.Errorf("critical Binder IPC device initialization failed; newly created resources rolled back")
 	}
 
 	logKmsg("[BINDERFS_INIT] All required Binder IPC devices initialized and verified successfully.")
+	return nil
+}
+
+func main() {
+	controlPath := flag.String("control", "/dev/binderfs/binder-control", "Path to binder-control device")
+	mountPath := flag.String("mount", "/dev/binderfs", "Path to binderfs mountpoint")
+	devDir := flag.String("dev", "/dev", "Path to /dev directory for symlinks")
+	sysDir := flag.String("sys", "/sys", "Path to /sys directory for legacy sysfs fallback")
+	procDir := flag.String("proc", "/proc", "Path to /proc directory")
+	unitTestMode := flag.Bool("unit-test", false, "Unit test execution flag (isolated, no live kernel calls)")
+	flag.Parse()
+
+	if err := runInit(*controlPath, *mountPath, *devDir, *sysDir, *procDir, *unitTestMode); err != nil {
+		logKmsg(fmt.Sprintf("[BINDERFS_INIT FATAL] %v", err))
+		os.Exit(1)
+	}
 	os.Exit(0)
 }

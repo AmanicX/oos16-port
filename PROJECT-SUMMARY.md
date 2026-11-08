@@ -1,8 +1,8 @@
 # OxygenOS 16 Port to OnePlus 7T (HD1901) — Project Summary
 
-> **Document Version**: 2.4.0 (Product/My_Product Mount Separation, Fail-Closed RAM Validation, Hardened dev_t & BinderFS Edge Cases, Expanded APEX Budgeting, Strengthened Watchdog Lifecycle, Hardened APEX Protobuf & ZIP Limits, and 101 Automated Tests)  
+> **Document Version**: 2.5.0 (Authentic Donor Provenance, Kernel IKCONFIG Audit, Android 16 Init Handover, APEX Bind-Mounts, Transactional BinderFS, Authoritative Manifest & 125 Automated Tests)  
 > **Target Device**: OnePlus 7T (`HD1901` / `hotdogb`, Snapdragon 855+ / SM8150-AC, 8 GB RAM)  
-> **Source ROM**: OxygenOS 16 (Android 16 / SDK 36 / `Baklava` / `BP4A.251205.006`)  
+> **Source ROM**: OxygenOS 16 / Android 16 (`BP2A.250605.015`, SDK 36 / `Baklava`, OnePlus 9 `lemonade` / `LE2113` EEA donor)  
 > **Base OS on Device**: crDroid (Android 16 / LineageOS 23.2 base, FBE Encrypted)  
 > **Primary Safety Mandate**: **Zero physical writes to internal flash** — Strictly volatile RAM execution.
 
@@ -248,9 +248,19 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
      - Rejects duplicate critical fields (tags 1, 2, 3). Strictly validates JSON manifest field types.
   6. **Watchdog Configuration Validation**:
      - Validates all 5 configuration variables with safe fallbacks and bounds: `WATCHDOG_TIMEOUT` (1..86400, default 60), `WATCHDOG_STAGE2_TIMEOUT` (1..86400, default 120), `WATCHDOG_HEALTH_TIMEOUT` (1..86400, default 600), `WATCHDOG_SLEEP_INTERVAL` (0.001..60, default 1), `WATCHDOG_MAX_TICKS` (0..1000000, default 0).
-  7. **CI & Documentation Integrity**:
+  7. **Authentic Kernel Configuration Audit (`IKCONFIG`)**:
+     - Decompressed and audited kernel config stream at offset 35146816 of `stage1/kernel_src/kernel`.
+     - Verified built-in `=y` monolithic support for `CONFIG_EROFS_FS` (with XATTR, POSIX_ACL, SECURITY, ZIP, PCPU_KTHREAD), `CONFIG_BLK_DEV_LOOP` (16 min count), `CONFIG_OVERLAY_FS`, `CONFIG_TMPFS`, `CONFIG_ANDROID_BINDERFS`, `CONFIG_ANDROID_BINDER_IPC`, `CONFIG_DRM_MSM`, and `CONFIG_QCOM_KGSL`.
+     - Verified `# CONFIG_DEVTMPFS is not set`, validating the necessity of userspace tmpfs `/dev` node management in Stage 1 and Stage 2.
+  8. **Android 16 Init Handover (`selinux_setup`)**:
+     - Corrected Stage-2 init handover from raw `second_stage` to `exec /system/bin/chroot /mnt/sysroot /system/bin/init "${INIT_ENTRY_STAGE:-selinux_setup}"`.
+     - Preserves PID 1 while executing `SetupSelinux()`, mounting selinuxfs, loading policy, transitioning PID 1 context into `u:r:init:s0`, and seamlessly execing `second_stage`.
+  9. **APEX Bind-Mounts & Registration**:
+     - Android 16 requires active APEX paths to be active bind-mounts (`mount_or_fail --bind "$versioned_dir" "$active_mount"`).
+     - Generated `/apex/apex-info-list.xml` and `/apex/.bootstrap-apex-info-list.xml` to satisfy apexd preflight checks.
+  10. **CI & Documentation Integrity**:
      - Updated `.github/workflows/ci.yml` to log `[SKIPPED - ARTIFACT NOT IN CHECKOUT]` for boot image checks in CI without proprietary device kernel binaries.
-     - Rebuilt local boot images: `build/loader.img` (SHA-256: `a467af4ac8ebd5b0aa04f77ff6b36e67bea6cd34b073dc244f311a69cd00709e`) and `build/stage1.img` (SHA-256: `6f055cf9de0445bdca5afc2a7e5ea332adbdf1d988e1bb18282a12ab6bd8a1c8`), both passing 31/31 pre-boot safety checks.
+     - Rebuilt local boot images: `build/loader.img` (SHA-256: `1af9f4ff2cba9741016d4edc6b2e3a7bb5845280f1559015a67f24098a16d477`) and `build/stage1.img` (SHA-256: `59bc9eb73034f9056f21d7c6313c5d3b2066dbc123468b1403e65aa7bac78dba`), both passing 31/31 pre-boot safety checks.
 
 ---
 
@@ -259,8 +269,8 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `a467af4a...`, 31/31), `build/stage1.img` (SHA-256: `6f055cf9...`, 31/31), and ramdisks (29/29). In CI without device kernel binaries, ramdisks pass 29/29 and packaged image audits are reported as skipped. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (118/118)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf & ZIP limits (18), Watchdog protocol & lifecycle (21), Stage-2 runner integration mocks (59), and Go BinderFS unit tests (9). |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `1af9f4ff...`, 31/31), `build/stage1.img` (SHA-256: `59bc9eb7...`, 31/31), and ramdisks (29/29). In CI without device kernel binaries, ramdisks pass 29/29 and packaged image audits are reported as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (125/125)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf & ZIP limits (18), Watchdog protocol & lifecycle (22), Stage-2 runner integration mocks (63), and Go BinderFS unit tests (11). |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
@@ -273,5 +283,5 @@ The repository is in a verified, build-clean, and audited state:
 * All host-side safety wrappers (`tools/safe/adb`, `tools/safe/fastboot`, `tools/safe/audit-no-writes.sh`) are active and verified.
 * All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (31/31).
 * All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS` and `PARTITION_MAP`.
-* All 118 automated unit and integration tests pass without error (100% OK).
+* All 125 automated unit and integration tests pass without error (100% OK).
 * **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`).
