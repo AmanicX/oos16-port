@@ -133,6 +133,8 @@ jobs:
           test_exit=${PIPESTATUS[0]}
           if [ $test_exit -ne 0 ]; then
             echo "::error title=Python Test Suite Failure::Python test suite exited with code $test_exit."
+            echo "=== FAILED PYTHON TEST SUITE DIAGNOSTIC TAIL ==="
+            tail -n 120 logs/python_tests.log
             exit $test_exit
           fi
 
@@ -207,6 +209,14 @@ jobs:
           7. **Packaged Boot-Image Audits**: $IMAGE_TEXT
           8. **Physical Device Verification Status**: **PENDING LIVE HARDWARE TEST** (Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to live device-level verification on OnePlus 7T HD1901).
           EOF
+
+          if grep -q "FAIL" logs/python_tests.log 2>/dev/null || grep -q "ERROR" logs/python_tests.log 2>/dev/null; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Test Failures Diagnostics" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 60 logs/python_tests.log >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload Safety Audit & Execution Logs
         if: always()
