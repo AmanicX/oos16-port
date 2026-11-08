@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/build_all.sh - Master Build & Independent Verification Orchestrator
+# Target: OnePlus 7T HD1901 (hotdogb), Snapdragon 855+ / SM8150-AC, 8 GB RAM
+# Operating System: OxygenOS 16 RAM-Only Port (fastboot boot only)
+#
+# NON-NEGOTIABLE SAFETY INVARIANTS:
+# 1. Strictly RAM-only execution via 'fastboot boot'.
+# 2. Never execute fastboot flash, erase, format, or set_active.
+# 3. Never write to, format, or modify physical UFS block devices (/dev/block/*).
+# 4. Never execute automated physical hardware boots during builds or testing.
+# 5. Fail closed immediately on any missing dependency, checksum failure, or
+#    audit violation.
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Ensure external and user bin paths are available in PATH
+export PATH="$PROJECT_ROOT/external/coloros_port/otatools/bin:$HOME/.local/bin:$PATH"
+
+# Mode flags
+SKIP_STAGE2=0
+STAGE2_ONLY=0
+BOOT_ONLY=0
+VERIFY_ONLY=0
+
+usage() {
+    cat << 'EOF'
+Usage: scripts/build_all.sh [OPTIONS]
+
+Master build and verification orchestrator for the OxygenOS 16 RAM-only port
+on OnePlus 7T HD1901 (hotdogb).
+
+Options:
+  --skip-stage2    Skip packaging Stage-2 EROFS images (reuse existing build/images/)
+  --stage2-only    Only build Stage-2 EROFS partition images and APEX modules
+  --boot-only      Only compile ARM64 helper and package Stage-1 boot images
+  --verify-only    Run independent verification and static audits without rebuilding
+  -h, --help       Show this help message and exit
+
+Environment Variables:
+  WORK_DIR         Directory containing donor partition trees (default: $PROJECT_ROOT/work)
+  OTATOOLS         Directory containing mkbootfs, mkfs.erofs, etc. (optional)
+EOF
+}
+
+# Parse command line arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --skip-stage2)
+            SKIP_STAGE2=1
+            shift
+            ;;
+        --stage2-only)
+            STAGE2_ONLY=1
+            shift
+            ;;
+        --boot-only)
+            BOOT_ONLY=1
+            shift
+            ;;
+        --verify-only)
+            VERIFY_ONLY=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Mutual exclusion checks
+ACTIVE_MODES=0
+[ "$STAGE2_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
+[ "$BOOT_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
+[ "$VERIFY_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
+
+if [ "$ACTIVE_MODES" -gt 1 ]; then
+    echo "Error: Options --stage2-only, --boot-only, and --verify-only are mutually exclusive." >&2
+    exit 1
+fi
+
+if [ "$SKIP_STAGE2" -eq 1 ] && [ "$STAGE2_ONLY" -eq 1 ]; then
+    echo "Error: Cannot combine --skip-stage2 with --stage2-only." >&2
+    exit 1
+fi
+
+echo "=========================================================="
+echo "    OnePlus 7T (HD1901) OxygenOS 16 RAM-Only Port"
+echo "    Master Build & Verification Orchestrator"
+echo "=========================================================="
+echo "Project Root: $PROJECT_ROOT"
+echo "Execution Mode:"
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+    echo "  [VERIFY-ONLY] Validating existing artifacts & static safety"
+elif [ "$STAGE2_ONLY" -eq 1 ]; then
+    echo "  [STAGE2-ONLY] Building EROFS partitions & APEX modules"
+elif [ "$BOOT_ONLY" -eq 1 ]; then
+    echo "  [BOOT-ONLY] Building ARM64 helper & Stage-1 boot images"
+elif [ "$SKIP_STAGE2" -eq 1 ]; then
+    echo "  [SKIP-STAGE2] Reusing existing EROFS images, rebuilding boot images"
+else
+    echo "  [FULL-BUILD] Rebuilding all components and running verification"
+fi
+echo ""
+
+# ------------------------------------------------------------------------------
+# 1. Host Tool & Environment Dependency Checks
+# ------------------------------------------------------------------------------
+echo "--- Step 1: Checking Host Tools and Dependencies ---"
+
+REQUIRED_HOST_TOOLS=(
+    "python3"
+    "go"
+    "sha256sum"
+    "stat"
+    "cpio"
+    "lz4"
+)
+
+for tool in "${REQUIRED_HOST_TOOLS[@]}"; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Error: Required host tool '$tool' is not installed or not in PATH." >&2
+        exit 1
+    fi
+    echo "  [OK] Host tool: $tool ($(command -v "$tool"))"
+done
+
+# 7-Zip check
+if command -v 7z >/dev/null 2>&1; then
+    echo "  [OK] 7-Zip archive tool: 7z ($(command -v 7z))"
+elif command -v 7za >/dev/null 2>&1; then
+    echo "  [OK] 7-Zip archive tool: 7za ($(command -v 7za))"
+else
+    echo "Error: 7-Zip (7z or 7za) is required for APEX extraction and not found." >&2
+    exit 1
+fi
+
+# Android Packaging Tools (mkbootfs, mkbootimg, unpack_bootimg, mkfs.erofs, fsck.erofs)
+ANDROID_TOOLS=(
+    "mkbootfs"
+    "mkbootimg"
+    "unpack_bootimg"
+    "mkfs.erofs"
+    "fsck.erofs"
+)
+
+for atool in "${ANDROID_TOOLS[@]}"; do
+    if ! command -v "$atool" >/dev/null 2>&1; then
+        echo "Error: Required Android tool '$atool' was not found in PATH or external/coloros_port/otatools/bin." >&2
+        exit 1
+    fi
+    echo "  [OK] Android tool: $atool ($(command -v "$atool"))"
+done
+
+# ------------------------------------------------------------------------------
+# 2. Hardware Asset Cryptographic & Architectural Validation
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Step 2: Validating Authentic OnePlus 7T Hardware Assets ---"
+
+KERNEL_IMG="$PROJECT_ROOT/stage1/kernel_src/kernel"
+DTB_IMG="$PROJECT_ROOT/stage1/kernel_src/dtb"
+RECOVERY_DTBO_IMG="$PROJECT_ROOT/stage1/kernel_src/recovery_dtbo"
+
+EXPECTED_KERNEL_SHA="c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129"
+EXPECTED_KERNEL_SIZE=48713752
+EXPECTED_DTB_SHA="e4faf7c553f88246077343de51487d90517bb534e345ee44893d2e4fb348df3c"
+EXPECTED_DTB_SIZE=9055368
+EXPECTED_RECOVERY_DTBO_SHA="7cfdd1984a7be7edd8ef4e761540cf32e69f1cba6a844afe6ba6780dd12223c1"
+EXPECTED_RECOVERY_DTBO_SIZE=3219456
+
+# Kernel validation
+if [ ! -f "$KERNEL_IMG" ]; then
+    echo "Error: Hardware kernel image missing: $KERNEL_IMG" >&2
+    exit 1
+fi
+ACTUAL_KERNEL_SIZE=$(stat -c "%s" "$KERNEL_IMG" 2>/dev/null || stat -f "%z" "$KERNEL_IMG")
+if [ "$ACTUAL_KERNEL_SIZE" -ne "$EXPECTED_KERNEL_SIZE" ]; then
+    echo "Error: Kernel size mismatch: $ACTUAL_KERNEL_SIZE != $EXPECTED_KERNEL_SIZE" >&2
+    exit 1
+fi
+ACTUAL_KERNEL_SHA=$(sha256sum "$KERNEL_IMG" | awk '{print $1}')
+if [ "$ACTUAL_KERNEL_SHA" != "$EXPECTED_KERNEL_SHA" ]; then
+    echo "Error: Kernel SHA-256 mismatch: $ACTUAL_KERNEL_SHA != $EXPECTED_KERNEL_SHA" >&2
+    exit 1
+fi
+if ! grep -a -F "4.14.357-perf-gcd3073fb68f1" "$KERNEL_IMG" >/dev/null 2>&1; then
+    echo "Error: Kernel does not contain expected banner 4.14.357-perf-gcd3073fb68f1" >&2
+    exit 1
+fi
+echo "  [OK] Kernel verified (SHA: ${ACTUAL_KERNEL_SHA:0:16}..., size: $ACTUAL_KERNEL_SIZE B, 4.14.357)"
+
+# DTB validation
+if [ ! -f "$DTB_IMG" ]; then
+    echo "Error: Device Tree Blob missing: $DTB_IMG" >&2
+    exit 1
+fi
+ACTUAL_DTB_SIZE=$(stat -c "%s" "$DTB_IMG" 2>/dev/null || stat -f "%z" "$DTB_IMG")
+if [ "$ACTUAL_DTB_SIZE" -ne "$EXPECTED_DTB_SIZE" ]; then
+    echo "Error: DTB size mismatch: $ACTUAL_DTB_SIZE != $EXPECTED_DTB_SIZE" >&2
+    exit 1
+fi
+ACTUAL_DTB_SHA=$(sha256sum "$DTB_IMG" | awk '{print $1}')
+if [ "$ACTUAL_DTB_SHA" != "$EXPECTED_DTB_SHA" ]; then
+    echo "Error: DTB SHA-256 mismatch: $ACTUAL_DTB_SHA != $EXPECTED_DTB_SHA" >&2
+    exit 1
+fi
+if ! grep -a -F "qcom,sm8150" "$DTB_IMG" >/dev/null 2>&1; then
+    echo "Error: DTB does not match Qualcomm SM8150 platform" >&2
+    exit 1
+fi
+echo "  [OK] DTB verified (SHA: ${ACTUAL_DTB_SHA:0:16}..., size: $ACTUAL_DTB_SIZE B, qcom,sm8150)"
+
+# Recovery DTBO validation
+if [ ! -f "$RECOVERY_DTBO_IMG" ]; then
+    echo "Error: Recovery DTBO missing: $RECOVERY_DTBO_IMG" >&2
+    exit 1
+fi
+ACTUAL_RECOVERY_DTBO_SIZE=$(stat -c "%s" "$RECOVERY_DTBO_IMG" 2>/dev/null || stat -f "%z" "$RECOVERY_DTBO_IMG")
+if [ "$ACTUAL_RECOVERY_DTBO_SIZE" -ne "$EXPECTED_RECOVERY_DTBO_SIZE" ]; then
+    echo "Error: Recovery DTBO size mismatch: $ACTUAL_RECOVERY_DTBO_SIZE != $EXPECTED_RECOVERY_DTBO_SIZE" >&2
+    exit 1
+fi
+ACTUAL_RECOVERY_DTBO_SHA=$(sha256sum "$RECOVERY_DTBO_IMG" | awk '{print $1}')
+if [ "$ACTUAL_RECOVERY_DTBO_SHA" != "$EXPECTED_RECOVERY_DTBO_SHA" ]; then
+    echo "Error: Recovery DTBO SHA-256 mismatch: $ACTUAL_RECOVERY_DTBO_SHA != $EXPECTED_RECOVERY_DTBO_SHA" >&2
+    exit 1
+fi
+if ! grep -a -F "samsung_oneplus" "$RECOVERY_DTBO_IMG" >/dev/null 2>&1; then
+    echo "Error: Recovery DTBO does not match OnePlus Samsung AMOLED panel" >&2
+    exit 1
+fi
+echo "  [OK] Recovery DTBO verified (SHA: ${ACTUAL_RECOVERY_DTBO_SHA:0:16}..., size: $ACTUAL_RECOVERY_DTBO_SIZE B, samsung_oneplus)"
+
+# ------------------------------------------------------------------------------
+# 3. Partition Input Verification (Donor ROM Extraction)
+# ------------------------------------------------------------------------------
+WORK_DIR="${WORK_DIR:-$PROJECT_ROOT/work}"
+
+if [ "$VERIFY_ONLY" -eq 0 ] && [ "$BOOT_ONLY" -eq 0 ] && [ "$SKIP_STAGE2" -eq 0 ]; then
+    echo ""
+    echo "--- Step 3: Validating Donor ROM Partition Directories & APEX Modules ---"
+    if [ ! -d "$WORK_DIR" ]; then
+        echo "Error: Work directory '$WORK_DIR' does not exist." >&2
+        exit 1
+    fi
+
+    MANDATORY_PARTITIONS=("system" "system_ext" "vendor" "odm" "my_product")
+    for part in "${MANDATORY_PARTITIONS[@]}"; do
+        if [ ! -d "$WORK_DIR/$part" ]; then
+            echo "Error: Mandatory donor partition directory '$WORK_DIR/$part' does not exist." >&2
+            exit 1
+        fi
+        echo "  [OK] Partition source: $part ($(du -sh "$WORK_DIR/$part" | awk '{print $1}'))"
+    done
+
+    # Check for mandatory bootstrap APEX archives in $WORK_DIR
+    REQUIRED_APEX_NAMES=(
+        "com.android.runtime.apex"
+        "com.android.i18n.apex"
+    )
+    for apex in "${REQUIRED_APEX_NAMES[@]}"; do
+        if [ ! -f "$WORK_DIR/$apex" ]; then
+            echo "Error: Required APEX file '$WORK_DIR/$apex' not found." >&2
+            exit 1
+        fi
+        echo "  [OK] Bootstrap APEX: $apex"
+    done
+
+    # Check for ART APEX
+    if [ -f "$WORK_DIR/com.google.android.art_compressed.apex" ] || [ -f "$WORK_DIR/com.android.art.apex" ]; then
+        echo "  [OK] Bootstrap ART APEX found"
+    else
+        echo "Error: Neither com.google.android.art_compressed.apex nor com.android.art.apex found in '$WORK_DIR'." >&2
+        exit 1
+    fi
+
+    # Check for Time Zone APEX
+    if [ -f "$WORK_DIR/com.google.android.tzdata6.apex" ] || [ -f "$WORK_DIR/com.android.tzdata.apex" ]; then
+        echo "  [OK] Bootstrap Timezone APEX found"
+    else
+        echo "Error: Neither com.google.android.tzdata6.apex nor com.android.tzdata.apex found in '$WORK_DIR'." >&2
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# 4. Build Static ARM64 Helper Binary (binderfs_init)
+# ------------------------------------------------------------------------------
+if [ "$VERIFY_ONLY" -eq 0 ] && [ "$STAGE2_ONLY" -eq 0 ]; then
+    echo ""
+    echo "--- Step 4: Compiling Static ARM64 Helper (binderfs_init) ---"
+    make -C "$PROJECT_ROOT/src" install
+    echo "  [OK] binderfs_init compiled and installed across Stage-1 ramdisks"
+fi
+
+# ------------------------------------------------------------------------------
+# 5. Build Stage-2 EROFS Partition Images & Bootstrap APEX Modules
+# ------------------------------------------------------------------------------
+if [ "$VERIFY_ONLY" -eq 0 ] && [ "$BOOT_ONLY" -eq 0 ] && [ "$SKIP_STAGE2" -eq 0 ]; then
+    echo ""
+    echo "--- Step 5: Packaging Stage-2 EROFS Partition Images ---"
+    "$PROJECT_ROOT/scripts/build_stage2_erofs.sh"
+    echo "  [OK] Stage-2 EROFS partitions and APEX modules generated successfully"
+fi
+
+# ------------------------------------------------------------------------------
+# 6. Build Stage-1 Boot Images (loader.img and stage1.img)
+# ------------------------------------------------------------------------------
+if [ "$VERIFY_ONLY" -eq 0 ] && [ "$STAGE2_ONLY" -eq 0 ]; then
+    echo ""
+    echo "--- Step 6: Packaging Stage-1 Android Boot Images ---"
+    "$PROJECT_ROOT/scripts/build_loader.sh"
+    "$PROJECT_ROOT/scripts/build_stage1.sh"
+    echo "  [OK] Stage-1 boot images packaged successfully"
+fi
+
+# ------------------------------------------------------------------------------
+# 7. Independent Cryptographic & Architectural Verification
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Step 7: Performing Independent Verification & Safety Audits ---"
+
+if [ "$STAGE2_ONLY" -eq 0 ]; then
+    # Verify loader.img
+    echo "1. Verifying build/loader.img..."
+    "$PROJECT_ROOT/scripts/verify_boot_image.sh" "$PROJECT_ROOT/build/loader.img"
+
+    # Verify stage1.img
+    echo "2. Verifying build/stage1.img..."
+    "$PROJECT_ROOT/scripts/verify_boot_image.sh" "$PROJECT_ROOT/build/stage1.img"
+fi
+
+if [ "$BOOT_ONLY" -eq 0 ]; then
+    # Verify build/images/
+    echo "3. Verifying Stage-2 partition images and APEX modules manifest..."
+    if [ ! -d "$PROJECT_ROOT/build/images" ] || [ ! -f "$PROJECT_ROOT/build/images/SHA256SUMS" ]; then
+        echo "Error: Stage-2 images directory or SHA256SUMS manifest is missing: $PROJECT_ROOT/build/images" >&2
+        exit 1
+    fi
+    (cd "$PROJECT_ROOT/build/images" && sha256sum -c SHA256SUMS --status)
+    echo "  [OK] All Stage-2 images match build/images/SHA256SUMS"
+
+    # Verify PARTITION_MAP schema
+    MAP_FILE="$PROJECT_ROOT/build/images/PARTITION_MAP"
+    if [ ! -f "$MAP_FILE" ] || [ ! -s "$MAP_FILE" ]; then
+        echo "Error: Authoritative PARTITION_MAP is missing or empty!" >&2
+        exit 1
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        case "$trimmed" in ''|\#*) continue ;; esac
+        num_colons=$(echo "$trimmed" | tr -cd ':' | wc -c)
+        if [ "$num_colons" -ne 3 ]; then
+            echo "Error: Malformed PARTITION_MAP record: '$trimmed' (expected 4 fields)" >&2
+            exit 1
+        fi
+        sha_field=$(echo "$trimmed" | cut -d: -f4)
+        if ! echo "$sha_field" | grep -qE '^[0-9a-fA-F]{64}$'; then
+            echo "Error: Invalid SHA-256 field in PARTITION_MAP: '$trimmed'" >&2
+            exit 1
+        fi
+    done < "$MAP_FILE"
+    echo "  [OK] PARTITION_MAP schema and checksum contract validated"
+fi
+
+# Run static safety audit
+echo "4. Running global pre-boot static safety audit..."
+"$PROJECT_ROOT/tools/safe/audit-no-writes.sh"
+echo "  [OK] Global static safety audit PASSED (zero disk writes, fail-closed enforcement)"
+
+# ------------------------------------------------------------------------------
+# 8. Final Build Summary Report
+# ------------------------------------------------------------------------------
+echo ""
+echo "=========================================================="
+echo "    ONEPLUS 7T OXYGENOS 16 BUILD & VERIFICATION SUMMARY"
+echo "=========================================================="
+
+if [ -f "$PROJECT_ROOT/build/loader.img" ]; then
+    LOADER_SIZE=$(stat -c "%s" "$PROJECT_ROOT/build/loader.img" 2>/dev/null || stat -f "%z" "$PROJECT_ROOT/build/loader.img")
+    LOADER_SHA=$(sha256sum "$PROJECT_ROOT/build/loader.img" | awk '{print $1}')
+    echo "Bootloader Image (Interactive ADB Diagnostic):"
+    echo "  Path:    build/loader.img"
+    echo "  Size:    $LOADER_SIZE bytes ($(ls -lh "$PROJECT_ROOT/build/loader.img" | awk '{print $5}'))"
+    echo "  SHA-256: $LOADER_SHA"
+fi
+
+if [ -f "$PROJECT_ROOT/build/stage1.img" ]; then
+    STAGE1_SIZE=$(stat -c "%s" "$PROJECT_ROOT/build/stage1.img" 2>/dev/null || stat -f "%z" "$PROJECT_ROOT/build/stage1.img")
+    STAGE1_SHA=$(sha256sum "$PROJECT_ROOT/build/stage1.img" | awk '{print $1}')
+    echo "Stage-1 Boot Image (Autonomous RAM Supervisor):"
+    echo "  Path:    build/stage1.img"
+    echo "  Size:    $STAGE1_SIZE bytes ($(ls -lh "$PROJECT_ROOT/build/stage1.img" | awk '{print $5}'))"
+    echo "  SHA-256: $STAGE1_SHA"
+fi
+
+if [ -d "$PROJECT_ROOT/build/images" ] && [ -f "$PROJECT_ROOT/build/images/PARTITION_MAP" ]; then
+    TOTAL_IMAGES=$(grep -vE '^[[:space:]]*(#|$)' "$PROJECT_ROOT/build/images/PARTITION_MAP" | wc -l)
+    TOTAL_EROFS_BYTES=$(du -sb "$PROJECT_ROOT/build/images" 2>/dev/null | awk '{print $1}' || du -sk "$PROJECT_ROOT/build/images" | awk '{print $1 * 1024}')
+    echo "Stage-2 Partition Images:"
+    echo "  Directory: build/images/"
+    echo "  Count:     $TOTAL_IMAGES partition images and APEX modules"
+    echo "  Total:     $TOTAL_EROFS_BYTES bytes ($(du -sh "$PROJECT_ROOT/build/images" | awk '{print $1}'))"
+    echo "  Manifest:  build/images/PARTITION_MAP (authoritative 4-field contract)"
+    echo "  Checksums: build/images/SHA256SUMS (cryptographically verified)"
+fi
+
+echo "----------------------------------------------------------"
+echo "HARDWARE EXECUTION STATUS:"
+echo "  Current Phase: PRE-BOOT VERIFICATION IN PROGRESS"
+echo "  Physical Boot: NOT APPROVED (Testing limited to fastboot boot)"
+echo "  Safety Policy: ZERO FLASHING, ZERO PHYSICAL DISK WRITES"
+echo ""
+echo "Safe Testing Procedure for OnePlus 7T HD1901:"
+echo "  1. Enter bootloader on device (Volume Down + Power)"
+echo "  2. Boot Stage-1 to volatile RAM (NEVER flash):"
+echo "       tools/safe/fastboot boot build/stage1.img"
+echo "  3. Stage images and initiate Stage-2 handover:"
+echo "       tools/safe/run_stage2.sh"
+echo "=========================================================="
+exit 0

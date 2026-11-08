@@ -35,10 +35,12 @@ jobs:
         run: |
           echo "Independently validating syntax for each shell and init script..."
           ALL_SCRIPTS=(
+            scripts/build_all.sh
             scripts/build_loader.sh
             scripts/build_stage1.sh
             scripts/build_stage2_erofs.sh
             scripts/stage2_init.sh
+            scripts/verify_boot_image.sh
             scripts/watchdog.sh
             tools/safe/run_stage2.sh
             tools/safe/audit-no-writes.sh

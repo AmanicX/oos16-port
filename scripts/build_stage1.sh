@@ -20,6 +20,13 @@ OTATOOLS="$PROJECT_ROOT/external/coloros_port/otatools/bin"
 
 mkdir -p "$BUILD_DIR"
 
+TMP_IMG="$BUILD_DIR/stage1.img.tmp.$$"
+
+cleanup() {
+    rm -f "$TMP_IMG" 2>/dev/null || true
+}
+trap cleanup EXIT ERR INT TERM
+
 # 1. Dependency Validation: Host Tools
 echo "1. Checking required host build tools..."
 
@@ -185,7 +192,15 @@ echo "4. Assembling Android Boot Image with mkbootimg..."
     --os_patch_level 2026-07 \
     --header_version 2 \
     --pagesize 4096 \
-    -o "$BUILD_DIR/stage1.img"
+    -o "$TMP_IMG"
+
+# Verify generated image before publishing
+if [ ! -s "$TMP_IMG" ]; then
+    echo "ERROR: mkbootimg generated an empty or missing image file!" >&2
+    exit 1
+fi
+
+mv -f "$TMP_IMG" "$BUILD_DIR/stage1.img"
 
 # 6. Run Pre-Boot Static Security Audit
 echo "5. Running Pre-Boot Static Security Audit..."

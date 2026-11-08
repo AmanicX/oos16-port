@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# ==============================================================================
+# build_loader.sh - Rebuilds the First-Stage RAM Loader Boot Image (build/loader.img)
+# Uses authentic OnePlus 7T kernel 4.14.357, SM8150 DTB, and recovery DTBO.
+# Enforces dynamic block-level read-only locks, active safety watchdog,
+# and hands over execution to Stage-2 via /mnt/boot_now trigger.
+# ==============================================================================
+
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -8,14 +15,60 @@ echo "=== Building First-Stage RAM Loader Boot Image ==="
 
 STAGE1_DIR="$PROJECT_ROOT/stage1"
 LOADER_RAMDISK="$STAGE1_DIR/loader_ramdisk"
+KERNEL_SRC="$STAGE1_DIR/kernel_src"
 BUILD_DIR="$PROJECT_ROOT/build"
 OTATOOLS="$PROJECT_ROOT/external/coloros_port/otatools/bin"
 
 mkdir -p "$BUILD_DIR"
 
+TMP_IMG="$BUILD_DIR/loader.img.tmp.$$"
+RAMDISK_ARCHIVE="$STAGE1_DIR/stage1_loader_ramdisk.cpio.lz4"
+
+cleanup() {
+    rm -f "$TMP_IMG" 2>/dev/null || true
+}
+trap cleanup EXIT ERR INT TERM
+
+# 1. Dependency Validation: Host Tools
+echo "1. Checking required host build tools..."
+
+MKBOOTFS_BIN=""
+if command -v mkbootfs >/dev/null 2>&1; then
+    MKBOOTFS_BIN="$(command -v mkbootfs)"
+elif [ -x "$OTATOOLS/mkbootfs" ]; then
+    MKBOOTFS_BIN="$OTATOOLS/mkbootfs"
+else
+    echo "ERROR: 'mkbootfs' not found in PATH or external/coloros_port/otatools/bin!" >&2
+    echo "Please install android-tools or run: git clone https://github.com/toraidl/coloros_port external/coloros_port" >&2
+    echo "See docs/BUILD_DEPENDENCIES.md for setup instructions." >&2
+    exit 1
+fi
+
+MKBOOTIMG_BIN=""
+if command -v mkbootimg >/dev/null 2>&1; then
+    MKBOOTIMG_BIN="$(command -v mkbootimg)"
+elif [ -x "$OTATOOLS/mkbootimg" ]; then
+    MKBOOTIMG_BIN="$OTATOOLS/mkbootimg"
+else
+    echo "ERROR: 'mkbootimg' not found in PATH or external/coloros_port/otatools/bin!" >&2
+    echo "See docs/BUILD_DEPENDENCIES.md for setup instructions." >&2
+    exit 1
+fi
+
+if ! command -v lz4 >/dev/null 2>&1; then
+    echo "ERROR: 'lz4' compression utility is not installed on this host!" >&2
+    echo "Please install lz4 (e.g. sudo apt install lz4 or pacman -S lz4)." >&2
+    exit 1
+fi
+
+echo "  mkbootfs: $MKBOOTFS_BIN"
+echo "  mkbootimg: $MKBOOTIMG_BIN"
+echo "  lz4: $(command -v lz4)"
+
+# 2. Dependency Validation: Kernel & Hardware Assets
 validate_hardware_assets() {
-    local k_src="$STAGE1_DIR/kernel_src"
-    echo "0. Validating authentic OnePlus 7T hardware kernel assets..."
+    local k_src="$KERNEL_SRC"
+    echo "2. Validating authentic OnePlus 7T hardware kernel assets..."
 
     local EXP_KERNEL_SHA="c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129"
     local EXP_DTB_SHA="e4faf7c553f88246077343de51487d90517bb534e345ee44893d2e4fb348df3c"
@@ -70,18 +123,26 @@ validate_hardware_assets() {
 validate_hardware_assets
 
 if [ ! -d "$LOADER_RAMDISK" ]; then
-    echo "Error: $LOADER_RAMDISK does not exist!"
+    echo "ERROR: Loader ramdisk directory $LOADER_RAMDISK does not exist!" >&2
     exit 1
 fi
 
-echo "1. Building reproducible static ARM64 binderfs_init from source..."
+# 3. Embed Host ADB Key if Available
+if [ -f "$HOME/.android/adbkey.pub" ]; then
+    echo "Embedding host adbkey.pub for authorized root ADB connection..."
+    cp "$HOME/.android/adbkey.pub" "$LOADER_RAMDISK/adb_keys"
+    chmod 644 "$LOADER_RAMDISK/adb_keys"
+fi
+
+# 4. Build Reproducible ARM64 Helper & Embed Scripts into Loader Ramdisk
+echo "3. Building reproducible static ARM64 binderfs_init from source..."
 if ! command -v go >/dev/null 2>&1; then
     echo "ERROR: 'go' compiler is required to build binderfs_init ARM64 binary!" >&2
     exit 1
 fi
 (cd "$PROJECT_ROOT/src" && make clean && make arm64 verify install)
 
-echo "2. Embedding Stage-2 bringup and watchdog scripts into loader ramdisk..."
+echo "4. Embedding Stage-2 bringup and watchdog scripts into loader ramdisk..."
 mkdir -p "$LOADER_RAMDISK/system/bin"
 cp "$PROJECT_ROOT/scripts/stage2_init.sh" "$LOADER_RAMDISK/system/bin/stage2_init.sh"
 chmod 0755 "$LOADER_RAMDISK/system/bin/stage2_init.sh"
@@ -98,15 +159,17 @@ cmp -s "$PROJECT_ROOT/src/binderfs_init_arm64" "$LOADER_RAMDISK/system/bin/binde
     exit 1
 }
 
-echo "3. Packaging Loader Ramdisk with mkbootfs..."
-"$OTATOOLS/mkbootfs" "$LOADER_RAMDISK" | lz4 -l -12 --favor-decSpeed > "$STAGE1_DIR/stage1_loader_ramdisk.cpio.lz4"
+# 5. Packaging Loader Ramdisk
+echo "5. Packaging Loader Ramdisk with mkbootfs..."
+"$MKBOOTFS_BIN" "$LOADER_RAMDISK" | lz4 -l -12 --favor-decSpeed > "$RAMDISK_ARCHIVE"
 
-echo "3. Assembling Loader Boot Image with mkbootimg..."
-"$OTATOOLS/mkbootimg" \
-    --kernel "$STAGE1_DIR/kernel_src/kernel" \
-    --ramdisk "$STAGE1_DIR/stage1_loader_ramdisk.cpio.lz4" \
-    --dtb "$STAGE1_DIR/kernel_src/dtb" \
-    --recovery_dtbo "$STAGE1_DIR/kernel_src/recovery_dtbo" \
+# 6. Assembling Loader Boot Image with mkbootimg (Atomic Publication)
+echo "6. Assembling Loader Boot Image with mkbootimg..."
+"$MKBOOTIMG_BIN" \
+    --kernel "$KERNEL_SRC/kernel" \
+    --ramdisk "$RAMDISK_ARCHIVE" \
+    --dtb "$KERNEL_SRC/dtb" \
+    --recovery_dtbo "$KERNEL_SRC/recovery_dtbo" \
     --cmdline "androidboot.hardware=qcom androidboot.memcg=1 androidboot.usbcontroller=a600000.dwc3 kpti=off loop.max_part=7 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 service_locator.enable=1 swiotlb=2048 androidboot.selinux=permissive enforcing=0 panic=5 androidboot.mode=normal" \
     --base 0x00000000 \
     --kernel_offset 0x00008000 \
@@ -117,9 +180,18 @@ echo "3. Assembling Loader Boot Image with mkbootimg..."
     --os_patch_level 2026-07 \
     --header_version 2 \
     --pagesize 4096 \
-    -o "$BUILD_DIR/loader.img"
+    -o "$TMP_IMG"
 
-echo "3. Running Pre-Boot Static Security Audit..."
+# Verify generated image before publishing
+if [ ! -s "$TMP_IMG" ]; then
+    echo "ERROR: mkbootimg generated an empty or missing image file!" >&2
+    exit 1
+fi
+
+mv -f "$TMP_IMG" "$BUILD_DIR/loader.img"
+
+# 7. Run Pre-Boot Static Security Audit
+echo "7. Running Pre-Boot Static Security Audit..."
 "$PROJECT_ROOT/tools/safe/audit-no-writes.sh" "$BUILD_DIR/loader.img"
 
 SHA=$(sha256sum "$BUILD_DIR/loader.img" | awk '{print $1}')
