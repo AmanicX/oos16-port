@@ -125,7 +125,13 @@ jobs:
       - name: Run Python Unit & Integration Test Suites
         run: |
           echo "Running full automated test suite with verbose diagnostics..."
-          python3 -m unittest discover -v -s tests -p "test_*.py"
+          mkdir -p logs
+          python3 -m unittest discover -v -s tests -p "test_*.py" 2>&1 | tee logs/python_tests.log
+          test_exit=${PIPESTATUS[0]}
+          if [ $test_exit -ne 0 ]; then
+            echo "::error title=Python Test Suite Failure::Python test suite exited with code $test_exit."
+            exit $test_exit
+          fi
 
       - name: Run Pre-Boot Static Safety Auditor (native_ramdisk)
         run: |

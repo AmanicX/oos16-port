@@ -525,9 +525,6 @@ log_kmsg() {{
     "{self.toybox_bin}" "$@"
 }}
 
-# Sourced function
-{init_code[init_code.index("mount_and_verify_tmpfs()"):init_code.index("mount_and_verify_tmpfs \"/mnt\"")]}
-
 # Redirect /proc/mounts to our mock
 sed_mounts="{self.proc_mounts}"
 mount_and_verify_tmpfs() {{
