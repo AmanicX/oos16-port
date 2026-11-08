@@ -99,11 +99,11 @@ validate_sleep_interval() {
         return 0
     fi
 
-    local int_num=$((10#$int_part))
     local all_zero=1
-    if [ "$int_num" -gt 0 ]; then
-        all_zero=0
-    elif [ -n "$frac_part" ]; then
+    case "$int_part" in
+        *[!0]*) all_zero=0 ;;
+    esac
+    if [ "$all_zero" -eq 1 ] && [ -n "$frac_part" ]; then
         case "$frac_part" in
             *[!0]*) all_zero=0 ;;
         esac
@@ -114,6 +114,9 @@ validate_sleep_interval() {
         echo "1"
         return 0
     fi
+
+    local clean_int="${int_part#"${int_part%%[!0]*}"}"
+    local int_num="${clean_int:-0}"
 
     if [ "$int_num" -gt 60 ]; then
         log_msg "[WATCHDOG WARN] WATCHDOG_SLEEP_INTERVAL '$raw' exceeds maximum (60s). Falling back to default (1s)."

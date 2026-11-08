@@ -15,8 +15,8 @@
 | **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 67 integration tests: RAM accounting, 4-field PARTITION_MAP contract, product mapping, APEX staging, fail-closed SELinux checks | 67/67 tests pass | **PASS** |
 | **H9** | Safe ADB & Fastboot Tests | `tests/test_safe_*.py` | 11 tests: command interception, metacharacter protection, flash bans (8 ADB + 3 Fastboot) | 11/11 tests pass | **PASS** |
 | **H10** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets | 29/29 Passed, 0 Failed | **PASS** |
-| **H11** | Packaged Loader Audit | `build/loader.img` | SHA-256: `428706b09e11e56f2e4a791113bb5722e5ff2398ba402bd930a14299b5225b38` | 31/31 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `eef8950ca85f37e6204d58997a51b1a87145088037255f252eaa506049b391af` | 31/31 Passed, 0 Failed | **PASS** |
+| **H11** | Packaged Loader Audit | `build/loader.img` | SHA-256: `dfb5e2e67896143b47aa062f84ae3245cb7a27118ee11be1c61cfa3bb781e435` | 31/31 Passed, 0 Failed | **PASS** |
+| **H12** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `6981068924f56a687ad351c9f2e045200d8f766c828f45b02eb796e0053c704e` | 31/31 Passed, 0 Failed | **PASS** |
 
 ## 2. Physical Device Bring-Up Stages (OnePlus 7T Hardware)
 

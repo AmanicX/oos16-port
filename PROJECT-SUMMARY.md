@@ -270,7 +270,7 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
      - Enforces Linux `dev_t` encoding (`unix.Mkdev`) and major/minor extraction macros (`major()`, `minor()`).
      - Rejects fake Binder character devices (e.g. major 1 `/dev/null`, `/dev/zero`), performs `BINDER_VERSION` ioctl check (`0xc0046209`), uses collision-resistant cryptographic temp paths, and guarantees atomic symlink replacement with rollback limited exclusively to newly created resources.
   13. **CI, Boot Images & Documentation Integrity**:
-     - Rebuilt local boot images: `build/loader.img` (SHA-256: `428706b09e11e56f2e4a791113bb5722e5ff2398ba402bd930a14299b5225b38`) and `build/stage1.img` (SHA-256: `eef8950ca85f37e6204d58997a51b1a87145088037255f252eaa506049b391af`), both passing 31/31 pre-boot safety checks.
+     - Rebuilt local boot images: `build/loader.img` (SHA-256: `dfb5e2e67896143b47aa062f84ae3245cb7a27118ee11be1c61cfa3bb781e435`) and `build/stage1.img` (SHA-256: `6981068924f56a687ad351c9f2e045200d8f766c828f45b02eb796e0053c704e`), both passing 31/31 pre-boot safety checks.
      - Static cross-compiled ARM64 binary `src/binderfs_init_arm64` (SHA-256: `a2bec3dac63b6fd26fa0d59bb00ae9f660812fd89ed98ed8ad9af3345d068f76`) installed byte-identically across ramdisks.
 
 ---
@@ -280,7 +280,7 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `428706b0...`, 31/31), `build/stage1.img` (SHA-256: `eef8950c...`, 31/31), and ramdisks (29/29). In CI without device kernel binaries, ramdisks pass 29/29 and packaged image audits are reported as skipped. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `dfb5e2e6...`, 31/31), `build/stage1.img` (SHA-256: `69810689...`, 31/31), and ramdisks (29/29). In CI without device kernel binaries, ramdisks pass 29/29 and packaged image audits are reported as skipped. |
 | **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (141/141)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & lifecycle (22), Stage-2 runner integration mocks (67), and Go BinderFS unit tests (15). Total Python unittests: 126/126; Go unit tests: 15/15. |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |

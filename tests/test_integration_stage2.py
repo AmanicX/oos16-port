@@ -1174,10 +1174,12 @@ exit 1
         with open(native_init) as f:
             n_content = f.read()
 
+        res = subprocess.run(["strings", loader_bin], capture_output=True, text=True)
+        self.assertIn("/dev/binderfs/binder-control", res.stdout)
+
         for content in [l_content, n_content]:
             self.assertIn("/system/bin/binderfs_init", content)
             self.assertIn("CRITICAL: binderfs_init failed", content)
-            self.assertIn("/dev/binderfs/binder-control", os.popen("strings '" + loader_bin + "' | grep binder-control").read())
 
     def test_stage2_init_product_and_my_product_mount_selection(self):
         """Verify scripts/stage2_init.sh handles product vs my_product partition layout strictly."""
