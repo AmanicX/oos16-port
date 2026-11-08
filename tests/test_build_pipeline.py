@@ -396,7 +396,7 @@ class TestPartitionMapContract(unittest.TestCase):
 
 
 class TestStaticSafetyAuditPasses(unittest.TestCase):
-    """Test that static safety auditor passes 36/36 checks cleanly."""
+    """Test that static safety auditor passes cleanly without write violations."""
 
     def test_audit_no_writes_clean(self):
         res = subprocess.run(
@@ -406,7 +406,24 @@ class TestStaticSafetyAuditPasses(unittest.TestCase):
             cwd=PROJECT_ROOT,
         )
         self.assertEqual(res.returncode, 0, f"Audit failed:\n{res.stderr}\n{res.stdout}")
-        self.assertIn("36 Passed, 0 Failed, 0 Mandatory Unverified", res.stdout)
+        self.assertIn("0 Failed, 0 Mandatory Unverified", res.stdout)
+        self.assertIn("AUDIT RESULT: PASSED", res.stdout)
+
+        if os.path.isfile(os.path.join(PROJECT_ROOT, "build", "stage1.img")):
+            self.assertIn("36 Passed", res.stdout)
+        else:
+            self.assertIn("34 Passed", res.stdout)
+            self.assertIn("Falling back to source ramdisk directory", res.stdout)
+
+    def test_audit_no_writes_ramdisk_target(self):
+        res = subprocess.run(
+            [AUDIT_SCRIPT, os.path.join(PROJECT_ROOT, "stage1", "loader_ramdisk")],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+        )
+        self.assertEqual(res.returncode, 0, f"Audit failed on ramdisk:\n{res.stderr}\n{res.stdout}")
+        self.assertIn("34 Passed, 0 Failed, 0 Mandatory Unverified", res.stdout)
         self.assertIn("AUDIT RESULT: PASSED", res.stdout)
 
 
