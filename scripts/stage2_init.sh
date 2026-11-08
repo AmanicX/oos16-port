@@ -302,9 +302,24 @@ atomic_update_inventory() {
     local m_inv="${MNT_DIR:-/mnt}/physical_storage_inventory"
     local t_inv="${TMP_DIR:-/tmp}/physical_storage_inventory"
 
+    # Both production inventories are mandatory
     if [ "${STAGE2_TEST_MODE:-0}" != "1" ]; then
         [ -f "$m_inv" ] || fatal "Atomic update failed: $m_inv missing in production mode at checkpoint $cp_tag!"
         [ -f "$t_inv" ] || fatal "Atomic update failed: $t_inv missing in production mode at checkpoint $cp_tag!"
+        [ -r "$m_inv" ] || fatal "Atomic update failed: $m_inv unreadable in production mode at checkpoint $cp_tag!"
+        [ -r "$t_inv" ] || fatal "Atomic update failed: $t_inv unreadable in production mode at checkpoint $cp_tag!"
+        [ -s "$m_inv" ] || fatal "Atomic update failed: $m_inv empty (0 bytes) in production mode at checkpoint $cp_tag!"
+        [ -s "$t_inv" ] || fatal "Atomic update failed: $t_inv empty (0 bytes) in production mode at checkpoint $cp_tag!"
+        cmp -s "$m_inv" "$t_inv" || fatal "Atomic update failed: initial inventory byte-identity mismatch between $m_inv and $t_inv at checkpoint $cp_tag!"
+    fi
+
+    # Verify new record is not duplicated in existing inventories
+    local dev_node="${record%%:*}"
+    if grep -q -F "$record" "$m_inv" 2>/dev/null || grep -q "^${dev_node}:" "$m_inv" 2>/dev/null; then
+        fatal "Atomic update failed: record '$record' already exists in $m_inv at checkpoint $cp_tag!"
+    fi
+    if grep -q -F "$record" "$t_inv" 2>/dev/null || grep -q "^${dev_node}:" "$t_inv" 2>/dev/null; then
+        fatal "Atomic update failed: record '$record' already exists in $t_inv at checkpoint $cp_tag!"
     fi
 
     local m_target_dir="${MNT_DIR:-/mnt}"
@@ -314,18 +329,23 @@ atomic_update_inventory() {
 
     if [ -f "$m_inv" ]; then
         m_staging="$m_target_dir/inventory.staging.$$.$RANDOM"
-        cp -f "$m_inv" "$m_staging" || fatal "Failed to copy $m_inv to staging $m_staging at checkpoint $cp_tag!"
-        echo "$record" >> "$m_staging" || fatal "Failed to write record to $m_staging at checkpoint $cp_tag!"
-        grep -q -F "$record" "$m_staging" || fatal "Record verification failed in $m_staging at checkpoint $cp_tag!"
+        cp -f "$m_inv" "$m_staging" || { rm -f "$m_staging" 2>/dev/null || true; fatal "Failed to copy $m_inv to staging $m_staging at checkpoint $cp_tag!"; }
+        echo "$record" >> "$m_staging" || { rm -f "$m_staging" 2>/dev/null || true; fatal "Failed to write record to $m_staging at checkpoint $cp_tag!"; }
+        local m_cnt
+        m_cnt=$(grep -c -F "$record" "$m_staging" 2>/dev/null || echo "0")
+        [ "$m_cnt" -eq 1 ] || { rm -f "$m_staging" 2>/dev/null || true; fatal "Record verification failed in $m_staging (count=$m_cnt, expected 1) at checkpoint $cp_tag!"; }
     fi
 
     if [ -f "$t_inv" ]; then
         t_staging="$t_target_dir/inventory.staging.$$.$RANDOM"
-        cp -f "$t_inv" "$t_staging" || fatal "Failed to copy $t_inv to staging $t_staging at checkpoint $cp_tag!"
-        echo "$record" >> "$t_staging" || fatal "Failed to write record to $t_staging at checkpoint $cp_tag!"
-        grep -q -F "$record" "$t_staging" || fatal "Record verification failed in $t_staging at checkpoint $cp_tag!"
+        cp -f "$t_inv" "$t_staging" || { rm -f "$m_staging" "$t_staging" 2>/dev/null || true; fatal "Failed to copy $t_inv to staging $t_staging at checkpoint $cp_tag!"; }
+        echo "$record" >> "$t_staging" || { rm -f "$m_staging" "$t_staging" 2>/dev/null || true; fatal "Failed to write record to $t_staging at checkpoint $cp_tag!"; }
+        local t_cnt
+        t_cnt=$(grep -c -F "$record" "$t_staging" 2>/dev/null || echo "0")
+        [ "$t_cnt" -eq 1 ] || { rm -f "$m_staging" "$t_staging" 2>/dev/null || true; fatal "Record verification failed in $t_staging (count=$t_cnt, expected 1) at checkpoint $cp_tag!"; }
     fi
 
+    # Both staged files must be byte-identical prior to publication
     if [ -n "$m_staging" ] && [ -n "$t_staging" ]; then
         if ! cmp -s "$m_staging" "$t_staging"; then
             rm -f "$m_staging" "$t_staging" 2>/dev/null || true
@@ -333,12 +353,12 @@ atomic_update_inventory() {
         fi
     fi
 
-    # Atomic publication via rename
+    # Atomic publication via rename (fail-closed if either rename fails)
     if [ -n "$m_staging" ]; then
-        mv -f "$m_staging" "$m_inv" || fatal "Atomic publish to $m_inv failed at checkpoint $cp_tag!"
+        mv -f "$m_staging" "$m_inv" || { rm -f "$m_staging" "$t_staging" 2>/dev/null || true; fatal "Atomic publish to $m_inv failed at checkpoint $cp_tag!"; }
     fi
     if [ -n "$t_staging" ]; then
-        mv -f "$t_staging" "$t_inv" || fatal "Atomic publish to $t_inv failed at checkpoint $cp_tag!"
+        mv -f "$t_staging" "$t_inv" || { rm -f "$t_staging" 2>/dev/null || true; fatal "Atomic publish to $t_inv failed at checkpoint $cp_tag!"; }
     fi
 
     # Post-publication byte-identity verification

@@ -120,6 +120,40 @@ exit 0
 """)
         os.chmod(self.mock_mknod, stat.S_IRWXU)
 
+        # Mock stat binary
+        self.mock_stat = os.path.join(self.bin_dir, "stat")
+        self.stat_log = os.path.join(self.test_dir, "stat_invocations.log")
+        with open(self.mock_stat, "w") as f:
+            f.write(f"""#!/bin/sh
+echo "$@" >> "{self.stat_log}"
+if [ "${{STAT_FAIL:-0}}" = "1" ]; then
+    echo "stat: cannot stat: I/O error" >&2
+    exit 1
+fi
+if [ -n "${{STAT_RAW_OUTPUT+x}}" ]; then
+    echo "${{STAT_RAW_OUTPUT}}"
+    exit 0
+fi
+node="$4"
+bname=$(basename "$node")
+dev_file="{self.mock_sys_block}/$bname/dev"
+if [ ! -f "$dev_file" ]; then
+    dev_file="{self.mock_sys_block}/sda/$bname/dev"
+fi
+if [ -f "$dev_file" ]; then
+    mm=$(cat "$dev_file" 2>/dev/null | tr -d '[:space:]')
+    maj="${{mm%%:*}}"
+    min="${{mm##*:}}"
+    hex_maj=$(printf "%x" "$maj" 2>/dev/null || echo "$maj")
+    hex_min=$(printf "%x" "$min" 2>/dev/null || echo "$min")
+    echo "$hex_maj:$hex_min"
+    exit 0
+fi
+echo "8:0"
+exit 0
+""")
+        os.chmod(self.mock_stat, stat.S_IRWXU)
+
         # Default valid disk sda
         self.sda_sys = os.path.join(self.mock_sys_block, "sda")
         os.makedirs(self.sda_sys, exist_ok=True)
@@ -132,9 +166,23 @@ exit 0
         with open(self.sda_node, "w") as f:
             f.write("")
 
-        self.inv_file = os.path.join(self.test_dir, "physical_storage_inventory")
-        with open(self.inv_file, "w") as f:
-            f.write(f"/dev/block/sda:8:0:{self.sda_sys}\n")
+        self.mnt_dir = os.path.join(self.test_dir, "mnt_dir")
+        self.tmp_dir = os.path.join(self.test_dir, "tmp_dir")
+        os.makedirs(self.mnt_dir, exist_ok=True)
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        self.inv_file_mnt = os.path.join(self.mnt_dir, "physical_storage_inventory_mnt")
+        self.inv_file_tmp = os.path.join(self.tmp_dir, "physical_storage_inventory_tmp")
+        self.inv_file = self.inv_file_mnt
+        initial_inv = f"/dev/block/sda:8:0:{self.sda_sys}\n"
+        with open(self.inv_file_mnt, "w") as f:
+            f.write(initial_inv)
+        with open(self.inv_file_tmp, "w") as f:
+            f.write(initial_inv)
+
+    def sync_inventories(self):
+        """Keep test mnt and tmp inventories synchronized if modified."""
+        if os.path.exists(self.inv_file_mnt):
+            shutil.copy2(self.inv_file_mnt, self.inv_file_tmp)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -149,7 +197,8 @@ exit 0
             "WATCHDOG_DONE_FILE": self.done_file,
             "WATCHDOG_CANCEL_FILE": self.cancel_file,
             "WATCHDOG_STATE_FILE": self.state_file,
-            "WATCHDOG_INVENTORY_FILE": self.inv_file,
+            "WATCHDOG_INVENTORY_FILE": self.inv_file_mnt,
+            "WATCHDOG_INVENTORY_FILE_TMP": self.inv_file_tmp,
             "SYS_BLOCK_DIR": self.mock_sys_block,
             "DEV_BLOCK_DIR": self.mock_dev_block,
             "WATCHDOG_TEST_MODE": "1",
@@ -157,6 +206,7 @@ exit 0
             "REBOOT_BIN": self.mock_reboot,
             "GETPROP_BIN": self.mock_getprop,
             "GETPROP_BOOT_STATUS_FILE": self.boot_status_file,
+            "STAT_BIN": self.mock_stat,
             "WATCHDOG_TIMEOUT": "2",
             "WATCHDOG_STAGE2_TIMEOUT": "4",
             "WATCHDOG_HEALTH_TIMEOUT": "4",
@@ -599,7 +649,9 @@ exit 0
 
     def test_watchdog_empty_inventory_triggers_storage_violation(self):
         """Verify watchdog triggers STORAGE_VIOLATION and reboot when inventory is 0 bytes."""
-        with open(self.inv_file, "w") as f:
+        with open(self.inv_file_mnt, "w") as f:
+            pass
+        with open(self.inv_file_tmp, "w") as f:
             pass
         res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
         self.assertEqual(res.returncode, 1)
@@ -610,7 +662,7 @@ exit 0
 
     def test_watchdog_unreadable_inventory_triggers_storage_violation(self):
         """Verify watchdog triggers STORAGE_VIOLATION when inventory file is unreadable."""
-        os.chmod(self.inv_file, 0o000)
+        os.chmod(self.inv_file_mnt, 0o000)
         try:
             res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
             self.assertEqual(res.returncode, 1)
@@ -618,12 +670,13 @@ exit 0
             with open(self.state_file) as f:
                 self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
         finally:
-            os.chmod(self.inv_file, 0o644)
+            os.chmod(self.inv_file_mnt, 0o644)
 
     def test_watchdog_malformed_inventory_triggers_storage_violation(self):
         """Verify watchdog triggers STORAGE_VIOLATION on malformed inventory entries."""
-        with open(self.inv_file, "w") as f:
+        with open(self.inv_file_mnt, "w") as f:
             f.write("/dev/block/sda:8:0\n")  # Missing 4th field
+        self.sync_inventories()
         res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
         self.assertEqual(res.returncode, 1)
         self.assertIn("Malformed inventory entry", res.stderr)
@@ -676,8 +729,9 @@ exit 0
 
     def test_watchdog_duplicate_inventory_entry_triggers_storage_violation(self):
         """Verify watchdog triggers STORAGE_VIOLATION on duplicate records in inventory."""
-        with open(self.inv_file, "a") as f:
+        with open(self.inv_file_mnt, "a") as f:
             f.write(f"/dev/block/sda:8:0:{self.sda_sys}\n")
+        self.sync_inventories()
         res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
         self.assertEqual(res.returncode, 1)
         self.assertIn("Duplicate device '/dev/block/sda' found in inventory", res.stderr)
@@ -697,7 +751,6 @@ exit 0
 
     def test_watchdog_newly_appearing_partition_locked_and_recorded(self):
         """Verify watchdog detects newly appearing partition in sysfs, creates node via mknod, locks it, and appends to inventory."""
-        # Create sda1 partition in sysfs without pre-creating device node
         sda1_sys = os.path.join(self.sda_sys, "sda1")
         os.makedirs(sda1_sys, exist_ok=True)
         with open(os.path.join(sda1_sys, "dev"), "w") as f:
@@ -706,7 +759,6 @@ exit 0
         if os.path.exists(sda1_node):
             os.remove(sda1_node)
 
-        # Heartbeat so watchdog finishes tick 1 cleanly
         with open(self.heartbeat_file, "w") as f:
             f.write("pet")
 
@@ -714,9 +766,12 @@ exit 0
         self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}")
         self.assertIn("Detected newly appearing physical partition: /dev/block/sda1", res.stderr)
         self.assertIn("Locked newly appearing partition read-only: /dev/block/sda1 (ro=1)", res.stderr)
-        with open(self.inv_file) as f:
-            content = f.read()
-        self.assertIn("/dev/block/sda1:8:1:", content)
+        with open(self.inv_file_mnt) as f:
+            content_mnt = f.read()
+        with open(self.inv_file_tmp) as f:
+            content_tmp = f.read()
+        self.assertEqual(content_mnt, content_tmp)
+        self.assertIn("/dev/block/sda1:8:1:", content_mnt)
         self.assertTrue(os.path.exists(sda1_node))
 
     def test_watchdog_newly_appearing_partition_mknod_arg_construction(self):
@@ -770,9 +825,12 @@ exit 0
         self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}")
         self.assertIn("Detected newly appearing physical disk: /dev/block/sdb", res.stderr)
         self.assertIn("Locked newly appearing disk read-only: /dev/block/sdb (ro=1)", res.stderr)
-        with open(self.inv_file) as f:
-            content = f.read()
-        self.assertIn("/dev/block/sdb:8:16:", content)
+        with open(self.inv_file_mnt) as f:
+            content_mnt = f.read()
+        with open(self.inv_file_tmp) as f:
+            content_tmp = f.read()
+        self.assertEqual(content_mnt, content_tmp)
+        self.assertIn("/dev/block/sdb:8:16:", content_mnt)
 
     def test_watchdog_newly_appearing_partition_mknod_failure_fails_closed(self):
         """Verify watchdog triggers STORAGE_VIOLATION when mknod fails for a newly appearing partition."""
@@ -844,12 +902,321 @@ exit 0
         with open(os.path.join(sda7_sys, "dev"), "w") as f:
             f.write("8:7\n")
 
-        # Make directory in place of inv_file to cause append failure
-        os.remove(self.inv_file)
-        os.makedirs(self.inv_file, exist_ok=True)
+        # Make directory in place of inv_file_mnt to cause update failure
+        os.remove(self.inv_file_mnt)
+        os.makedirs(self.inv_file_mnt, exist_ok=True)
 
         res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
         self.assertEqual(res.returncode, 1)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    # --------------------------------------------------------------------------
+    # Priority 3: Inventory Synchronization Regression Tests
+    # --------------------------------------------------------------------------
+    def test_watchdog_new_disk_updates_both_inventories(self):
+        """Verify newly appearing disk updates both /mnt and /tmp inventory copies."""
+        sdb_sys = os.path.join(self.mock_sys_block, "sdb")
+        os.makedirs(sdb_sys, exist_ok=True)
+        with open(os.path.join(sdb_sys, "device"), "w") as f:
+            f.write("mock_hw\n")
+        with open(os.path.join(sdb_sys, "dev"), "w") as f:
+            f.write("8:16\n")
+        sdb_node = os.path.join(self.mock_dev_block, "sdb")
+        if os.path.exists(sdb_node):
+            os.remove(sdb_node)
+
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 0, f"Watchdog failed: {res.stderr}")
+        with open(self.inv_file_mnt) as f:
+            content_mnt = f.read()
+        with open(self.inv_file_tmp) as f:
+            content_tmp = f.read()
+        self.assertIn("/dev/block/sdb:8:16:", content_mnt)
+        self.assertIn("/dev/block/sdb:8:16:", content_tmp)
+        self.assertEqual(content_mnt, content_tmp)
+
+    def test_watchdog_new_partition_updates_both_inventories(self):
+        """Verify newly appearing partition updates both /mnt and /tmp inventory copies."""
+        sda1_sys = os.path.join(self.sda_sys, "sda1")
+        os.makedirs(sda1_sys, exist_ok=True)
+        with open(os.path.join(sda1_sys, "dev"), "w") as f:
+            f.write("8:1\n")
+        sda1_node = os.path.join(self.mock_dev_block, "sda1")
+        if os.path.exists(sda1_node):
+            os.remove(sda1_node)
+
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 0, f"Watchdog failed: {res.stderr}")
+        with open(self.inv_file_mnt) as f:
+            content_mnt = f.read()
+        with open(self.inv_file_tmp) as f:
+            content_tmp = f.read()
+        self.assertIn("/dev/block/sda1:8:1:", content_mnt)
+        self.assertIn("/dev/block/sda1:8:1:", content_tmp)
+        self.assertEqual(content_mnt, content_tmp)
+
+    def test_watchdog_both_files_remain_byte_identical_after_update(self):
+        """Verify both inventory files remain byte-identical after discovery and locking."""
+        sda1_sys = os.path.join(self.sda_sys, "sda1")
+        os.makedirs(sda1_sys, exist_ok=True)
+        with open(os.path.join(sda1_sys, "dev"), "w") as f:
+            f.write("8:1\n")
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 0)
+        with open(self.inv_file_mnt, "rb") as f1, open(self.inv_file_tmp, "rb") as f2:
+            self.assertEqual(f1.read(), f2.read())
+
+    def test_watchdog_missing_mnt_inventory_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION when /mnt inventory copy is missing."""
+        os.remove(self.inv_file_mnt)
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Physical storage inventory missing at", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_missing_tmp_inventory_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION when /tmp inventory copy is missing."""
+        os.remove(self.inv_file_tmp)
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Physical storage inventory missing at", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_initial_inventory_mismatch_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION when initial /mnt and /tmp copies mismatch."""
+        with open(self.inv_file_tmp, "a") as f:
+            f.write("/dev/block/mismatch:8:99:/sys/block/mismatch\n")
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Initial physical storage inventory byte-identity mismatch", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_failure_copying_staging_file_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION if copying staging file fails."""
+        sda1_sys = os.path.join(self.sda_sys, "sda1")
+        os.makedirs(sda1_sys, exist_ok=True)
+        with open(os.path.join(sda1_sys, "dev"), "w") as f:
+            f.write("8:1\n")
+        # Make staging directory read-only to prevent staging file creation
+        os.chmod(self.mnt_dir, 0o555)
+        try:
+            res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("Failed to copy", res.stderr)
+            with open(self.state_file) as f:
+                self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+        finally:
+            os.chmod(self.mnt_dir, 0o755)
+
+    def test_watchdog_failure_appending_record_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION if record append fails."""
+        sda1_sys = os.path.join(self.sda_sys, "sda1")
+        os.makedirs(sda1_sys, exist_ok=True)
+        with open(os.path.join(sda1_sys, "dev"), "w") as f:
+            f.write("8:1\n")
+        # Replace tmp inventory with directory so staging copy/append fails
+        os.remove(self.inv_file_tmp)
+        os.makedirs(self.inv_file_tmp, exist_ok=True)
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_failure_publishing_staged_file_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION if publication rename fails."""
+        sda1_sys = os.path.join(self.sda_sys, "sda1")
+        os.makedirs(sda1_sys, exist_ok=True)
+        with open(os.path.join(sda1_sys, "dev"), "w") as f:
+            f.write("8:1\n")
+        # Target inventory replaced by non-empty directory prevents mv -f
+        os.remove(self.inv_file_tmp)
+        os.makedirs(self.inv_file_tmp, exist_ok=True)
+        with open(os.path.join(self.inv_file_tmp, "blocker"), "w") as f:
+            f.write("blocker\n")
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_final_byte_identity_mismatch_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION if final published inventories mismatch."""
+        with open(self.inv_file_mnt, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{self.sda_sys}\n")
+        with open(self.inv_file_tmp, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{self.sda_sys}\n/dev/block/sdb:8:16:{self.sda_sys}\n")
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("byte-identity mismatch", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_duplicate_record_insertion_rejected(self):
+        """Verify duplicate record insertion is rejected fail-closed."""
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 0)
+        with open(self.inv_file_mnt) as f:
+            lines = f.read().splitlines()
+        sda_lines = [l for l in lines if l.startswith("/dev/block/sda:")]
+        self.assertEqual(len(sda_lines), 1, "Duplicate sda record found in inventory!")
+
+    # --------------------------------------------------------------------------
+    # Priority 3: Block-Node Identity Verification Regression Tests
+    # --------------------------------------------------------------------------
+    def test_watchdog_correct_hex_major_minor_conversion_passes(self):
+        """Verify correct hexadecimal major/minor conversion (e.g. 8:10 hex -> 8:16 dec) passes."""
+        with open(os.path.join(self.sda_sys, "dev"), "w") as f:
+            f.write("8:16\n")
+        with open(self.inv_file_mnt, "w") as f:
+            f.write(f"/dev/block/sda:8:16:{self.sda_sys}\n")
+        self.sync_inventories()
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_RAW_OUTPUT": "8:10",  # 0x10 hex == 16 decimal
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}")
+
+    def test_watchdog_correct_device_identity_passes(self):
+        """Verify matching device identity passes verification."""
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+        with open(os.path.join(self.sda_sys, "dev"), "w") as f:
+            f.write("8:1\n")
+        with open(self.inv_file_mnt, "w") as f:
+            f.write(f"/dev/block/sda:8:1:{self.sda_sys}\n")
+        self.sync_inventories()
+        res_pass = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_RAW_OUTPUT": "8:1",
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res_pass.returncode, 0, f"Failed: {res_pass.stderr}")
+
+    def test_watchdog_incorrect_major_fails_closed(self):
+        """Verify incorrect major number in stat output triggers STORAGE_VIOLATION."""
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_RAW_OUTPUT": "9:0",  # expected 8:0
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("does not match sysfs", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_incorrect_minor_fails_closed(self):
+        """Verify incorrect minor number in stat output triggers STORAGE_VIOLATION."""
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_RAW_OUTPUT": "8:99",  # expected 8:0
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("does not match sysfs", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_malformed_stat_output_fails_closed(self):
+        """Verify malformed stat output (missing colon or non-hex) triggers STORAGE_VIOLATION."""
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_RAW_OUTPUT": "invalid_stat_string",
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Malformed stat output", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_empty_stat_output_fails_closed(self):
+        """Verify empty stat output triggers STORAGE_VIOLATION."""
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_RAW_OUTPUT": "",
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Empty stat output", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_both_stat_implementations_unavailable_fails_closed(self):
+        """Verify absence of any stat binary triggers STORAGE_VIOLATION."""
+        no_stat_dir = os.path.join(self.test_dir, "no_stat_bin")
+        os.makedirs(no_stat_dir, exist_ok=True)
+        sh_path = shutil.which("sh") or "/bin/sh"
+        os.symlink(sh_path, os.path.join(no_stat_dir, "sh"))
+        for tool in ["rm", "mv", "cp", "cat", "echo", "grep", "tr", "cut", "sed", "wc", "basename", "dirname", "printf", "cmp", "blockdev"]:
+            tool_path = shutil.which(tool)
+            if tool_path:
+                os.symlink(tool_path, os.path.join(no_stat_dir, tool))
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_BIN": "/nonexistent/stat_binary",
+            "PATH": no_stat_dir,
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("No stat binary available", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_stat_exits_nonzero_fails_closed(self):
+        """Verify non-zero stat exit code triggers STORAGE_VIOLATION."""
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_FAIL": "1",
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("stat -L -c '%t:%T' failed on block node", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_zero_identity_rejected_for_physical_devices(self):
+        """Verify unexpected zero device identity (0:0) triggers STORAGE_VIOLATION."""
+        res = self.run_watchdog({
+            "WATCHDOG_TEST_VERIFY_STAT": "1",
+            "STAT_RAW_OUTPUT": "0:0",
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Unexpected zero device identity (0:0)", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_test_mode_regular_files_supported_without_weakening_production(self):
+        """Verify regular file mocks pass in test mode but fail closed in production mode."""
+        # 1. Test mode = 1: regular file mock passes
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+        res_test = self.run_watchdog({"WATCHDOG_TEST_MODE": "1", "WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res_test.returncode, 0, f"Failed in test mode: {res_test.stderr}")
+
+        # 2. Production mode (WATCHDOG_TEST_MODE = 0): regular file mock is rejected fail-closed
+        res_prod = self.run_watchdog({
+            "WATCHDOG_TEST_MODE": "0",
+            "WATCHDOG_MAX_TICKS": "1",
+            "WATCHDOG_INVENTORY_MNT": self.inv_file_mnt,
+            "WATCHDOG_INVENTORY_TMP": self.inv_file_tmp
+        })
+        self.assertEqual(res_prod.returncode, 1)
+        self.assertIn("is NOT a block device", res_prod.stderr)
         with open(self.state_file) as f:
             self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
 

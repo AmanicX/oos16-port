@@ -1,6 +1,6 @@
 # OxygenOS 16 Port to OnePlus 7T (HD1901) — Project Summary
 
-> **Document Version**: 2.9.0 (Disposable Loop & Block-Device Test Tier, Fail-Closed Storage Audit & Protection, Atomic Inventory Staging, Watchdog Fail-Closed Architecture, 6-Checkpoint Revalidation, 201 Total Automated Tests: 186 Python + 15 Go, 36/36 Static Safety Auditor Checks on Packaged Images, 34/34 on Ramdisks)  
+> **Document Version**: 2.10.0 (Synchronized Watchdog Inventory Updates, Strict Block-Node Identity Verification, Atomic Stage-2 Updates, Disposable Loop & Block-Device Test Tier, Fail-Closed Storage Audit & Protection, 6-Checkpoint Revalidation, 222 Total Automated Tests: 207 Python [206 pass, 0 fail, 1 unprivileged skip locally, 207 pass in CI] + 15 Go, 36/36 Static Safety Auditor Checks on Packaged Images, 34/34 on Ramdisks)  
 > **Target Device**: OnePlus 7T (`HD1901` / `hotdogb`, Snapdragon 855+ / SM8150-AC, 8 GB RAM)  
 > **Source ROM**: OxygenOS 16 / Android 16 (`BP2A.250605.015`, SDK 36 / `Baklava`, OnePlus 9 `lemonade` / `LE2113_16.0.10.500(EX01)` EEA donor, `ota_full-LE2113_16.0.10.500.zip`, SHA-256 `5ea5f120a2bce5eb98bd2a5d1aca872f5888903825861142bd0900772b8d0844`)  
 > **Base OS on Device**: crDroid (Android 16 / LineageOS 23.2 base, FBE Encrypted)  

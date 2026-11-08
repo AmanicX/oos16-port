@@ -164,7 +164,11 @@ STATE_FILE="${WATCHDOG_STATE_FILE:-/mnt/watchdog_state}"
 REBOOT_BIN="${REBOOT_BIN:-/system/bin/reboot}"
 GETPROP_BIN="${GETPROP_BIN:-/system/bin/getprop}"
 CHROOT_BIN="${CHROOT_BIN:-/system/bin/chroot}"
+STAT_BIN="${STAT_BIN:-}"
 WATCHDOG_INVENTORY_FILE="${WATCHDOG_INVENTORY_FILE:-}"
+WATCHDOG_INVENTORY_FILE_TMP="${WATCHDOG_INVENTORY_FILE_TMP:-}"
+WATCHDOG_INVENTORY_MNT="${WATCHDOG_INVENTORY_MNT:-}"
+WATCHDOG_INVENTORY_TMP="${WATCHDOG_INVENTORY_TMP:-}"
 SYS_BLOCK_DIR="${SYS_BLOCK_DIR:-/sys/block}"
 DEV_BLOCK_DIR="${DEV_BLOCK_DIR:-/dev/block}"
 WATCHDOG_TEST_MODE="${WATCHDOG_TEST_MODE:-0}"
@@ -243,26 +247,262 @@ trigger_storage_violation() {
     exit 1
 }
 
+# Helper to strictly verify block device node identity and fail-closed
+verify_block_node_identity() {
+    local check_node="$1"
+    local exp_maj="$2"
+    local exp_min="$3"
+    local dev_name="$4"
+
+    # 1. Device node existence
+    if [ ! -e "$check_node" ]; then
+        trigger_storage_violation "Block device node '$dev_name' does not exist"
+    fi
+
+    # 2. Block special device enforcement (fail-closed in production)
+    if [ "$WATCHDOG_TEST_MODE" = "1" ]; then
+        if [ ! -b "$check_node" ] && [ ! -f "$check_node" ]; then
+            trigger_storage_violation "Device node '$dev_name' is neither block special nor test mock file"
+        fi
+    else
+        if [ ! -b "$check_node" ]; then
+            trigger_storage_violation "Device node '$dev_name' is NOT a block device"
+        fi
+    fi
+
+    # 3. Stat identity verification
+    # Required for real block-special devices, and for test mocks when explicitly verifying stat
+    local should_verify_stat=0
+    if [ -b "$check_node" ]; then
+        should_verify_stat=1
+    elif [ "$WATCHDOG_TEST_MODE" = "1" ]; then
+        if [ "${WATCHDOG_TEST_VERIFY_STAT:-0}" = "1" ] || [ -n "${STAT_RAW_OUTPUT+x}" ] || [ "${STAT_FAIL:-0}" = "1" ]; then
+            should_verify_stat=1
+        fi
+    fi
+
+    if [ "$should_verify_stat" -eq 1 ]; then
+        local stat_out=""
+        local stat_st=0
+        if [ -n "${STAT_BIN:-}" ] && [ -x "$STAT_BIN" ]; then
+            stat_out=$("$STAT_BIN" -L -c "%t:%T" "$check_node" 2>&1) || stat_st=$?
+        elif [ -x /system/bin/toybox ]; then
+            stat_out=$(/system/bin/toybox stat -L -c "%t:%T" "$check_node" 2>&1) || stat_st=$?
+        elif command -v stat >/dev/null 2>&1; then
+            stat_out=$(stat -L -c "%t:%T" "$check_node" 2>&1) || stat_st=$?
+        else
+            trigger_storage_violation "No stat binary available to verify block device node identity for '$dev_name'"
+        fi
+
+        if [ "$stat_st" -ne 0 ]; then
+            trigger_storage_violation "stat -L -c '%t:%T' failed on block node '$dev_name' with exit code $stat_st ($stat_out)"
+        fi
+
+        local clean_stat
+        clean_stat=$(echo "$stat_out" | tr -d '[:space:]')
+        if [ -z "$clean_stat" ]; then
+            trigger_storage_violation "Empty stat output for block node '$dev_name'"
+        fi
+
+        # Require exactly 2 fields separated by 1 colon
+        local num_colons
+        num_colons=$(echo "$clean_stat" | tr -cd ':' | wc -c)
+        if [ "$num_colons" -ne 1 ]; then
+            trigger_storage_violation "Malformed stat output '$clean_stat' for block node '$dev_name' (expected 2 colon-separated fields)"
+        fi
+
+        local hex_maj="${clean_stat%%:*}"
+        local hex_min="${clean_stat##*:}"
+        if [ -z "$hex_maj" ] || [ -z "$hex_min" ]; then
+            trigger_storage_violation "Malformed stat output '$clean_stat' for block node '$dev_name' (empty major or minor)"
+        fi
+
+        case "$hex_maj" in
+            ''|*[!0-9a-fA-F]*)
+                trigger_storage_violation "Non-hexadecimal major '$hex_maj' in stat output for '$dev_name'"
+                ;;
+        esac
+        case "$hex_min" in
+            ''|*[!0-9a-fA-F]*)
+                trigger_storage_violation "Non-hexadecimal minor '$hex_min' in stat output for '$dev_name'"
+                ;;
+        esac
+
+        # POSIX-compliant conversion of hexadecimal to decimal
+        local dec_maj dec_min
+        dec_maj=$(printf "%d" "0x$hex_maj" 2>/dev/null) || trigger_storage_violation "Failed to convert major '0x$hex_maj' to decimal"
+        dec_min=$(printf "%d" "0x$hex_min" 2>/dev/null) || trigger_storage_violation "Failed to convert minor '0x$hex_min' to decimal"
+
+        # Reject unexpected zero identity values (0:0 is invalid for physical storage devices)
+        if [ "$dec_maj" -eq 0 ] && [ "$dec_min" -eq 0 ]; then
+            trigger_storage_violation "Unexpected zero device identity (0:0) for physical block node '$dev_name'"
+        fi
+
+        # Compare resulting decimal values with expected sysfs dev
+        if [ "$dec_maj" != "$exp_maj" ] || [ "$dec_min" != "$exp_min" ]; then
+            trigger_storage_violation "Block node '$dev_name' major:minor ($dec_maj:$dec_min) does not match sysfs ($exp_maj:$exp_min)"
+        fi
+    fi
+}
+
+# Reusable watchdog inventory-update function enforcing two-copy synchronization
+watchdog_atomic_update_inventory() {
+    local record="$1"
+    local inv_mnt="$INV_MNT"
+    local inv_tmp="$INV_TMP"
+
+    # Reject duplicate record or device
+    local dev_node="${record%%:*}"
+    if grep -q -F "$record" "$inv_mnt" 2>/dev/null || grep -q "^${dev_node}:" "$inv_mnt" 2>/dev/null; then
+        trigger_storage_violation "Duplicate record '$record' already exists in inventory '$inv_mnt'"
+    fi
+    if grep -q -F "$record" "$inv_tmp" 2>/dev/null || grep -q "^${dev_node}:" "$inv_tmp" 2>/dev/null; then
+        trigger_storage_violation "Duplicate record '$record' already exists in inventory '$inv_tmp'"
+    fi
+
+    # Verify both source inventories exist, are readable, non-empty, and byte-identical
+    if [ ! -f "$inv_mnt" ]; then
+        trigger_storage_violation "Cannot update inventory: '$inv_mnt' missing"
+    fi
+    if [ ! -f "$inv_tmp" ]; then
+        trigger_storage_violation "Cannot update inventory: '$inv_tmp' missing"
+    fi
+    if [ ! -r "$inv_mnt" ]; then
+        trigger_storage_violation "Cannot update inventory: '$inv_mnt' is not readable"
+    fi
+    if [ ! -r "$inv_tmp" ]; then
+        trigger_storage_violation "Cannot update inventory: '$inv_tmp' is not readable"
+    fi
+    if [ ! -s "$inv_mnt" ]; then
+        trigger_storage_violation "Cannot update inventory: '$inv_mnt' is empty (0 bytes)"
+    fi
+    if [ ! -s "$inv_tmp" ]; then
+        trigger_storage_violation "Cannot update inventory: '$inv_tmp' is empty (0 bytes)"
+    fi
+    if ! cmp -s "$inv_mnt" "$inv_tmp"; then
+        trigger_storage_violation "Cannot update inventory: '$inv_mnt' and '$inv_tmp' are not byte-identical prior to update"
+    fi
+
+    # Determine staging paths on each target filesystem
+    local mnt_dir tmp_dir m_staging t_staging
+    mnt_dir=$(dirname "$inv_mnt")
+    tmp_dir=$(dirname "$inv_tmp")
+    m_staging="$mnt_dir/inventory.staging.$$.$RANDOM"
+    t_staging="$tmp_dir/inventory.staging.$$.$RANDOM"
+
+    # Copy to staging
+    if ! cp -f "$inv_mnt" "$m_staging" 2>/dev/null; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Failed to copy '$inv_mnt' to staging '$m_staging'"
+    fi
+    if ! cp -f "$inv_tmp" "$t_staging" 2>/dev/null; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Failed to copy '$inv_tmp' to staging '$t_staging'"
+    fi
+
+    # Append record
+    if ! echo "$record" >> "$m_staging"; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Failed to append record to staging '$m_staging'"
+    fi
+    if ! echo "$record" >> "$t_staging"; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Failed to append record to staging '$t_staging'"
+    fi
+
+    # Verify record appears exactly once in m_staging
+    local m_count t_count
+    m_count=$(grep -c -F "$record" "$m_staging" 2>/dev/null || echo "0")
+    if [ "$m_count" -ne 1 ]; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Record count verification failed in '$m_staging' (count=$m_count, expected 1)"
+    fi
+
+    # Verify record appears exactly once in t_staging
+    t_count=$(grep -c -F "$record" "$t_staging" 2>/dev/null || echo "0")
+    if [ "$t_count" -ne 1 ]; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Record count verification failed in '$t_staging' (count=$t_count, expected 1)"
+    fi
+
+    # Verify both staged files are byte-identical
+    if ! cmp -s "$m_staging" "$t_staging"; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Staged inventory files are not byte-identical prior to publication"
+    fi
+
+    # Publish both updated inventories via rename
+    local m_mv_st=0 t_mv_st=0
+    mv -f "$m_staging" "$inv_mnt" 2>/dev/null || m_mv_st=$?
+    if [ "$m_mv_st" -ne 0 ]; then
+        rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Failed to publish staged inventory to '$inv_mnt' (mv exit code $m_mv_st)"
+    fi
+
+    mv -f "$t_staging" "$inv_tmp" 2>/dev/null || t_mv_st=$?
+    if [ "$t_mv_st" -ne 0 ]; then
+        rm -f "$t_staging" 2>/dev/null || true
+        trigger_storage_violation "Failed to publish staged inventory to '$inv_tmp' (mv exit code $t_mv_st)"
+    fi
+
+    # Verify final byte identity
+    if ! cmp -s "$inv_mnt" "$inv_tmp"; then
+        trigger_storage_violation "Published inventories byte-identity mismatch after update between '$inv_mnt' and '$inv_tmp'"
+    fi
+}
+
 # Helper to verify physical storage read-only state continuously & fail-closed
 check_storage_inventory_safety() {
-    local inv=""
-    if [ -n "$WATCHDOG_INVENTORY_FILE" ] && [ -f "$WATCHDOG_INVENTORY_FILE" ]; then
-        inv="$WATCHDOG_INVENTORY_FILE"
-    elif [ -f "/mnt/physical_storage_inventory" ]; then
-        inv="/mnt/physical_storage_inventory"
-    elif [ -f "/tmp/physical_storage_inventory" ]; then
-        inv="/tmp/physical_storage_inventory"
+    INV_MNT="${WATCHDOG_INVENTORY_MNT:-${WATCHDOG_INVENTORY_FILE:-/mnt/physical_storage_inventory}}"
+    INV_TMP="${WATCHDOG_INVENTORY_TMP:-${WATCHDOG_INVENTORY_FILE_TMP:-/tmp/physical_storage_inventory}}"
+
+    if [ "${WATCHDOG_TEST_MODE:-0}" != "1" ]; then
+        if [ ! -f "$INV_MNT" ]; then
+            trigger_storage_violation "Physical storage inventory missing at mandatory production path '$INV_MNT'"
+        fi
+        if [ ! -f "$INV_TMP" ]; then
+            trigger_storage_violation "Physical storage inventory missing at mandatory production path '$INV_TMP'"
+        fi
+        if [ ! -r "$INV_MNT" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_MNT' is not readable"
+        fi
+        if [ ! -r "$INV_TMP" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_TMP' is not readable"
+        fi
+        if [ ! -s "$INV_MNT" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_MNT' is empty (0 bytes)"
+        fi
+        if [ ! -s "$INV_TMP" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_TMP' is empty (0 bytes)"
+        fi
+        if ! cmp -s "$INV_MNT" "$INV_TMP"; then
+            trigger_storage_violation "Initial physical storage inventory byte-identity mismatch between '$INV_MNT' and '$INV_TMP'"
+        fi
     else
-        trigger_storage_violation "Physical storage inventory missing (neither /mnt nor /tmp found)"
+        if [ ! -f "$INV_MNT" ]; then
+            trigger_storage_violation "Physical storage inventory missing at '$INV_MNT'"
+        fi
+        if [ ! -f "$INV_TMP" ]; then
+            trigger_storage_violation "Physical storage inventory missing at '$INV_TMP'"
+        fi
+        if [ ! -r "$INV_MNT" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_MNT' is not readable"
+        fi
+        if [ ! -r "$INV_TMP" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_TMP' is not readable"
+        fi
+        if [ ! -s "$INV_MNT" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_MNT' is empty (0 bytes)"
+        fi
+        if [ ! -s "$INV_TMP" ]; then
+            trigger_storage_violation "Physical storage inventory '$INV_TMP' is empty (0 bytes)"
+        fi
+        if ! cmp -s "$INV_MNT" "$INV_TMP"; then
+            trigger_storage_violation "Initial physical storage inventory byte-identity mismatch between '$INV_MNT' and '$INV_TMP'"
+        fi
     fi
 
-    if [ ! -r "$inv" ]; then
-        trigger_storage_violation "Physical storage inventory '$inv' is not readable"
-    fi
-
-    if [ ! -s "$inv" ]; then
-        trigger_storage_violation "Physical storage inventory '$inv' is empty (0 bytes)"
-    fi
+    local inv="$INV_MNT"
 
     local sys_block_root="${SYS_BLOCK_DIR:-/sys/block}"
     local dev_block_root="${DEV_BLOCK_DIR:-/dev/block}"
@@ -320,21 +560,8 @@ check_storage_inventory_safety() {
             fi
         fi
 
-        # 1. Device node existence
-        if [ ! -e "$check_dev" ]; then
-            trigger_storage_violation "Block device node '$dev' does not exist"
-        fi
-
-        # 2. Device node type: must be block special
-        if [ "$WATCHDOG_TEST_MODE" = "1" ]; then
-            if [ ! -b "$check_dev" ] && [ ! -f "$check_dev" ]; then
-                trigger_storage_violation "Device node '$dev' is neither block special nor test mock file"
-            fi
-        else
-            if [ ! -b "$check_dev" ]; then
-                trigger_storage_violation "Device node '$dev' is NOT a block device"
-            fi
-        fi
+        # 1. Device node existence and strict block-node identity verification
+        verify_block_node_identity "$check_dev" "$maj" "$min" "$dev"
 
         # 3. Sysfs directory and dev file existence (disappearing detection)
         if [ ! -d "$check_sdir" ] || [ ! -f "$check_sdir/dev" ]; then
@@ -417,37 +644,8 @@ check_storage_inventory_safety() {
                                 trigger_storage_violation "mknod failed for newly appearing disk '$disk_dev' with exit code $d_mknod_st ($d_mknod_err)"
                             fi
                         fi
-                        if [ "$WATCHDOG_TEST_MODE" = "1" ]; then
-                            if [ ! -b "$check_dnode" ] && [ ! -f "$check_dnode" ]; then
-                                trigger_storage_violation "Device node '$check_dnode' for newly appearing disk '$disk_dev' is neither block special nor test mock file"
-                            fi
-                        else
-                            if [ ! -b "$check_dnode" ]; then
-                                trigger_storage_violation "Device node '$check_dnode' for newly appearing disk '$disk_dev' is NOT a block device"
-                            fi
-                        fi
-
-                        # Verify major/minor match against sysfs disk
-                        local cur_d_mm
-                        cur_d_mm=$(cat "$bdir/dev" 2>/dev/null | tr -d '[:space:]')
-                        if [ "$cur_d_mm" != "$d_maj:$d_min" ]; then
-                            trigger_storage_violation "Major:minor mismatch for newly appearing disk '$disk_dev' ($cur_d_mm != $d_maj:$d_min)"
-                        fi
-
-                        # If real block special node, verify node device numbers match sysfs
-                        if [ -b "$check_dnode" ]; then
-                            local dnode_hex_mm
-                            dnode_hex_mm=$(/system/bin/toybox stat -L -c "%t:%T" "$check_dnode" 2>/dev/null || stat -L -c "%t:%T" "$check_dnode" 2>/dev/null || true)
-                            if [ -n "$dnode_hex_mm" ] && [ "$dnode_hex_mm" != "0:0" ]; then
-                                local dn_hmaj="${dnode_hex_mm%%:*}"
-                                local dn_hmin="${dnode_hex_mm##*:}"
-                                local dn_dmaj=$(( 0x$dn_hmaj ))
-                                local dn_dmin=$(( 0x$dn_hmin ))
-                                if [ "$dn_dmaj" != "$d_maj" ] || [ "$dn_dmin" != "$d_min" ]; then
-                                    trigger_storage_violation "Block node '$check_dnode' major:minor ($dn_dmaj:$dn_dmin) does not match sysfs disk ($d_maj:$d_min)"
-                                fi
-                            fi
-                        fi
+                        # Strict block node identity verification
+                        verify_block_node_identity "$check_dnode" "$d_maj" "$d_min" "$disk_dev"
 
                         # Lock read-only
                         local setro_status=0
@@ -481,7 +679,8 @@ check_storage_inventory_safety() {
                             trigger_storage_violation "Newly appearing disk '$disk_dev' could not be locked read-only (ro=$clean_d_ro, expected 1)"
                         fi
 
-                        echo "$disk_dev:$d_maj:$d_min:$bdir" >> "$inv" || trigger_storage_violation "Failed to append newly appearing disk to inventory $inv"
+                        # Synchronize two-copy inventory atomically
+                        watchdog_atomic_update_inventory "$disk_dev:$d_maj:$d_min:$bdir"
                         seen_devs="$seen_devs$disk_dev "
                         log_msg "[WATCHDOG] Locked newly appearing disk read-only: $disk_dev (ro=1) and appended to inventory."
                         ;;
@@ -525,37 +724,8 @@ check_storage_inventory_safety() {
                                 fi
                             fi
 
-                            if [ "$WATCHDOG_TEST_MODE" = "1" ]; then
-                                if [ ! -b "$check_pnode" ] && [ ! -f "$check_pnode" ]; then
-                                    trigger_storage_violation "Device node '$check_pnode' for newly appearing partition '$part_dev' is neither block special nor test mock file"
-                                fi
-                            else
-                                if [ ! -b "$check_pnode" ]; then
-                                    trigger_storage_violation "Device node '$check_pnode' for newly appearing partition '$part_dev' is NOT a block device"
-                                fi
-                            fi
-
-                            # Verify major/minor match against sysfs partition
-                            local cur_p_mm
-                            cur_p_mm=$(cat "$pdir/dev" 2>/dev/null | tr -d '[:space:]')
-                            if [ "$cur_p_mm" != "$p_maj:$p_min" ]; then
-                                trigger_storage_violation "Major:minor mismatch for newly appearing partition '$part_dev' ($cur_p_mm != $p_maj:$p_min)"
-                            fi
-
-                            # If real block special node, verify node device numbers match sysfs
-                            if [ -b "$check_pnode" ]; then
-                                local pnode_hex_mm
-                                pnode_hex_mm=$(/system/bin/toybox stat -L -c "%t:%T" "$check_pnode" 2>/dev/null || stat -L -c "%t:%T" "$check_pnode" 2>/dev/null || true)
-                                if [ -n "$pnode_hex_mm" ] && [ "$pnode_hex_mm" != "0:0" ]; then
-                                    local pn_hmaj="${pnode_hex_mm%%:*}"
-                                    local pn_hmin="${pnode_hex_mm##*:}"
-                                    local pn_dmaj=$(( 0x$pn_hmaj ))
-                                    local pn_dmin=$(( 0x$pn_hmin ))
-                                    if [ "$pn_dmaj" != "$p_maj" ] || [ "$pn_dmin" != "$p_min" ]; then
-                                        trigger_storage_violation "Block node '$check_pnode' major:minor ($pn_dmaj:$pn_dmin) does not match sysfs partition ($p_maj:$p_min)"
-                                    fi
-                                fi
-                            fi
+                            # Strict block node identity verification
+                            verify_block_node_identity "$check_pnode" "$p_maj" "$p_min" "$part_dev"
 
                             local p_setro_st=0
                             local p_setro_err=""
@@ -588,7 +758,8 @@ check_storage_inventory_safety() {
                                 trigger_storage_violation "Newly appearing partition '$part_dev' could not be locked read-only (ro=$clean_p_ro, expected 1)"
                             fi
 
-                            echo "$part_dev:$p_maj:$p_min:$pdir" >> "$inv" || trigger_storage_violation "Failed to append newly appearing partition to inventory $inv"
+                            # Synchronize two-copy inventory atomically
+                            watchdog_atomic_update_inventory "$part_dev:$p_maj:$p_min:$pdir"
                             seen_devs="$seen_devs$part_dev "
                             log_msg "[WATCHDOG] Locked newly appearing partition read-only: $part_dev (ro=1) and appended to inventory."
                             ;;
