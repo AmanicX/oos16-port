@@ -5,8 +5,8 @@
 [![Device](https://img.shields.io/badge/Device-OnePlus%207T%20(hotdogb)-blue.svg)](https://wiki.lineageos.org/devices/hotdogb/)
 [![SoC](https://img.shields.io/badge/SoC-Snapdragon%20855%2B%20(SM8150--AC)-orange.svg)](https://www.qualcomm.com/)
 [![Storage](https://img.shields.io/badge/Storage-100%25%20Read--Only%20RAM-red.svg)](#non-negotiable-safety-contract)
-[![Tests](https://img.shields.io/badge/Tests-153%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
-[![Audit](https://img.shields.io/badge/Audit-33%2F33%20Passed-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Tests](https://img.shields.io/badge/Tests-178%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Audit](https://img.shields.io/badge/Audit-36%2F36%20Passed-brightgreen.svg)](#7-verification-status--test-matrix)
 
 ---
 
@@ -283,8 +283,8 @@ To maintain rigorous engineering honesty, verification states are strictly parti
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (33/33)** | Passed on local packaged boot images: `loader.img` (SHA-256: `ba58599d...`, 33/33), `stage1.img` (SHA-256: `edcd45f0...`, 33/33), and ramdisks (31/31). In CI without device kernel inputs, ramdisks pass 31/31 and packaged boot-image audits are logged as skipped. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (153/153)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & lifecycle (22), Stage-2 runner integration mocks (67), Storage safety & inventory revalidation (12), and Go BinderFS unit tests (15). Total Python unittests: 138/138; Go unit tests: 15/15. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `loader.img` (SHA-256: `6064d5fd...`, 36/36), `stage1.img` (SHA-256: `2030aa31...`, 36/36), and ramdisks (34/34 + 1 optional). In CI without device kernel inputs, ramdisks pass and packaged boot-image audits are logged as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (178/178)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & fail-closed lifecycle (34), Stage-2 runner integration mocks (72), Storage safety & inventory revalidation (20), and Go BinderFS unit tests (15). Total Python unittests: 163/163; Go unit tests: 15/15. |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |

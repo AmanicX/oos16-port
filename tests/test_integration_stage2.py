@@ -86,6 +86,51 @@ if subcmd == "push":
 if subcmd in ["shell", "exec-out"]:
     shell_cmd = " ".join(args[1:])
 
+    if "physical_storage_inventory" in shell_cmd:
+        if "{behavior_config.get('missing_inventory', False)}" == "True":
+            sys.exit(1)
+        elif "test -f" in shell_cmd:
+            sys.exit(0)
+        elif "{behavior_config.get('empty_inventory', False)}" == "True":
+            print("")
+            sys.exit(0)
+        elif "{behavior_config.get('malformed_inventory', False)}" == "True":
+            print("/dev/block/sda:8:0")
+            sys.exit(0)
+        elif "{behavior_config.get('mismatch_inventory', False)}" == "True":
+            print("/dev/block/sda:8:0:/sys/block/sda\\n/dev/block/sdz:8:240:/sys/block/sdz")
+            sys.exit(0)
+        else:
+            if "{behavior_config.get('no_physical', False)}" == "True":
+                print("")
+            elif "{behavior_config.get('fail_partition_ro', '')}":
+                print("/dev/block/sda:8:0:/sys/block/sda\\n/dev/block/sda1:8:1:/sys/block/sda/sda1\\n/dev/block/sda2:8:2:/sys/block/sda/sda2\\n/dev/block/sdb:8:16:/sys/block/sdb")
+            else:
+                print("/dev/block/sda:8:0:/sys/block/sda\\n/dev/block/sdb:8:16:/sys/block/sdb")
+            sys.exit(0)
+
+    if "test -b" in shell_cmd:
+        if "{behavior_config.get('missing_block_node', False)}" == "True":
+            sys.exit(1)
+        sys.exit(0)
+
+    if "cat /sys/block/" in shell_cmd and "/dev" in shell_cmd:
+        target = shell_cmd.split()[-1]
+        if "sda1" in target:
+            print("8:1")
+        elif "sda2" in target:
+            print("8:2")
+        elif "sdb" in target:
+            print("8:16")
+        elif "sdz" in target:
+            print("8:240")
+        else:
+            print("8:0")
+        sys.exit(0)
+
+    if "test -f /sys/block/" in shell_cmd and "/dev" in shell_cmd:
+        sys.exit(0)
+
     if "ls -1 /sys/block/sda" in shell_cmd:
         if "{behavior_config.get('fail_partition_ro', '')}":
             print("sda1\\nsda2\\nqueue")
@@ -371,6 +416,56 @@ sys.exit(0)
         res = subprocess.run(["bash", RUN_STAGE2], capture_output=True, text=True, env=env)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("No physical storage devices could be identified", res.stderr + res.stdout)
+
+    def test_runner_aborts_on_missing_target_inventory(self):
+        """Verify runner halts if target physical storage inventory is missing."""
+        mock_adb = self.create_mock_adb({"missing_inventory": True})
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Mandatory target physical storage inventory is missing or unreadable", res.stderr)
+
+    def test_runner_aborts_on_empty_target_inventory(self):
+        """Verify runner halts if target physical storage inventory is 0 bytes."""
+        mock_adb = self.create_mock_adb({"empty_inventory": True})
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Target physical storage inventory is empty (0 bytes)", res.stderr)
+
+    def test_runner_aborts_on_malformed_target_inventory(self):
+        """Verify runner halts if target physical storage inventory has malformed lines."""
+        mock_adb = self.create_mock_adb({"malformed_inventory": True})
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Malformed inventory record on target", res.stderr)
+
+    def test_runner_aborts_on_inventory_sysfs_parity_mismatch(self):
+        """Verify runner halts if target inventory does not match discovered physical devices."""
+        mock_adb = self.create_mock_adb({"mismatch_inventory": True})
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("CRITICAL SAFETY VIOLATION", res.stderr)
+
+    def test_runner_aborts_on_missing_block_device_node(self):
+        """Verify runner halts if a target inventory device node does not exist or is not block device."""
+        mock_adb = self.create_mock_adb({"missing_block_node": True})
+        test_images = os.path.join(self.test_dir, "images")
+        self.create_dummy_images(test_images)
+
+        res = self.run_stage2_runner(test_images, mock_adb)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("does not exist or is not a block device", res.stderr)
 
     def test_auditor_exit_codes(self):
         """

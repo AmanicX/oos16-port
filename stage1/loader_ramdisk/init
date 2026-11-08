@@ -160,21 +160,103 @@ log_kmsg "=========================================================="
 log_kmsg "  STAGE-1 RAM LOADER SUPERVISOR (PID 1) STARTING         "
 log_kmsg "=========================================================="
 
-# 5. Mount RAM Volatile Staging Filesystems
-/system/bin/toybox mount -t tmpfs -o mode=0777,size=6500M tmpfs /mnt
-/system/bin/toybox mount -t tmpfs -o mode=0777,size=512M tmpfs /tmp
-log_kmsg "[LOADER-PID1] RAM staging tmpfs mounted (6500MB available at /mnt)"
+# 5. Mount & Strictly Validate RAM Volatile Staging Filesystems
+# Verifies mount execution, /proc/mounts entries, tmpfs filesystem type,
+# confirms zero physical block-device backing, and verifies available memory.
 
-# 6. Strict Physical Storage Discovery, Validation, Write-Locking & Inventory
+# Check system-level physical memory from /proc/meminfo first
+if [ ! -f /proc/meminfo ] || [ ! -s /proc/meminfo ]; then
+    fatal_halt "CRITICAL: /proc/meminfo is missing or unreadable! Cannot verify RAM availability."
+fi
+
+MEM_TOTAL_KB=$(/system/bin/toybox awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
+case "$MEM_TOTAL_KB" in
+    ''|*[!0-9]*) fatal_halt "CRITICAL: Missing or non-numeric MemTotal in /proc/meminfo ('$MEM_TOTAL_KB')!" ;;
+esac
+MEM_TOTAL_MB=$((MEM_TOTAL_KB / 1024))
+if [ "$MEM_TOTAL_MB" -lt 6500 ]; then
+    fatal_halt "CRITICAL: MemTotal is ${MEM_TOTAL_MB}MB (< 6500MB). Target OnePlus 7T requires 8 GB RAM!"
+fi
+
+MEM_AVAIL_KB=$(/system/bin/toybox awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
+case "$MEM_AVAIL_KB" in
+    ''|*[!0-9]*) fatal_halt "CRITICAL: Missing or non-numeric MemAvailable in /proc/meminfo ('$MEM_AVAIL_KB')!" ;;
+esac
+MEM_AVAIL_MB=$((MEM_AVAIL_KB / 1024))
+# Minimum volatile bringup allocation requires at least 3392 MB
+if [ "$MEM_AVAIL_MB" -lt 3392 ]; then
+    fatal_halt "CRITICAL: Insufficient available volatile RAM (${MEM_AVAIL_MB}MB < 3392MB required for safe bringup)!"
+fi
+log_kmsg "[LOADER-PID1] Host volatile memory verified: ${MEM_AVAIL_MB}MB available / ${MEM_TOTAL_MB}MB total."
+
+mount_and_verify_tmpfs() {
+    local target="$1"
+    local size_opt="$2"
+    local min_free_mb="$3"
+
+    # 1. Ensure mountpoint exists
+    if [ ! -d "$target" ]; then
+        /system/bin/toybox mkdir -p "$target" || fatal_halt "Failed to create directory $target!"
+    fi
+
+    # 2. Execute mount command
+    if ! /system/bin/toybox mount -t tmpfs -o "mode=0777,$size_opt" tmpfs "$target"; then
+        fatal_halt "Failed to mount tmpfs on $target (options: $size_opt)!"
+    fi
+
+    # 3. Inspect /proc/mounts to confirm active mount
+    local mount_line
+    mount_line=$(/system/bin/toybox grep -E "[[:space:]]${target}[[:space:]]" /proc/mounts 2>/dev/null || true)
+    if [ -z "$mount_line" ]; then
+        fatal_halt "Mount verification failed: $target is not mounted according to /proc/mounts!"
+    fi
+
+    # 4. Confirm filesystem type is strictly tmpfs
+    local fs_type
+    fs_type=$(echo "$mount_line" | /system/bin/toybox awk '{print $3}')
+    if [ "$fs_type" != "tmpfs" ]; then
+        fatal_halt "Mount verification failed: $target filesystem is '$fs_type', expected 'tmpfs'!"
+    fi
+
+    # 5. Confirm mount source is tmpfs and NOT a physical block device
+    local fs_src
+    fs_src=$(echo "$mount_line" | /system/bin/toybox awk '{print $1}')
+    case "$fs_src" in
+        /dev/block/*|/dev/sd*|/dev/mmcblk*)
+            fatal_halt "CRITICAL SAFETY VIOLATION: $target is backed by physical block device '$fs_src'!" ;;
+    esac
+
+    # 6. Verify usable capacity using df
+    local df_out
+    df_out=$(/system/bin/toybox df -m "$target" 2>/dev/null || true)
+    local free_mb
+    free_mb=$(echo "$df_out" | /system/bin/toybox awk 'NR>1 {print $4}' | /system/bin/toybox tr -d '[:space:]')
+    case "$free_mb" in
+        ''|*[!0-9]*) fatal_halt "Failed to parse numeric free capacity for $target from df ('$df_out')!" ;;
+    esac
+    if [ "$free_mb" -lt "$min_free_mb" ]; then
+        fatal_halt "Mount capacity error: $target provides only ${free_mb}MB free (< ${min_free_mb}MB required)!"
+    fi
+    log_kmsg "[LOADER-PID1] Verified $target: tmpfs mounted (free: ${free_mb}MB, quota: $size_opt)."
+}
+
+mount_and_verify_tmpfs "/mnt" "size=6500M" 576
+mount_and_verify_tmpfs "/tmp" "size=512M" 64
+
+# 6. Strict Physical Storage Discovery, Validation, Write-Locking & Atomic Inventory
 # Note on Linux block-layer read-only limitations:
 # blockdev --setro enforces the BLKROSET flag on the kernel gendisk/block device,
 # preventing write requests submitted through block layer I/O queues and filesystems.
 # Raw kernel drivers could theoretically bypass the block layer if directly instructed,
 # but in this volatile RAM-only environment, zero write drivers or physical mount targets exist.
 log_kmsg "[LOADER-PID1] Discovering and locking physical storage block devices..."
-rm -f /tmp/physical_storage_inventory /mnt/physical_storage_inventory 2>/dev/null || true
 PHYSICAL_DEV_COUNT=0
 LOCKED_DEV_COUNT=0
+
+# Clean any existing inventory and staging files
+rm -f /tmp/physical_storage_inventory /mnt/physical_storage_inventory /tmp/inventory.staging.$$ 2>/dev/null || true
+STAGING_INV="/tmp/inventory.staging.$$"
+: > "$STAGING_INV" || fatal_halt "CRITICAL: Unable to initialize staging inventory file $STAGING_INV!"
 
 lock_and_record_physical_node() {
     local sysfs_dir="$1"
@@ -204,7 +286,7 @@ lock_and_record_physical_node() {
     esac
 
     local dev_node="/dev/block/$dev_name"
-    /system/bin/toybox mkdir -p /dev/block 2>/dev/null || true
+    /system/bin/toybox mkdir -p /dev/block 2>/dev/null || fatal_halt "CRITICAL: Failed to create /dev/block directory!"
 
     if [ ! -b "$dev_node" ]; then
         if ! /system/bin/toybox mknod "$dev_node" b "$maj" "$min"; then
@@ -227,9 +309,10 @@ lock_and_record_physical_node() {
         fatal_halt "CRITICAL SAFETY FAILURE: Failed to lock $dev_node read-only (ro=$ro_status, expected 1)!"
     fi
 
-    # Record into physical storage inventory
-    echo "$dev_node:$maj:$min:$sysfs_dir" >> /tmp/physical_storage_inventory
-    echo "$dev_node:$maj:$min:$sysfs_dir" >> /mnt/physical_storage_inventory 2>/dev/null || true
+    # Append record into temporary staging inventory (check write explicitly)
+    if ! echo "$dev_node:$maj:$min:$sysfs_dir" >> "$STAGING_INV"; then
+        fatal_halt "CRITICAL: Failed to write inventory record for $dev_node to $STAGING_INV!"
+    fi
 
     PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
     LOCKED_DEV_COUNT=$((LOCKED_DEV_COUNT + 1))
@@ -262,8 +345,57 @@ if [ "$PHYSICAL_DEV_COUNT" -eq 0 ]; then
     fatal_halt "CRITICAL SAFETY FAILURE: No physical storage block devices discovered in /sys/block!"
 fi
 
+# Post-Discovery Inventory Validation:
+# 1. Verify staging inventory is non-empty
+if [ ! -s "$STAGING_INV" ]; then
+    fatal_halt "CRITICAL: Staging inventory $STAGING_INV is empty after physical storage discovery!"
+fi
+
+# 2. Check for duplicate device entries
+DUP_DEVS=$(/system/bin/toybox cut -d: -f1 "$STAGING_INV" | /system/bin/toybox sort | /system/bin/toybox uniq -d || true)
+if [ -n "$DUP_DEVS" ]; then
+    fatal_halt "CRITICAL SAFETY FAILURE: Duplicate device entries in staging inventory: $DUP_DEVS!"
+fi
+
+# 3. Verify every recorded entry in staging file against sysfs and blockdev
+RECORD_COUNT=0
+while IFS=: read -r c_dev c_maj c_min c_sdir || [ -n "$c_dev" ]; do
+    [ -z "$c_dev" ] && continue
+    case "$c_dev" in \#*) continue ;; esac
+    [ -b "$c_dev" ] || fatal_halt "Integrity check failed: $c_dev is not a block device!"
+    [ -d "$c_sdir" ] || fatal_halt "Integrity check failed: sysfs dir $c_sdir does not exist!"
+    cur_mm=$(cat "$c_sdir/dev" 2>/dev/null | tr -d '[:space:]')
+    [ "$cur_mm" = "$c_maj:$c_min" ] || fatal_halt "Integrity check failed: major:minor mismatch for $c_dev ($cur_mm != $c_maj:$c_min)!"
+    cur_ro=$(/system/bin/toybox blockdev --getro "$c_dev" 2>/dev/null || echo "0")
+    [ "$cur_ro" = "1" ] || fatal_halt "Integrity check failed: $c_dev is not read-only (ro=$cur_ro)!"
+    RECORD_COUNT=$((RECORD_COUNT + 1))
+done < "$STAGING_INV"
+
+if [ "$RECORD_COUNT" -ne "$PHYSICAL_DEV_COUNT" ]; then
+    fatal_halt "Integrity check failed: Staging record count ($RECORD_COUNT) does not match discovered physical count ($PHYSICAL_DEV_COUNT)!"
+fi
+
+# 4. Atomic Publication to Authoritative Location (/mnt) and Fallback Copy (/tmp)
+/system/bin/toybox cp "$STAGING_INV" "/mnt/physical_storage_inventory.tmp.$$" || fatal_halt "Failed to stage inventory copy in /mnt!"
+/system/bin/toybox cp "$STAGING_INV" "/tmp/physical_storage_inventory.tmp.$$" || fatal_halt "Failed to stage inventory copy in /tmp!"
+
+/system/bin/toybox mv -f "/mnt/physical_storage_inventory.tmp.$$" "/mnt/physical_storage_inventory" || fatal_halt "Atomic publication to /mnt failed!"
+/system/bin/toybox mv -f "/tmp/physical_storage_inventory.tmp.$$" "/tmp/physical_storage_inventory" || fatal_halt "Atomic publication to /tmp failed!"
+rm -f "$STAGING_INV" 2>/dev/null || true
+
+# 5. Read back and confirm both published files exist and are byte-identical
+if [ ! -s "/mnt/physical_storage_inventory" ]; then
+    fatal_halt "CRITICAL: Published authoritative inventory /mnt/physical_storage_inventory cannot be read back or is 0 bytes!"
+fi
+if [ ! -s "/tmp/physical_storage_inventory" ]; then
+    fatal_halt "CRITICAL: Published backup inventory /tmp/physical_storage_inventory cannot be read back or is 0 bytes!"
+fi
+if ! /system/bin/toybox cmp -s "/mnt/physical_storage_inventory" "/tmp/physical_storage_inventory"; then
+    fatal_halt "CRITICAL: Published inventory copies in /mnt and /tmp do not match!"
+fi
+
 log_kmsg "[LOADER-PID1] Storage verified: $LOCKED_DEV_COUNT/$PHYSICAL_DEV_COUNT physical devices & partitions locked strictly read-only."
-log_kmsg "[LOADER-PID1] Physical storage inventory recorded at /mnt/physical_storage_inventory."
+log_kmsg "[LOADER-PID1] Authoritative physical storage inventory published atomically at /mnt/physical_storage_inventory."
 
 # 7. Configure USB Gadget for Root ADB
 log_kmsg "[LOADER-PID1] Configuring USB gadget for ADB..."

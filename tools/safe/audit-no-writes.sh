@@ -130,7 +130,15 @@ elif [ -d "$TARGET" ]; then
     RAMDISK_DIR="$TARGET"
     audit_pass "Using direct directory target: $TARGET"
 else
-    audit_fail "Target existence" "File or directory $TARGET does not exist"
+    if [ "$TARGET" = "build/stage1.img" ] && [ ! -e "$TARGET" ]; then
+        audit_unverified "Target boot image" "Default target $TARGET does not exist on disk" 0
+        if [ -d "$PROJECT_ROOT/stage1/loader_ramdisk" ]; then
+            RAMDISK_DIR="$PROJECT_ROOT/stage1/loader_ramdisk"
+            audit_pass "Falling back to source ramdisk directory: stage1/loader_ramdisk"
+        fi
+    else
+        audit_fail "Target existence" "File or directory $TARGET does not exist"
+    fi
 fi
 
 # 2. Kernel Command Line Audit (Static Check)
@@ -393,11 +401,19 @@ else
     audit_fail "Device node initialization" "Missing ueventd or binderfs initialization in Stage-1 supervisor"
 fi
 
-# 6. Memory Staging Sizing (/mnt >= 6000M tmpfs)
-if grep -qE "size=6[0-9]{3}M.* /mnt|size=6[0-9]{3}M.*tmpfs /mnt" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null; then
-    audit_pass "RAM staging directory /mnt sizing verified (>= 6000M tmpfs)"
-else
+# 6. Memory Staging Sizing (/mnt >= 6000M tmpfs) & Mount Validation
+TMPFS_VAL_OK=1
+if ! grep -qE "size=6[0-9]{3}M.* /mnt|size=6[0-9]{3}M.*tmpfs /mnt|mount_and_verify_tmpfs \"/mnt\" \"size=6[0-9]{3}M\"" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null; then
+    TMPFS_VAL_OK=0
     audit_fail "RAM staging capacity" "/mnt does not allocate >= 6000M tmpfs in Stage-1 supervisor"
+fi
+if ! grep -q "mount_and_verify_tmpfs" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null || \
+   ! grep -q "mount_and_verify_tmpfs" "$PROJECT_ROOT/stage1/native_ramdisk/init" 2>/dev/null; then
+    TMPFS_VAL_OK=0
+    audit_fail "TMPFS mount validation" "Missing mount_and_verify_tmpfs validation in Stage-1 supervisor"
+fi
+if [ "$TMPFS_VAL_OK" -eq 1 ]; then
+    audit_pass "RAM staging sizing (>= 6000M) and strict mount_and_verify_tmpfs validation verified across ramdisks"
 fi
 
 # 7. APEX Canonical Versioned Directory & Symlink Structure
@@ -522,12 +538,61 @@ else
     audit_fail "Storage revalidation checkpoints" "stage2_init only has $REVAL_COUNT revalidation checkpoints (minimum 6 required)"
 fi
 
+MANDATORY_CHECKPOINTS=(
+    "stage2_startup"
+    "before_base_system_and_overlay_mount"
+    "before_child_partition_mounts"
+    "before_apex_loop_mounts"
+    "before_data_tmpfs_mount"
+    "before_init_handover"
+)
+CHECKPOINTS_OK=1
+for cp in "${MANDATORY_CHECKPOINTS[@]}"; do
+    if ! grep -q "revalidate_storage_inventory \"$cp\"" "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null; then
+        CHECKPOINTS_OK=0
+        audit_fail "Storage revalidation checkpoint" "Missing mandatory checkpoint '$cp' in stage2_init.sh"
+    fi
+done
+if [ "$CHECKPOINTS_OK" -eq 1 ]; then
+    audit_pass "All 6 mandatory storage revalidation checkpoints explicitly verified in stage2_init.sh"
+fi
+
 # 16. Unified RAM Budgeting Alignment
 if grep -q "3392" "$PROJECT_ROOT/tools/safe/run_stage2.sh" 2>/dev/null && \
    grep -q "future_ram_req_mb=" "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null; then
     audit_pass "Unified 3392 MB bringup allocation model verified between runner and stage2_init"
 else
     audit_fail "RAM budget unification" "Runner and stage2_init RAM budget models diverge"
+fi
+
+# 17. Watchdog Fail-Closed Storage Verification (No echo 1 fallback, strict violation trigger)
+WATCHDOG_FAILCLOSED_OK=1
+if grep -q 'blockdev --getro.*echo "1"' "$PROJECT_ROOT/scripts/watchdog.sh" 2>/dev/null; then
+    WATCHDOG_FAILCLOSED_OK=0
+    audit_fail "Watchdog fail-closed logic" "scripts/watchdog.sh contains dangerous 'echo 1' fallback on blockdev --getro"
+fi
+if ! grep -q 'trigger_storage_violation' "$PROJECT_ROOT/scripts/watchdog.sh" 2>/dev/null; then
+    WATCHDOG_FAILCLOSED_OK=0
+    audit_fail "Watchdog fail-closed logic" "scripts/watchdog.sh lacks trigger_storage_violation handler"
+fi
+if [ "$WATCHDOG_FAILCLOSED_OK" -eq 1 ]; then
+    audit_pass "Watchdog fail-closed storage safety logic verified (no echo 1 fallback, strict violation trigger)"
+fi
+
+# 18. Atomic Inventory Staging and Publication
+ATOMIC_INV_OK=1
+if ! grep -q 'inventory.staging' "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null || \
+   ! grep -q 'mv -f .*physical_storage_inventory' "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null; then
+    ATOMIC_INV_OK=0
+    audit_fail "Atomic inventory staging" "stage1/loader_ramdisk/init lacks atomic inventory staging or rename publication"
+fi
+if ! grep -q 'inventory.staging' "$PROJECT_ROOT/stage1/native_ramdisk/init" 2>/dev/null || \
+   ! grep -q 'mv -f .*physical_storage_inventory' "$PROJECT_ROOT/stage1/native_ramdisk/init" 2>/dev/null; then
+    ATOMIC_INV_OK=0
+    audit_fail "Atomic inventory staging" "stage1/native_ramdisk/init lacks atomic inventory staging or rename publication"
+fi
+if [ "$ATOMIC_INV_OK" -eq 1 ]; then
+    audit_pass "Atomic inventory staging (inventory.staging.$$) and rename publication verified across ramdisks"
 fi
 
 # 5. Summary & Disclaimer

@@ -128,3 +128,56 @@ UFS LUNs: `sda`, `sdb`, `sdc`, `sdd`, `sde`, `sdf`
 | `fsg` / `fsc` | `/dev/block/sdf4` / `/dev/block/sdf5` | Golden baseband calibration |
 | `logdump` | `/dev/block/sde67` | **DANGER**: HakiOS default logdump target. MUST BE COMPILED OUT. |
 | `splash` | `/dev/block/sde62` | Continuous splash image |
+
+---
+
+## 8. Linux Block-Device Protection Model & Safety Architecture
+
+Because this port executes exclusively from volatile RAM via `fastboot boot`, physical storage integrity is safety-critical. Internal UFS 3.0 flash must never receive write requests.
+
+### 8.1 Linux Block-Layer Read-Only Scope (`BLKROSET`)
+- Setting `blockdev --setro` invokes the kernel ioctl `BLKROSET`, which sets the `bdev_read_only()` flag on the target block device descriptor.
+- **Critical Linux Limitation**: In the Linux block subsystem, setting `BLKROSET` on a parent whole-disk `gendisk` (e.g. `/dev/block/sda`) sets read-only on the whole-disk device node, but does **not** automatically propagate to existing child partition descriptors (`sda1`..`sda32`).
+- **Enforcement Rule**: Stage-1 supervisor and Stage-2 bringup enumerate all child partitions under each discovered physical disk and explicitly invoke `blockdev --setro` on every individual child partition node.
+- **Return Code Contract**: Fallback constructs such as `blockdev --getro ... || echo "1"` are strictly forbidden. `blockdev --getro` must return exit code 0 and stdout `1`. Any failure or `0` triggers immediate fail-closed halt and reboot.
+
+### 8.2 Defense-in-Depth Protection Layers
+1. **Layer 1: Kernel Command Line Invariants**:
+   - `panic=5`, `androidboot.selinux=permissive`, zero physical root (`root=/dev/block` absent), zero wipe/format directives, zero userdata targets.
+2. **Layer 2: Dynamic sysfs Discovery & Recursive Write-Locking**:
+   - Discovers all physical storage devices via `/sys/block/*` with `/device` backing or `sd*`/`mmcblk*` naming.
+   - Creates verified block device nodes (`mknod b <maj> <min>`) and sets `blockdev --setro`.
+3. **Layer 3: Atomic Storage Inventory Publishing**:
+   - Inventories are written to staging (`/tmp/inventory.staging.$$`), checked for syntax and duplicate records, verified against sysfs, atomically published via `mv` to `/mnt/physical_storage_inventory` and `/tmp/physical_storage_inventory`, and verified byte-identical (`cmp -s`).
+4. **Layer 4: Host Runner Storage Pre-Conditioning**:
+   - `tools/safe/run_stage2.sh` queries target inventory and sysfs, enforces 1-to-1 parity, rejects phantom/duplicate/unlocked devices before transferring images.
+5. **Layer 5: Multi-Checkpoint Stage-2 Revalidation**:
+   - Stage-2 revalidates the inventory across 6 critical bringup checkpoints (`stage2_startup`, `before_base_system_and_overlay_mount`, `before_child_partition_mounts`, `before_apex_loop_mounts`, `before_data_tmpfs_mount`, `before_init_handover`).
+   - Confirms byte-identity of `/mnt` and `/tmp` inventory copies, detects disappearing devices, locks newly appearing partitions read-only, and verifies 0 writable physical mounts in `/proc/mounts`.
+6. **Layer 6: Active Safety Watchdog**:
+   - Device-side `scripts/watchdog.sh` monitors storage inventory every 5 seconds. Missing, empty, or corrupted inventory triggers `STORAGE_VIOLATION` and emergency reboot.
+7. **Layer 7: 100% Volatile RAM Filesystems**:
+   - All mount targets (`/mnt`, `/tmp`, `/data`, `/sysroot`) are strictly RAM-backed `tmpfs` instances. Physical flash is never mounted.
+
+### 8.3 Protection Boundary Clarifications
+- **Block-Layer Read-Only (`blockdev --setro`)**: Rejects standard block I/O requests (`BIO_OP_WRITE`) at the kernel request queue.
+- **Filesystem Read-Only (`mount -o ro`)**: VFS-level enforcement preventing write syscalls.
+- **Absence of Write Commands**: Static verification that binaries and scripts contain no destructive invocations (`fastboot flash`, `mkfs.ext4`, etc.).
+- **Silicon-Level Write-Protect**: Hardware registers (e.g. UFS write-protect or eMMC hardware WP pins). While software blockdev locks do not configure silicon OTP registers, the combined 7-layer defense prevents any write execution paths.
+
+---
+
+## 9. Hardware Display Diagnostic Pipeline (10-State Visual Engine)
+
+To provide tactile and visual feedback on the physical device without relying on adb logs, Stage 1 and Stage 2 implement a 10-state visual/hardware diagnostic sequence:
+
+1. **State 1 (Hardware Tactile)**: Haptic vibrator pulse (300 ms) triggered via `/sys/class/leds/vibrator`.
+2. **State 2 (AMOLED Backlight)**: Samsung AMOLED backlight powered on (level 200) via `/sys/class/backlight/panel0-backlight/brightness` or `lcd-backlight`.
+3. **State 3 (Kernel DRM Node)**: Verified `/dev/dri/card0` and `/dev/dri/renderD128` from Qualcomm MDSS MDP driver (`0x0ae00000`).
+4. **State 4 (Adreno KGSL Node)**: Verified `/dev/kgsl-3d0` character device from Qualcomm Adreno 640 GPU driver.
+5. **State 5 (SurfaceFlinger 60Hz Mode)**: Display locked to 60.00 Hz to prevent panel connector detachment on aftermarket display panels.
+6. **State 6 (Memory Allocation Feedback)**: Staging capacity verified (>= 6500 MB total, >= 3392 MB available).
+7. **State 7 (Storage Protection Acknowledgment)**: Storage inventory locked and published to `/mnt/stage1_ack`.
+8. **State 8 (APEX Mounting Phase)**: Visual/log confirmation of canonical AOSP APEX payloads mounted on loop devices.
+9. **State 9 (SELinux Policy Handover)**: Compilation/hash verification of `plat_sepolicy.cil`, `vendor_sepolicy.cil`, `odm_sepolicy.cil`.
+10. **State 10 (Android Init Exec)**: PID 1 handover to `/system/bin/init selinux_setup`.

@@ -11,18 +11,18 @@
 | **H4** | C Reference Test | `src/binderfs_init.c` | Strict gcc compilation (-Wall -Wextra -Werror -pedantic) | Clean compilation | **PASS** |
 | **H5** | Embedded Consistency | Ramdisk binaries & scripts | `cmp -s` across `loader_ramdisk`, `native_ramdisk`, and source files | All embedded files byte-identical | **PASS** |
 | **H6** | APEX Metadata Tests | `tests/test_apex_info.py` | 26 unit tests: varint tags, wire types, duplicate fields, ZIP limits, XML schema validation, tag 11 provideSharedApexLibs, active mounts | 26/26 tests pass | **PASS** |
-| **H7** | Watchdog Unit Tests | `tests/test_watchdog.py` | 22 unit tests: numeric parsing, timeout arithmetic bounds, ADB disconnect, prop fail, config bounds | 22/22 tests pass | **PASS** |
-| **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 67 integration tests: RAM accounting, 4-field PARTITION_MAP contract, product mapping, APEX staging, fail-closed SELinux checks | 67/67 tests pass | **PASS** |
+| **H7** | Watchdog Unit Tests | `tests/test_watchdog.py` | 34 unit tests: numeric parsing, timeout bounds, fail-closed storage validation (missing, empty, malformed inventory), blockdev ro=1, duplicate detection, emergency reboot trigger | 34/34 tests pass | **PASS** |
+| **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 72 integration tests: RAM accounting, 4-field PARTITION_MAP contract, runner storage parity enforcement, APEX staging, fail-closed SELinux checks | 72/72 tests pass | **PASS** |
 | **H9** | Safe ADB & Fastboot Tests | `tests/test_safe_*.py` | 11 tests: command interception, metacharacter protection, flash bans (8 ADB + 3 Fastboot) | 11/11 tests pass | **PASS** |
-| **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 12 tests: multi-disk sysfs discovery, child partitions, major:minor parsing, fail-closed mknod, blockdev ro=1, newly appearing partitions, disappearing device abort, multi-checkpoint revalidation | 12/12 tests pass | **PASS** |
-| **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (31 checks per directory) | 31/31 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Loader Audit | `build/loader.img` | SHA-256: `ba58599d17de58d2668f4e871669664669852cab4e9484c2b6973994e333161b` (33 static & handover checks) | 33/33 Passed, 0 Failed | **PASS** |
-| **H13** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `edcd45f0d8594c38ef6f0982b2eee5345ecd247b20de92773231b61dfecbb33a` (33 static & handover checks) | 33/33 Passed, 0 Failed | **PASS** |
+| **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 20 tests: multi-disk sysfs discovery, duplicate detection, byte-identity verification, mount_and_verify_tmpfs, capacity exhaustion, 6 checkpoint tracking | 20/20 tests pass | **PASS** |
+| **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (34 checks per directory, 0 failures) | 34/34 Passed, 0 Failed | **PASS** |
+| **H12** | Packaged Loader Audit | `build/loader.img` | SHA-256: `6064d5fdd8d8e9e4e07649c662706a14178641877227425ea5fc3c766581d4d4` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
+| **H13** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `2030aa31278dd863f755dba20e68c33d2f8ffcd6141fddf44a347403bd359a57` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
 | **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`) | Strict SHA-256 and symbol match | **PASS** |
 
-Total automated Python test suite: **138 tests**, 100% pass rate.
+Total automated Python test suite: **163 tests**, 100% pass rate.
 Total Go test suite: **15 tests**, 100% pass rate.
-Total pre-boot auditor checks on packaged boot images: **33 checks**, 0 failures.
+Total pre-boot auditor checks on packaged boot images: **36 checks**, 0 failures.
 
 ## 2. Physical Device Bring-Up Stages (OnePlus 7T Hardware)
 

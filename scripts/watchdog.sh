@@ -164,14 +164,21 @@ STATE_FILE="${WATCHDOG_STATE_FILE:-/mnt/watchdog_state}"
 REBOOT_BIN="${REBOOT_BIN:-/system/bin/reboot}"
 GETPROP_BIN="${GETPROP_BIN:-/system/bin/getprop}"
 CHROOT_BIN="${CHROOT_BIN:-/system/bin/chroot}"
+WATCHDOG_INVENTORY_FILE="${WATCHDOG_INVENTORY_FILE:-}"
+SYS_BLOCK_DIR="${SYS_BLOCK_DIR:-/sys/block}"
+DEV_BLOCK_DIR="${DEV_BLOCK_DIR:-/dev/block}"
+WATCHDOG_TEST_MODE="${WATCHDOG_TEST_MODE:-0}"
 
 # Atomic state writer using temp file and rename
 set_state() {
     local new_state="$1"
     CURRENT_STATE="$new_state"
     local tmp_file="${STATE_FILE}.tmp.$$"
-    echo "$new_state" > "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$STATE_FILE" 2>/dev/null || true
+    if echo "$new_state" > "$tmp_file" 2>/dev/null; then
+        mv -f "$tmp_file" "$STATE_FILE" 2>/dev/null || echo "$new_state" > "$STATE_FILE" 2>/dev/null || true
+    else
+        echo "$new_state" > "$STATE_FILE" 2>/dev/null || true
+    fi
 }
 
 # Helper to validate and consume a heartbeat file
@@ -221,40 +228,291 @@ query_boot_completed() {
     return 1
 }
 
-# Helper to verify physical storage read-only state continuously
-check_storage_inventory_safety() {
-    local inv="/mnt/physical_storage_inventory"
-    [ -f "$inv" ] || inv="/tmp/physical_storage_inventory"
-    [ -f "$inv" ] || return 0
+# Critical Safety Emergency Trigger: Record violation, update state, trigger reboot, and exit 1
+trigger_storage_violation() {
+    local reason="$1"
+    log_msg "[WATCHDOG FATAL] Storage safety violation: $reason! Emergency rebooting!"
+    set_state "STORAGE_VIOLATION"
+    if [ -x "$REBOOT_BIN" ]; then
+        "$REBOOT_BIN" bootloader || true
+    elif command -v reboot >/dev/null 2>&1; then
+        reboot bootloader 2>/dev/null || true
+    else
+        /system/bin/reboot bootloader 2>/dev/null || true
+    fi
+    exit 1
+}
 
-    while IFS=: read -r dev maj min sdir || [ -n "$dev" ]; do
-        case "$dev" in ''|\#*) continue ;; esac
-        if [ -b "$dev" ]; then
-            local ro
-            ro=$(/system/bin/toybox blockdev --getro "$dev" 2>/dev/null || blockdev --getro "$dev" 2>/dev/null || echo "1")
-            if [ "$ro" != "1" ]; then
-                log_msg "[WATCHDOG FATAL] Storage safety violation: $dev became writable (ro=$ro)! Emergency rebooting!"
-                set_state "STORAGE_VIOLATION"
-                if [ -x "$REBOOT_BIN" ]; then
-                    "$REBOOT_BIN" bootloader
-                else
-                    /system/bin/reboot bootloader 2>/dev/null || true
-                fi
-                exit 1
+# Helper to verify physical storage read-only state continuously & fail-closed
+check_storage_inventory_safety() {
+    local inv=""
+    if [ -n "$WATCHDOG_INVENTORY_FILE" ] && [ -f "$WATCHDOG_INVENTORY_FILE" ]; then
+        inv="$WATCHDOG_INVENTORY_FILE"
+    elif [ -f "/mnt/physical_storage_inventory" ]; then
+        inv="/mnt/physical_storage_inventory"
+    elif [ -f "/tmp/physical_storage_inventory" ]; then
+        inv="/tmp/physical_storage_inventory"
+    else
+        trigger_storage_violation "Physical storage inventory missing (neither /mnt nor /tmp found)"
+    fi
+
+    if [ ! -r "$inv" ]; then
+        trigger_storage_violation "Physical storage inventory '$inv' is not readable"
+    fi
+
+    if [ ! -s "$inv" ]; then
+        trigger_storage_violation "Physical storage inventory '$inv' is empty (0 bytes)"
+    fi
+
+    local sys_block_root="${SYS_BLOCK_DIR:-/sys/block}"
+    local dev_block_root="${DEV_BLOCK_DIR:-/dev/block}"
+
+    local seen_devs=" "
+    local valid_entries=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Trim leading and trailing whitespace
+        local trimmed
+        trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        case "$trimmed" in ''|\#*) continue ;; esac
+
+        # Verify exactly 4 colon-separated fields (3 colons)
+        local num_colons
+        num_colons=$(echo "$trimmed" | tr -cd ':' | wc -c)
+        if [ "$num_colons" -ne 3 ]; then
+            trigger_storage_violation "Malformed inventory entry '$trimmed' in $inv (expected 4 colon-separated fields)"
+        fi
+
+        local dev maj min sdir
+        dev=$(echo "$trimmed" | cut -d: -f1 | tr -d '[:space:]')
+        maj=$(echo "$trimmed" | cut -d: -f2 | tr -d '[:space:]')
+        min=$(echo "$trimmed" | cut -d: -f3 | tr -d '[:space:]')
+        sdir=$(echo "$trimmed" | cut -d: -f4 | tr -d '[:space:]')
+
+        if [ -z "$dev" ] || [ -z "$maj" ] || [ -z "$min" ] || [ -z "$sdir" ]; then
+            trigger_storage_violation "Malformed inventory entry '$trimmed' in $inv (empty field detected)"
+        fi
+
+        case "$maj" in ''|*[!0-9]*) trigger_storage_violation "Non-numeric major number '$maj' in $inv" ;; esac
+        case "$min" in ''|*[!0-9]*) trigger_storage_violation "Non-numeric minor number '$min' in $inv" ;; esac
+
+        # Check duplicate entries in inventory
+        case "$seen_devs" in
+            *" $dev "*)
+                trigger_storage_violation "Duplicate device '$dev' found in inventory $inv" ;;
+        esac
+        seen_devs="$seen_devs$dev "
+
+        # Resolve paths for test isolation
+        local check_dev="$dev"
+        if [ -n "${DEV_BLOCK_DIR:-}" ]; then
+            local rel_dev="${dev#/dev/block/}"
+            if [ "$rel_dev" != "$dev" ]; then
+                check_dev="$dev_block_root/$rel_dev"
             fi
         fi
+
+        local check_sdir="$sdir"
+        if [ -n "${SYS_BLOCK_DIR:-}" ]; then
+            local rel_sdir="${sdir#/sys/block/}"
+            if [ "$rel_sdir" != "$sdir" ]; then
+                check_sdir="$sys_block_root/$rel_sdir"
+            fi
+        fi
+
+        # 1. Device node existence
+        if [ ! -e "$check_dev" ]; then
+            trigger_storage_violation "Block device node '$dev' does not exist"
+        fi
+
+        # 2. Device node type: must be block special
+        if [ "$WATCHDOG_TEST_MODE" = "1" ]; then
+            if [ ! -b "$check_dev" ] && [ ! -f "$check_dev" ]; then
+                trigger_storage_violation "Device node '$dev' is neither block special nor test mock file"
+            fi
+        else
+            if [ ! -b "$check_dev" ]; then
+                trigger_storage_violation "Device node '$dev' is NOT a block device"
+            fi
+        fi
+
+        # 3. Sysfs directory and dev file existence (disappearing detection)
+        if [ ! -d "$check_sdir" ] || [ ! -f "$check_sdir/dev" ]; then
+            trigger_storage_violation "Sysfs directory or dev file for '$dev' ($sdir) disappeared or does not exist"
+        fi
+
+        # 4. Major:minor match against sysfs
+        local sys_mm
+        sys_mm=$(cat "$check_sdir/dev" 2>/dev/null | tr -d '[:space:]')
+        if [ "$sys_mm" != "$maj:$min" ]; then
+            trigger_storage_violation "Major:minor mismatch for '$dev' ($sys_mm != $maj:$min)"
+        fi
+
+        # 5. Query blockdev --getro (MUST succeed with exit 0 and output == 1; NO fallback to 1)
+        local ro_out=""
+        local ro_status=0
+        if [ -x /system/bin/toybox ]; then
+            ro_out=$(/system/bin/toybox blockdev --getro "$check_dev" 2>&1) || ro_status=$?
+        elif command -v blockdev >/dev/null 2>&1; then
+            ro_out=$(blockdev --getro "$check_dev" 2>&1) || ro_status=$?
+        else
+            trigger_storage_violation "No blockdev binary available to query read-only state"
+        fi
+
+        if [ "$ro_status" -ne 0 ]; then
+            trigger_storage_violation "blockdev --getro failed on '$dev' with exit code $ro_status ($ro_out)"
+        fi
+
+        local clean_ro
+        clean_ro=$(echo "$ro_out" | tr -d '[:space:]')
+        if [ "$clean_ro" != "1" ]; then
+            trigger_storage_violation "Block device '$dev' is NOT read-only (ro=$clean_ro, expected 1)"
+        fi
+
+        valid_entries=$((valid_entries + 1))
     done < "$inv"
 
-    if [ -f /proc/mounts ]; then
-        if grep -E "^/dev/block/(sd|mmcblk)" /proc/mounts 2>/dev/null | grep -E "([ ,(]rw[ ,)]|,rw$)" >/dev/null 2>&1; then
-            log_msg "[WATCHDOG FATAL] Storage safety violation: detected writable physical mount in /proc/mounts! Emergency rebooting!"
-            set_state "STORAGE_VIOLATION"
-            if [ -x "$REBOOT_BIN" ]; then
-                "$REBOOT_BIN" bootloader
-            else
-                /system/bin/reboot bootloader 2>/dev/null || true
+    if [ "$valid_entries" -eq 0 ]; then
+        trigger_storage_violation "Physical storage inventory '$inv' contains zero valid device records"
+    fi
+
+    # 6. Completeness: independently scan sysfs to detect newly appearing devices
+    if [ -d "$sys_block_root" ]; then
+        for bdir in "$sys_block_root"/*; do
+            [ -d "$bdir" ] || continue
+            local bname
+            bname=$(basename "$bdir")
+            case "$bname" in loop*|ram*|zram*|dm-*) continue ;; esac
+
+            if [ -e "$bdir/device" ] || case "$bname" in sd*|mmcblk*) true ;; *) false ;; esac; then
+                local disk_dev="/dev/block/$bname"
+                case "$seen_devs" in
+                    *" $disk_dev "*) ;;
+                    *)
+                        log_msg "[WATCHDOG WARNING] Detected newly appearing physical disk: $disk_dev"
+                        if [ ! -f "$bdir/dev" ]; then
+                            trigger_storage_violation "Newly appearing physical disk '$disk_dev' lacks sysfs dev file"
+                        fi
+                        local d_mm
+                        d_mm=$(cat "$bdir/dev" 2>/dev/null | tr -d '[:space:]')
+                        case "$d_mm" in ''|*[!0-9:]*|*:*[:]*|*:|:*)
+                            trigger_storage_violation "Newly appearing disk '$disk_dev' has malformed dev file '$d_mm'" ;;
+                        esac
+                        local d_maj="${d_mm%%:*}"
+                        local d_min="${d_mm##*:}"
+                        local check_dnode="$disk_dev"
+                        [ -n "${DEV_BLOCK_DIR:-}" ] && check_dnode="$dev_block_root/$bname"
+
+                        if [ ! -e "$check_dnode" ]; then
+                            if [ -x /system/bin/toybox ]; then
+                                /system/bin/toybox mknod "$check_dnode" b "$d_maj" "$d_min" 2>/dev/null || true
+                            elif command -v mknod >/dev/null 2>&1; then
+                                mknod "$check_dnode" b "$d_maj" "$d_min" 2>/dev/null || true
+                            fi
+                        fi
+                        if [ "$WATCHDOG_TEST_MODE" != "1" ] && [ ! -b "$check_dnode" ]; then
+                            trigger_storage_violation "Failed to create block node for newly appearing disk '$disk_dev'"
+                        fi
+
+                        # Lock read-only
+                        local setro_status=0
+                        if [ -x /system/bin/toybox ]; then
+                            /system/bin/toybox blockdev --setro "$check_dnode" >/dev/null 2>&1 || setro_status=$?
+                        elif command -v blockdev >/dev/null 2>&1; then
+                            blockdev --setro "$check_dnode" >/dev/null 2>&1 || setro_status=$?
+                        fi
+                        if [ "$setro_status" -ne 0 ]; then
+                            trigger_storage_violation "Failed to execute blockdev --setro on newly appearing disk '$disk_dev'"
+                        fi
+
+                        local d_ro=""
+                        local d_ro_st=0
+                        if [ -x /system/bin/toybox ]; then
+                            d_ro=$(/system/bin/toybox blockdev --getro "$check_dnode" 2>&1) || d_ro_st=$?
+                        elif command -v blockdev >/dev/null 2>&1; then
+                            d_ro=$(blockdev --getro "$check_dnode" 2>&1) || d_ro_st=$?
+                        fi
+                        if [ "$d_ro_st" -ne 0 ] || [ "$(echo "$d_ro" | tr -d '[:space:]')" != "1" ]; then
+                            trigger_storage_violation "Newly appearing disk '$disk_dev' could not be locked read-only (ro=$d_ro)"
+                        fi
+
+                        echo "$disk_dev:$d_maj:$d_min:$bdir" >> "$inv" || trigger_storage_violation "Failed to append newly appearing disk to inventory $inv"
+                        seen_devs="$seen_devs$disk_dev "
+                        log_msg "[WATCHDOG] Locked newly appearing disk read-only: $disk_dev (ro=1) and appended to inventory."
+                        ;;
+                esac
+
+                # Check child partitions of this disk
+                for pdir in "$bdir"/"$bname"*; do
+                    [ -d "$pdir" ] || continue
+                    local pname
+                    pname=$(basename "$pdir")
+                    local part_dev="/dev/block/$pname"
+                    case "$seen_devs" in
+                        *" $part_dev "*) ;;
+                        *)
+                            log_msg "[WATCHDOG WARNING] Detected newly appearing physical partition: $part_dev"
+                            if [ ! -f "$pdir/dev" ]; then
+                                trigger_storage_violation "Newly appearing physical partition '$part_dev' lacks sysfs dev file"
+                            fi
+                            local p_mm
+                            p_mm=$(cat "$pdir/dev" 2>/dev/null | tr -d '[:space:]')
+                            case "$p_mm" in ''|*[!0-9:]*|*:*[:]*|*:|:*)
+                                trigger_storage_violation "Newly appearing partition '$part_dev' has malformed dev file '$p_mm'" ;;
+                            esac
+                            local p_maj="${p_mm%%:*}"
+                            local p_min="${p_mm##*:}"
+                            local check_pnode="$part_dev"
+                            [ -n "${DEV_BLOCK_DIR:-}" ] && check_pnode="$dev_block_root/$pname"
+
+                            if [ ! -e "$check_pnode" ]; then
+                                if [ -x /system/bin/toybox ]; then
+                                    /system/bin/toybox mknod "$check_pnode" b "$p_maj" "$pmin" 2>/dev/null || true
+                                elif command -v mknod >/dev/null 2>&1; then
+                                    mknod "$check_pnode" b "$p_maj" "$pmin" 2>/dev/null || true
+                                fi
+                            fi
+                            if [ "$WATCHDOG_TEST_MODE" != "1" ] && [ ! -b "$check_pnode" ]; then
+                                trigger_storage_violation "Failed to create block node for newly appearing partition '$part_dev'"
+                            fi
+
+                            local p_setro_st=0
+                            if [ -x /system/bin/toybox ]; then
+                                /system/bin/toybox blockdev --setro "$check_pnode" >/dev/null 2>&1 || p_setro_st=$?
+                            elif command -v blockdev >/dev/null 2>&1; then
+                                blockdev --setro "$check_pnode" >/dev/null 2>&1 || p_setro_st=$?
+                            fi
+                            if [ "$p_setro_st" -ne 0 ]; then
+                                trigger_storage_violation "Failed to execute blockdev --setro on newly appearing partition '$part_dev'"
+                            fi
+
+                            local p_ro=""
+                            local p_ro_st=0
+                            if [ -x /system/bin/toybox ]; then
+                                p_ro=$(/system/bin/toybox blockdev --getro "$check_pnode" 2>&1) || p_ro_st=$?
+                            elif command -v blockdev >/dev/null 2>&1; then
+                                p_ro=$(blockdev --getro "$check_pnode" 2>&1) || p_ro_st=$?
+                            fi
+                            if [ "$p_ro_st" -ne 0 ] || [ "$(echo "$p_ro" | tr -d '[:space:]')" != "1" ]; then
+                                trigger_storage_violation "Newly appearing partition '$part_dev' could not be locked read-only (ro=$p_ro)"
+                            fi
+
+                            echo "$part_dev:$p_maj:$p_min:$pdir" >> "$inv" || trigger_storage_violation "Failed to append newly appearing partition to inventory $inv"
+                            seen_devs="$seen_devs$part_dev "
+                            log_msg "[WATCHDOG] Locked newly appearing partition read-only: $part_dev (ro=1) and appended to inventory."
+                            ;;
+                    esac
+                done
             fi
-            exit 1
+        done
+    fi
+
+    # 7. Check live mounts for writable physical storage
+    local mounts_f="/proc/mounts"
+    [ -n "${PROC_MOUNTS_FILE:-}" ] && mounts_f="$PROC_MOUNTS_FILE"
+    if [ -f "$mounts_f" ]; then
+        if grep -E "^/dev/block/(sd|mmcblk)" "$mounts_f" 2>/dev/null | grep -E "([ ,(]rw[ ,)]|,rw$)" >/dev/null 2>&1; then
+            trigger_storage_violation "Detected writable physical mount in $mounts_f"
         fi
     fi
 }

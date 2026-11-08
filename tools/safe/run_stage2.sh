@@ -81,24 +81,135 @@ for dev_path in "${DISCOVERED_PHYSICAL_DEVS[@]}"; do
     echo "  Verified: $dev_path is read-only (ro=1)"
 done
 
-# Verify Stage-1 Physical Storage Inventory on Target if Available
-TARGET_INV=$("$SAFE_ADB" shell "cat /mnt/physical_storage_inventory" 2>/dev/null || true)
-if [ -z "$TARGET_INV" ] || [[ "$TARGET_INV" =~ "No such file" ]]; then
+# Require & Strictly Verify Target Physical Storage Inventory
+echo "Requiring and strictly validating Stage-1 physical storage inventory..."
+TARGET_INV=""
+INV_FILE_FOUND=0
+if "$SAFE_ADB" shell "test -f /mnt/physical_storage_inventory" >/dev/null 2>&1; then
+    INV_FILE_FOUND=1
+    TARGET_INV=$("$SAFE_ADB" shell "cat /mnt/physical_storage_inventory" 2>/dev/null || true)
+elif "$SAFE_ADB" shell "test -f /tmp/physical_storage_inventory" >/dev/null 2>&1; then
+    INV_FILE_FOUND=1
     TARGET_INV=$("$SAFE_ADB" shell "cat /tmp/physical_storage_inventory" 2>/dev/null || true)
 fi
-if [ -n "$TARGET_INV" ] && ! [[ "$TARGET_INV" =~ "No such file" ]]; then
-    echo "Verifying target physical storage inventory records..."
-    while IFS=: read -r inv_dev inv_maj inv_min inv_sdir || [ -n "$inv_dev" ]; do
-        [ -z "$inv_dev" ] && continue
-        [[ "$inv_dev" =~ ^# ]] && continue
-        inv_ro=$("$SAFE_ADB" shell "blockdev --getro $inv_dev" 2>/dev/null | tr -d '\r\n[:space:]')
-        if [ "$inv_ro" != "1" ]; then
-            echo "CRITICAL SAFETY VIOLATION: Inventory device $inv_dev is NOT read-only (ro=$inv_ro)!" >&2
-            exit 1
-        fi
-    done <<< "$TARGET_INV"
-    echo "Verified: All devices in target physical storage inventory are confirmed read-only (ro=1)."
+
+if [ "$INV_FILE_FOUND" -eq 0 ]; then
+    echo "CRITICAL SAFETY ERROR: Mandatory target physical storage inventory is missing or unreadable on target!" >&2
+    echo "Cannot confirm hardware read-only safety locks from Stage-1 supervisor. Aborting before image staging." >&2
+    exit 1
 fi
+
+TARGET_INV=$(printf "%s" "$TARGET_INV" | tr -d '\r')
+
+if [ -z "$(printf "%s" "$TARGET_INV" | tr -d '[:space:]')" ]; then
+    echo "CRITICAL SAFETY ERROR: Target physical storage inventory is empty (0 bytes)!" >&2
+    exit 1
+fi
+
+INVENTORY_DEVS=()
+SEEN_INV_DEVS=" "
+INV_RECORD_COUNT=0
+
+while IFS= read -r line || [ -n "$line" ]; do
+    trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case "$trimmed" in ''|\#*) continue ;; esac
+
+    num_colons=$(echo "$trimmed" | tr -cd ':' | wc -c)
+    if [ "$num_colons" -ne 3 ]; then
+        echo "CRITICAL SAFETY ERROR: Malformed inventory record on target: '$trimmed' (expected 4 colon-separated fields)!" >&2
+        exit 1
+    fi
+
+    inv_dev=$(echo "$trimmed" | cut -d: -f1 | tr -d '[:space:]')
+    inv_maj=$(echo "$trimmed" | cut -d: -f2 | tr -d '[:space:]')
+    inv_min=$(echo "$trimmed" | cut -d: -f3 | tr -d '[:space:]')
+    inv_sdir=$(echo "$trimmed" | cut -d: -f4 | tr -d '[:space:]')
+
+    if [ -z "$inv_dev" ] || [ -z "$inv_maj" ] || [ -z "$inv_min" ] || [ -z "$inv_sdir" ]; then
+        echo "CRITICAL SAFETY ERROR: Empty field in target inventory record: '$trimmed'!" >&2
+        exit 1
+    fi
+
+    if [[ ! "$inv_dev" =~ ^/dev/block/ ]]; then
+        echo "CRITICAL SAFETY ERROR: Invalid device path in target inventory: '$inv_dev' (must start with /dev/block/)!" >&2
+        exit 1
+    fi
+
+    if ! [[ "$inv_maj" =~ ^[0-9]+$ ]] || ! [[ "$inv_min" =~ ^[0-9]+$ ]]; then
+        echo "CRITICAL SAFETY ERROR: Non-numeric major/minor '$inv_maj:$inv_min' in target inventory record '$trimmed'!" >&2
+        exit 1
+    fi
+
+    if [[ ! "$inv_sdir" =~ ^/sys/block/ ]]; then
+        echo "CRITICAL SAFETY ERROR: Invalid sysfs path in target inventory: '$inv_sdir' (must start with /sys/block/)!" >&2
+        exit 1
+    fi
+
+    case "$SEEN_INV_DEVS" in
+        *" $inv_dev "*)
+            echo "CRITICAL SAFETY ERROR: Duplicate device '$inv_dev' in target inventory!" >&2
+            exit 1
+            ;;
+    esac
+    SEEN_INV_DEVS="$SEEN_INV_DEVS$inv_dev "
+    INVENTORY_DEVS+=("$inv_dev")
+    INV_RECORD_COUNT=$((INV_RECORD_COUNT + 1))
+
+    if ! "$SAFE_ADB" shell "test -f $inv_sdir/dev" >/dev/null 2>&1; then
+        echo "CRITICAL SAFETY ERROR: Target sysfs dev node $inv_sdir/dev does not exist!" >&2
+        exit 1
+    fi
+
+    target_mm=$("$SAFE_ADB" shell "cat $inv_sdir/dev" 2>/dev/null | tr -d '\r\n[:space:]')
+    if [ "$target_mm" != "$inv_maj:$inv_min" ]; then
+        echo "CRITICAL SAFETY ERROR: Major:minor mismatch on target for $inv_dev ($target_mm != $inv_maj:$inv_min)!" >&2
+        exit 1
+    fi
+
+    if ! "$SAFE_ADB" shell "test -b $inv_dev" >/dev/null 2>&1; then
+        echo "CRITICAL SAFETY ERROR: Target node $inv_dev does not exist or is not a block device!" >&2
+        exit 1
+    fi
+
+    inv_ro=$("$SAFE_ADB" shell "blockdev --getro $inv_dev" 2>/dev/null | tr -d '\r\n[:space:]')
+    if [ "$inv_ro" != "1" ]; then
+        echo "CRITICAL SAFETY VIOLATION: Inventory device $inv_dev is NOT read-only (ro=$inv_ro)!" >&2
+        exit 1
+    fi
+    echo "  Verified target inventory node: $inv_dev ($inv_maj:$inv_min, ro=1)"
+done <<< "$TARGET_INV"
+
+if [ "$INV_RECORD_COUNT" -eq 0 ]; then
+    echo "CRITICAL SAFETY ERROR: Target inventory contains zero valid records!" >&2
+    exit 1
+fi
+
+for disc_dev in "${DISCOVERED_PHYSICAL_DEVS[@]}"; do
+    case "$SEEN_INV_DEVS" in
+        *" $disc_dev "*) ;;
+        *)
+            echo "CRITICAL SAFETY VIOLATION: Discovered physical device $disc_dev is NOT in target inventory!" >&2
+            echo "Device is unprotected. Aborting to protect physical storage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+for inv_item in "${INVENTORY_DEVS[@]}"; do
+    FOUND_IN_DISC=0
+    for disc_item in "${DISCOVERED_PHYSICAL_DEVS[@]}"; do
+        if [ "$inv_item" = "$disc_item" ]; then
+            FOUND_IN_DISC=1
+            break
+        fi
+    done
+    if [ "$FOUND_IN_DISC" -eq 0 ]; then
+        echo "CRITICAL SAFETY VIOLATION: Target inventory declares device $inv_item which was not discovered in sysfs!" >&2
+        exit 1
+    fi
+done
+
+echo "Verified: Complete 1-to-1 parity between discovered physical devices (${#DISCOVERED_PHYSICAL_DEVS[@]}) and verified inventory ($INV_RECORD_COUNT)."
 
 get_device_mounts() {
     local m

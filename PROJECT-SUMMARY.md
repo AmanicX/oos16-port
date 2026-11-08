@@ -1,6 +1,6 @@
 # OxygenOS 16 Port to OnePlus 7T (HD1901) — Project Summary
 
-> **Document Version**: 2.7.0 (Fail-Closed Physical Storage Inventory & 6-Checkpoint Revalidation, Kernel Asset Provenance, Unified 3392 MB Bringup Budget, 10-State Display Diagnostics, Authentic APEX Schema Validation, 153 Total Automated Tests: 138 Python + 15 Go)  
+> **Document Version**: 2.8.0 (Fail-Closed Storage Audit & Protection, Atomic Inventory Staging, Watchdog Fail-Closed Architecture, 6-Checkpoint Revalidation, 178 Total Automated Tests: 163 Python + 15 Go, 36/36 Static Safety Auditor Checks)  
 > **Target Device**: OnePlus 7T (`HD1901` / `hotdogb`, Snapdragon 855+ / SM8150-AC, 8 GB RAM)  
 > **Source ROM**: OxygenOS 16 / Android 16 (`BP2A.250605.015`, SDK 36 / `Baklava`, OnePlus 9 `lemonade` / `LE2113_16.0.10.500(EX01)` EEA donor, `ota_full-LE2113_16.0.10.500.zip`, SHA-256 `5ea5f120a2bce5eb98bd2a5d1aca872f5888903825861142bd0900772b8d0844`)  
 > **Base OS on Device**: crDroid (Android 16 / LineageOS 23.2 base, FBE Encrypted)  
@@ -282,8 +282,9 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
   16. **10-State Hardware Display & Graphics Diagnostics**:
      - Implemented structured 10-state hardware diagnostic tracking (DRM `card0`, panel detected, panel enabled, DRM connector `DSI-1`, Adreno 640 GPU, EGL ready, Composer HAL, SurfaceFlinger, frames presented post-handover, touchscreen input) with clear separation between pre-handover hardware probe and post-handover userspace rendering milestones.
   17. **CI, Boot Images & Documentation Integrity**:
-     - Rebuilt local boot images: `build/loader.img` (SHA-256: `ba58599d17de58d2668f4e871669664669852cab4e9484c2b6973994e333161b`) and `build/stage1.img` (SHA-256: `edcd45f0d8594c38ef6f0982b2eee5345ecd247b20de92773231b61dfecbb33a`), both passing 33/33 pre-boot safety checks.
+     - Rebuilt local boot images: `build/loader.img` (SHA-256: `6064d5fdd8d8e9e4e07649c662706a14178641877227425ea5fc3c766581d4d4`) and `build/stage1.img` (SHA-256: `2030aa31278dd863f755dba20e68c33d2f8ffcd6141fddf44a347403bd359a57`), both passing 36/36 pre-boot safety checks.
      - Static cross-compiled ARM64 binary `src/binderfs_init_arm64` installed byte-identically across ramdisks.
+     - Total automated test suite expanded to 178 passing tests (163 Python + 15 Go).
 
 ---
 
@@ -292,8 +293,8 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (33/33)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `ba58599d...`, 33/33), `build/stage1.img` (SHA-256: `edcd45f0...`, 33/33), and ramdisks (31/31). In CI without device kernel binaries, ramdisks pass 31/31 and packaged image audits are reported as skipped. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (153/153)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & lifecycle (22), Stage-2 runner integration mocks (67), Storage safety & inventory revalidation (12), and Go BinderFS unit tests (15). Total Python unittests: 138/138; Go unit tests: 15/15. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `6064d5fd...`, 36/36), `build/stage1.img` (SHA-256: `2030aa31...`, 36/36), and ramdisks (34/34 + 1 optional). In CI without device kernel binaries, ramdisks pass and packaged image audits are reported as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (178/178)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & fail-closed lifecycle (34), Stage-2 runner integration mocks (72), Storage safety & inventory revalidation (20), and Go BinderFS unit tests (15). Total Python unittests: 163/163; Go unit tests: 15/15. |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
@@ -304,7 +305,7 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 
 The repository is in a verified, build-clean, and audited state:
 * All host-side safety wrappers (`tools/safe/adb`, `tools/safe/fastboot`, `tools/safe/audit-no-writes.sh`) are active and verified.
-* All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (33/33).
+* All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (36/36).
 * All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS` and `PARTITION_MAP`.
-* All 153 automated unit and integration tests pass without error (100% OK: 138 Python + 15 Go).
+* All 178 automated unit and integration tests pass without error (100% OK: 163 Python + 15 Go).
 * **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`).

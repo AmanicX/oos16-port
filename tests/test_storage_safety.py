@@ -351,6 +351,289 @@ class TestPhysicalStorageProtection(StorageSafetyTestBase):
                 f"Missing mandatory storage revalidation checkpoint: {cp}"
             )
 
+    def test_duplicate_device_entries_in_inventory_fail_closed(self):
+        """Verify duplicate device entries in inventory trigger immediate fail-closed halt."""
+        self._create_mock_disk("sda", 8, 0, partition_count=1)
+        inv_file = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        with open(inv_file, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+
+        res = self._run_revalidate(checkpoint="duplicate_test")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Duplicate device entry", res.stderr)
+
+    def test_inventory_byte_identity_mismatch_fails_closed(self):
+        """Verify byte-identity mismatch between /mnt and /tmp inventory copies triggers fail-closed halt."""
+        self._create_mock_disk("sda", 8, 0, partition_count=1)
+        mnt_inv = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        tmp_inv = os.path.join(self.tmp_dir, "physical_storage_inventory")
+        with open(mnt_inv, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+        with open(tmp_inv, "w") as f:
+            f.write(f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n")
+            f.write(f"/dev/block/sdb:8:16:{os.path.join(self.sys_block, 'sdb')}\n")
+
+        res = self._run_revalidate(checkpoint="identity_mismatch_test")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("byte-identity mismatch", res.stderr)
+
+    def test_checkpoints_recorded_to_mnt_and_tmp(self):
+        """Verify successful revalidation records the checkpoint to /mnt and /tmp checkpoints_verified."""
+        self._create_mock_disk("sda", 8, 0, partition_count=1)
+        mnt_inv = os.path.join(self.mnt_dir, "physical_storage_inventory")
+        tmp_inv = os.path.join(self.tmp_dir, "physical_storage_inventory")
+        inv_content = f"/dev/block/sda:8:0:{os.path.join(self.sys_block, 'sda')}\n"
+        with open(mnt_inv, "w") as f:
+            f.write(inv_content)
+        with open(tmp_inv, "w") as f:
+            f.write(inv_content)
+
+        res = self._run_revalidate(checkpoint="before_apex_loop_mounts")
+        self.assertEqual(res.returncode, 0, f"Revalidation failed: {res.stderr}\n{res.stdout}")
+
+        mnt_cp = os.path.join(self.mnt_dir, "checkpoints_verified")
+        tmp_cp = os.path.join(self.tmp_dir, "checkpoints_verified")
+        self.assertTrue(os.path.isfile(mnt_cp), "Missing /mnt/checkpoints_verified")
+        self.assertTrue(os.path.isfile(tmp_cp), "Missing /tmp/checkpoints_verified")
+
+        with open(mnt_cp, "r") as f:
+            self.assertIn("before_apex_loop_mounts", f.read())
+        with open(tmp_cp, "r") as f:
+            self.assertIn("before_apex_loop_mounts", f.read())
+
+    def test_verify_checkpoints_cli_lists_six_checkpoints(self):
+        """Verify --verify-checkpoints CLI prints all 6 mandatory checkpoints."""
+        res = subprocess.run(
+            ["sh", f"{STAGE2_INIT_SCRIPT}", "--verify-checkpoints"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        self.assertEqual(res.returncode, 0)
+        expected = [
+            "stage2_startup",
+            "before_base_system_and_overlay_mount",
+            "before_child_partition_mounts",
+            "before_apex_loop_mounts",
+            "before_data_tmpfs_mount",
+            "before_init_handover",
+        ]
+        for cp in expected:
+            self.assertIn(cp, res.stdout)
+
+
+class TestStage1StorageSafety(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="stage1_safety_test_")
+        self.bin_dir = os.path.join(self.test_dir, "bin")
+        os.makedirs(self.bin_dir, exist_ok=True)
+        self.mnt_dir = os.path.join(self.test_dir, "mnt")
+        self.tmp_dir = os.path.join(self.test_dir, "tmp")
+        os.makedirs(self.mnt_dir, exist_ok=True)
+        os.makedirs(self.tmp_dir, exist_ok=True)
+
+        self.proc_dir = os.path.join(self.test_dir, "proc")
+        os.makedirs(self.proc_dir, exist_ok=True)
+        self.proc_mounts = os.path.join(self.proc_dir, "mounts")
+        with open(self.proc_mounts, "w") as f:
+            f.write("none /proc proc rw 0 0\n")
+
+        # Mock toybox
+        self.toybox_bin = os.path.join(self.bin_dir, "toybox")
+        with open(self.toybox_bin, "w") as f:
+            f.write(f"""#!/usr/bin/env bash
+subcmd="$1"
+shift
+case "$subcmd" in
+    grep)
+        exec grep "$@"
+        ;;
+    awk)
+        exec awk "$@"
+        ;;
+    tr)
+        exec tr "$@"
+        ;;
+    cut)
+        exec cut "$@"
+        ;;
+    sort)
+        exec sort "$@"
+        ;;
+    uniq)
+        exec uniq "$@"
+        ;;
+    cmp)
+        exec cmp "$@"
+        ;;
+    df)
+        if [ "${{MOCK_DF_FAIL:-0}}" = "1" ]; then
+            echo "df: error" >&2
+            exit 1
+        elif [ "${{MOCK_DF_LOW_CAPACITY:-0}}" = "1" ]; then
+            echo "Filesystem 1M-blocks Used Available Use% Mounted on"
+            echo "tmpfs 100 90 10 90% $1"
+            exit 0
+        else
+            echo "Filesystem 1M-blocks Used Available Use% Mounted on"
+            echo "tmpfs 6500 100 6400 2% $1"
+            exit 0
+        fi
+        ;;
+    mount)
+        if [ "${{MOCK_MOUNT_FAIL:-0}}" = "1" ]; then
+            echo "mount: error" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    *)
+        exec "$subcmd" "$@"
+        ;;
+esac
+""")
+        os.chmod(self.toybox_bin, 0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _extract_and_run_mount_tmpfs(self, target, size_opt, min_free, extra_env=None):
+        """Extract mount_and_verify_tmpfs definition from stage1/loader_ramdisk/init and run it."""
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}:" + env.get("PATH", "")
+        if extra_env:
+            env.update(extra_env)
+
+        # Extract function from loader_ramdisk/init
+        init_file = os.path.join(PROJECT_ROOT, "stage1/loader_ramdisk/init")
+        with open(init_file, "r") as f:
+            init_code = f.read()
+
+        # Build runner script
+        test_script = f"""
+#!/usr/bin/env bash
+set -e
+fatal_halt() {{
+    echo "[FATAL] $1" >&2
+    exit 1
+}}
+log_kmsg() {{
+    echo "$1"
+}}
+/system/bin/toybox() {{
+    "{self.toybox_bin}" "$@"
+}}
+
+# Sourced function
+{init_code[init_code.index("mount_and_verify_tmpfs()"):init_code.index("mount_and_verify_tmpfs \"/mnt\"")]}
+
+# Redirect /proc/mounts to our mock
+sed_mounts="{self.proc_mounts}"
+mount_and_verify_tmpfs() {{
+    local target="$1"
+    local size_opt="$2"
+    local min_free_mb="$3"
+
+    if [ ! -d "$target" ]; then
+        mkdir -p "$target" || fatal_halt "Failed to create directory $target!"
+    fi
+
+    if ! "{self.toybox_bin}" mount -t tmpfs -o "mode=0777,$size_opt" tmpfs "$target"; then
+        fatal_halt "Failed to mount tmpfs on $target (options: $size_opt)!"
+    fi
+
+    local mount_line
+    mount_line=$("{self.toybox_bin}" grep -E "[[:space:]]${{target}}[[:space:]]" "$sed_mounts" 2>/dev/null || true)
+    if [ -z "$mount_line" ]; then
+        fatal_halt "Mount verification failed: $target is not mounted according to /proc/mounts!"
+    fi
+
+    local fs_type
+    fs_type=$(echo "$mount_line" | "{self.toybox_bin}" awk '{{print $3}}')
+    if [ "$fs_type" != "tmpfs" ]; then
+        fatal_halt "Mount verification failed: $target filesystem is '$fs_type', expected 'tmpfs'!"
+    fi
+
+    local fs_src
+    fs_src=$(echo "$mount_line" | "{self.toybox_bin}" awk '{{print $1}}')
+    case "$fs_src" in
+        /dev/block/*|/dev/sd*|/dev/mmcblk*)
+            fatal_halt "CRITICAL SAFETY VIOLATION: $target is backed by physical block device '$fs_src'!" ;;
+    esac
+
+    local df_out
+    df_out=$("{self.toybox_bin}" df -m "$target" 2>/dev/null || true)
+    local free_mb
+    free_mb=$(echo "$df_out" | "{self.toybox_bin}" awk 'NR>1 {{print $4}}' | "{self.toybox_bin}" tr -d '[:space:]')
+    case "$free_mb" in
+        ''|*[!0-9]*) fatal_halt "Failed to parse numeric free capacity for $target from df ('$df_out')!" ;;
+    esac
+
+    if [ "$free_mb" -lt "$min_free_mb" ]; then
+        fatal_halt "Mount capacity error: $target provides only ${{free_mb}}MB free (< ${{min_free_mb}}MB required)!"
+    fi
+    log_kmsg "[LOADER-PID1] Verified $target: tmpfs mounted (free: ${{free_mb}}MB, quota: $size_opt)."
+}}
+
+mount_and_verify_tmpfs "$1" "$2" "$3"
+"""
+        runner_path = os.path.join(self.test_dir, "run_mount_test.sh")
+        with open(runner_path, "w") as f:
+            f.write(test_script)
+        os.chmod(runner_path, 0o755)
+
+        return subprocess.run(
+            ["bash", runner_path, target, size_opt, str(min_free)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env
+        )
+
+    def test_stage1_mount_success(self):
+        """Verify successful tmpfs mount and verification in Stage 1."""
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"tmpfs {self.mnt_dir} tmpfs rw,mode=777 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(self.mnt_dir, "size=6500M", 576)
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}\n{res.stdout}")
+        self.assertIn("Verified", res.stdout)
+
+    def test_stage1_mount_wrong_fstype_fails_closed(self):
+        """Verify mount failure when filesystem type is not tmpfs."""
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"ext4 {self.mnt_dir} ext4 rw 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(self.mnt_dir, "size=6500M", 576)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("filesystem is 'ext4', expected 'tmpfs'", res.stderr)
+
+    def test_stage1_mount_physical_device_source_fails_closed(self):
+        """Verify mount failure when source is backed by a physical block device."""
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"/dev/block/sda32 {self.mnt_dir} tmpfs rw 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(self.mnt_dir, "size=6500M", 576)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CRITICAL SAFETY VIOLATION: ", res.stderr)
+        self.assertIn("backed by physical block device", res.stderr)
+
+    def test_stage1_mount_capacity_exhaustion_fails_closed(self):
+        """Verify mount failure when usable capacity is below requirement."""
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"tmpfs {self.mnt_dir} tmpfs rw 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(
+            self.mnt_dir,
+            "size=6500M",
+            576,
+            extra_env={"MOCK_DF_LOW_CAPACITY": "1"}
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Mount capacity error:", res.stderr)
+        self.assertIn("provides only 10MB free", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

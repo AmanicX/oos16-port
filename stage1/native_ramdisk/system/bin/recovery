@@ -9,7 +9,12 @@ echo "  STAGE-1 SAFE RAM HARNESS STARTING ON ONEPLUS 7T         " > /dev/kmsg
 echo "==========================================================" > /dev/kmsg
 
 # 1. Enforce read-only lock on all physical storage devices and partitions dynamically
-rm -f /tmp/physical_storage_inventory /mnt/physical_storage_inventory 2>/dev/null || true
+rm -f /tmp/physical_storage_inventory /mnt/physical_storage_inventory /tmp/inventory.staging.$$ 2>/dev/null || true
+STAGING_INV="/tmp/inventory.staging.$$"
+: > "$STAGING_INV" || {
+    echo "[STAGE1-FATAL] Unable to initialize staging inventory $STAGING_INV" > /dev/kmsg 2>/dev/null || true
+    /system/bin/reboot bootloader 2>/dev/null || exit 1
+}
 PHYSICAL_DEV_COUNT=0
 
 lock_node() {
@@ -51,8 +56,10 @@ lock_node() {
         echo "[STAGE1-FATAL] $dnode is not read-only (ro=$ro_val)" > /dev/kmsg 2>/dev/null || true
         /system/bin/reboot bootloader 2>/dev/null || exit 1
     fi
-    echo "$dnode:$maj:$min:$sdir" >> /tmp/physical_storage_inventory
-    echo "$dnode:$maj:$min:$sdir" >> /mnt/physical_storage_inventory 2>/dev/null || true
+    echo "$dnode:$maj:$min:$sdir" >> "$STAGING_INV" || {
+        echo "[STAGE1-FATAL] Failed to write inventory record for $dnode" > /dev/kmsg 2>/dev/null || true
+        /system/bin/reboot bootloader 2>/dev/null || exit 1
+    }
     PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
     echo "[STAGE1] Physical node $dnode locked read-only (ro=$ro_val, $maj:$min)" > /dev/kmsg
 }
@@ -78,6 +85,24 @@ done
 
 if [ "$PHYSICAL_DEV_COUNT" -eq 0 ]; then
     echo "[STAGE1-FATAL] No physical storage block devices discovered!" > /dev/kmsg 2>/dev/null || true
+    /system/bin/reboot bootloader 2>/dev/null || exit 1
+fi
+
+# Post-Discovery Atomic Publication
+DUP_DEVS=$(/system/bin/toybox cut -d: -f1 "$STAGING_INV" | /system/bin/toybox sort | /system/bin/toybox uniq -d || true)
+if [ -n "$DUP_DEVS" ]; then
+    echo "[STAGE1-FATAL] Duplicate device entries in staging inventory: $DUP_DEVS" > /dev/kmsg 2>/dev/null || true
+    /system/bin/reboot bootloader 2>/dev/null || exit 1
+fi
+
+/system/bin/toybox cp "$STAGING_INV" "/mnt/physical_storage_inventory.tmp.$$" 2>/dev/null || true
+/system/bin/toybox cp "$STAGING_INV" "/tmp/physical_storage_inventory.tmp.$$" 2>/dev/null || true
+/system/bin/toybox mv -f "/mnt/physical_storage_inventory.tmp.$$" "/mnt/physical_storage_inventory" 2>/dev/null || true
+/system/bin/toybox mv -f "/tmp/physical_storage_inventory.tmp.$$" "/tmp/physical_storage_inventory" 2>/dev/null || true
+rm -f "$STAGING_INV" 2>/dev/null || true
+
+if [ ! -s "/mnt/physical_storage_inventory" ] && [ ! -s "/tmp/physical_storage_inventory" ]; then
+    echo "[STAGE1-FATAL] Failed to publish physical storage inventory!" > /dev/kmsg 2>/dev/null || true
     /system/bin/reboot bootloader 2>/dev/null || exit 1
 fi
 

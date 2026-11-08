@@ -305,10 +305,25 @@ revalidate_storage_inventory() {
     local checkpoint="${1:-unspecified}"
     log_msg "[STAGE2] Revalidating physical storage inventory at checkpoint: $checkpoint..."
 
-    local inv_file="${MNT_DIR:-/mnt}/physical_storage_inventory"
-    [ -f "$inv_file" ] || inv_file="${TMP_DIR:-/tmp}/physical_storage_inventory"
+    local mnt_inv="${MNT_DIR:-/mnt}/physical_storage_inventory"
+    local tmp_inv="${TMP_DIR:-/tmp}/physical_storage_inventory"
 
-    if [ ! -f "$inv_file" ] || [ ! -s "$inv_file" ]; then
+    if [ ! -f "$mnt_inv" ] && [ ! -f "$tmp_inv" ]; then
+        fatal "Physical storage inventory missing or 0 bytes in both $mnt_inv and $tmp_inv at checkpoint: $checkpoint! Halting to protect physical storage."
+    fi
+
+    if [ -f "$mnt_inv" ] && [ -f "$tmp_inv" ]; then
+        if ! cmp -s "$mnt_inv" "$tmp_inv"; then
+            fatal "Physical storage inventory byte-identity mismatch between $mnt_inv and $tmp_inv at checkpoint: $checkpoint!"
+        fi
+    elif [ "${STAGE2_TEST_MODE:-0}" != "1" ]; then
+        fatal "Physical storage inventory missing from one of $mnt_inv or $tmp_inv at checkpoint: $checkpoint!"
+    fi
+
+    local inv_file="$mnt_inv"
+    [ -f "$inv_file" ] || inv_file="$tmp_inv"
+
+    if [ ! -s "$inv_file" ]; then
         fatal "Physical storage inventory ($inv_file) missing or 0 bytes at checkpoint: $checkpoint! Halting to protect physical storage."
     fi
 
@@ -316,8 +331,16 @@ revalidate_storage_inventory() {
     local dev_block_root="${DEV_BLOCK_DIR:-/dev/block}"
 
     local verified_count=0
+    local seen_devices=" "
     while IFS=: read -r dev maj min sdir || [ -n "$dev" ]; do
         case "$dev" in ''|\#*) continue ;; esac
+
+        case "$seen_devices" in
+            *" $dev "*)
+                fatal "Duplicate device entry $dev in physical storage inventory at checkpoint: $checkpoint!"
+                ;;
+        esac
+        seen_devices="${seen_devices}${dev} "
 
         local check_sdir="$sdir"
         if [ -n "${SYS_BLOCK_DIR:-}" ]; then
@@ -411,7 +434,8 @@ revalidate_storage_inventory() {
                 local n_ro
                 n_ro=$(tb_run blockdev --getro "$check_disk_node" 2>/dev/null || echo "0")
                 [ "$n_ro" = "1" ] || fatal "Newly appearing device $dev_node could not be locked read-only (ro=$n_ro)!"
-                echo "$dev_node:$n_maj:$n_min:$bdir" >> "$inv_file"
+                [ -f "$mnt_inv" ] && echo "$dev_node:$n_maj:$n_min:$bdir" >> "$mnt_inv"
+                [ -f "$tmp_inv" ] && echo "$dev_node:$n_maj:$n_min:$bdir" >> "$tmp_inv"
                 log_msg "[STAGE2] Locked newly appearing physical disk read-only: $dev_node (ro=1) and appended to inventory."
             fi
 
@@ -451,7 +475,8 @@ revalidate_storage_inventory() {
                     local p_ro
                     p_ro=$(tb_run blockdev --getro "$check_part_node" 2>/dev/null || echo "0")
                     [ "$p_ro" = "1" ] || fatal "Newly appearing partition $part_node could not be locked read-only (ro=$p_ro)!"
-                    echo "$part_node:$p_maj:$p_min:$pdir" >> "$inv_file"
+                    [ -f "$mnt_inv" ] && echo "$part_node:$p_maj:$p_min:$pdir" >> "$mnt_inv"
+                    [ -f "$tmp_inv" ] && echo "$part_node:$p_maj:$p_min:$pdir" >> "$tmp_inv"
                     log_msg "[STAGE2] Locked newly appearing physical partition read-only: $part_node (ro=1) and appended to inventory."
                 fi
             done
@@ -463,6 +488,18 @@ revalidate_storage_inventory() {
     mounts_check=$(tb_run mount 2>/dev/null || cat /proc/mounts 2>/dev/null || true)
     if echo "$mounts_check" | grep -E "^/dev/block/(sd|mmcblk)" | grep -E "([ ,(]rw[ ,)]|,rw$)"; then
         fatal "CRITICAL SAFETY VIOLATION: Detected writable physical partition mount at checkpoint: $checkpoint!"
+    fi
+
+    # 7. Record verified checkpoint to /mnt/checkpoints_verified and /tmp/checkpoints_verified
+    local mnt_cp="${MNT_DIR:-/mnt}/checkpoints_verified"
+    local tmp_cp="${TMP_DIR:-/tmp}/checkpoints_verified"
+    local ts
+    ts="$(/system/bin/toybox date +%s%N 2>/dev/null || date +%s%N 2>/dev/null || echo 0)"
+    if [ -d "${MNT_DIR:-/mnt}" ]; then
+        echo "$checkpoint:$ts" >> "$mnt_cp" 2>/dev/null || true
+    fi
+    if [ -d "${TMP_DIR:-/tmp}" ]; then
+        echo "$checkpoint:$ts" >> "$tmp_cp" 2>/dev/null || true
     fi
 
     log_msg "[STAGE2] Storage inventory revalidation PASSED ($verified_count devices verified, ro=1, 0 writable mounts) at checkpoint: $checkpoint."
@@ -484,6 +521,18 @@ fi
 if [ "${1:-}" = "--revalidate-inventory" ]; then
     STAGE2_TEST_MODE=1
     revalidate_storage_inventory "${2:-manual_check}"
+    exit 0
+fi
+
+if [ "${1:-}" = "--verify-checkpoints" ] || [ "${1:-}" = "--list-checkpoints" ]; then
+    cat << 'EOF'
+stage2_startup
+before_base_system_and_overlay_mount
+before_child_partition_mounts
+before_apex_loop_mounts
+before_data_tmpfs_mount
+before_init_handover
+EOF
     exit 0
 fi
 
