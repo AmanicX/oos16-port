@@ -81,6 +81,25 @@ for dev_path in "${DISCOVERED_PHYSICAL_DEVS[@]}"; do
     echo "  Verified: $dev_path is read-only (ro=1)"
 done
 
+# Verify Stage-1 Physical Storage Inventory on Target if Available
+TARGET_INV=$("$SAFE_ADB" shell "cat /mnt/physical_storage_inventory" 2>/dev/null || true)
+if [ -z "$TARGET_INV" ] || [[ "$TARGET_INV" =~ "No such file" ]]; then
+    TARGET_INV=$("$SAFE_ADB" shell "cat /tmp/physical_storage_inventory" 2>/dev/null || true)
+fi
+if [ -n "$TARGET_INV" ] && ! [[ "$TARGET_INV" =~ "No such file" ]]; then
+    echo "Verifying target physical storage inventory records..."
+    while IFS=: read -r inv_dev inv_maj inv_min inv_sdir || [ -n "$inv_dev" ]; do
+        [ -z "$inv_dev" ] && continue
+        [[ "$inv_dev" =~ ^# ]] && continue
+        inv_ro=$("$SAFE_ADB" shell "blockdev --getro $inv_dev" 2>/dev/null | tr -d '\r\n[:space:]')
+        if [ "$inv_ro" != "1" ]; then
+            echo "CRITICAL SAFETY VIOLATION: Inventory device $inv_dev is NOT read-only (ro=$inv_ro)!" >&2
+            exit 1
+        fi
+    done <<< "$TARGET_INV"
+    echo "Verified: All devices in target physical storage inventory are confirmed read-only (ro=1)."
+fi
+
 get_device_mounts() {
     local m
     m=$("$SAFE_ADB" shell "cat /proc/mounts" 2>/dev/null || true)
@@ -414,22 +433,25 @@ if [ "$MEM_TOTAL_MB" -lt 6500 ]; then
     exit 1
 fi
 
-# Budget Breakdown:
+# Unified Memory Budget Model (Total Bringup Allocation: 3392 MB):
 # 1. Staged Images (/mnt tmpfs):                     TOTAL_STAGED_MB (measured)
-# 2. Expanded APEX payloads (/apex tmpfs):           TOTAL_EXPANDED_APEX_MB (measured/preflight)
+# 2. Direct APEX loop backing buffer:                64MB (direct loop mounted from staged images)
 # 3. Ephemeral Data (/data tmpfs):                   1024MB (configured quota)
 # 4. OverlayFS upper/work & tmp staging:             512MB (configured quota)
 # 5. Kernel, GPU, display & Android Runtime reserve: 1536MB (hardware reserve)
 # 6. Filesystem metadata & safety headroom:          256MB (buffer)
-REQUIRED_RAM_MB=$((TOTAL_STAGED_MB + TOTAL_EXPANDED_APEX_MB + 1024 + 512 + 1536 + 256))
-echo "Memory Budget Breakdown:"
+BRINGUP_ALLOCATION_MB=3392
+REQUIRED_RAM_MB=$((TOTAL_STAGED_MB + BRINGUP_ALLOCATION_MB))
+echo "Unified Memory Budget Breakdown:"
 echo "  - Staged partition & APEX images (/mnt tmpfs): ${TOTAL_STAGED_MB}MB (measured)"
-echo "  - Expanded APEX payloads (/apex tmpfs):        ${TOTAL_EXPANDED_APEX_MB}MB (measured/preflight)"
+echo "  - Expanded APEX payloads (/apex tmpfs):        ${TOTAL_EXPANDED_APEX_MB}MB (uncompressed reference, loop backed)"
+echo "  - Direct APEX loop backing buffer:             64MB (direct loop mounted)"
 echo "  - Ephemeral /data (tmpfs quota):               1024MB"
 echo "  - OverlayFS upper/work & tmp staging:          512MB"
 echo "  - Kernel, GPU, display & runtime reserve:      1536MB"
 echo "  - Filesystem metadata & safety headroom:       256MB"
 echo "  ----------------------------------------------------"
+echo "  Bringup Allocation Total:                      ${BRINGUP_ALLOCATION_MB}MB"
 echo "  Total Peak Memory Required:                    ${REQUIRED_RAM_MB}MB"
 
 if [ "$MEM_AVAIL_MB" -lt "$REQUIRED_RAM_MB" ]; then

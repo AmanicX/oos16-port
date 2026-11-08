@@ -12,11 +12,13 @@ The authentic in-kernel configuration stream (`IKCONFIG`) was decompressed and a
 
 - **Source File**: `stage1/kernel_src/kernel`
 - **File Size**: 40,845,312 bytes
-- **SHA-256**: `6965c822e0e4177b8f9e612cb79a5e84000305fc61937f2fe963234e40242a78`
+- **SHA-256**: `c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129`
 - **Magic Offset**: `35146816` (`0x2184e00`)
 - **Stream Format**: gzip compressed `IKCONFIG_ST` stream
 - **Decompressed Size**: 163,956 bytes
-- **Linux Kernel Banner**: `Linux version 4.14.190-perf+`
+- **Linux Kernel Banner**: `Linux version 4.14.357-perf-gcd3073fb68f1 (build-user@build-host) (Android (14054515, +pgo, +bolt, +lto, +mlgo, based on r563880c) clang version 21.0.0, LLD 21.0.0 (/mnt/disks/build-disk/src/googleplex-android/llvm-r563880-release/out/llvm-project/llvm 5e96669f06077099aa41290cdb4c5e6fa0f59349)) #1 SMP PREEMPT Sat Jul 25 04:58:43 PKT 2026`
+- **Associated DTB File**: `stage1/kernel_src/dtb` (SHA-256: `e4faf7c553f88246077343de51487d90517bb534e345ee44893d2e4fb348df3c`, platform: `qcom,sm8150`)
+- **Associated Recovery DTBO File**: `stage1/kernel_src/recovery_dtbo` (SHA-256: `7cfdd1984a7be7edd8ef4e761540cf32e69f1cba6a844afe6ba6780dd12223c1`, display: `dsi_samsung_oneplus_dsc_cmd_display`, `samsung_oneplus`)
 
 ---
 

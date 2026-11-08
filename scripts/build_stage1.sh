@@ -57,7 +57,7 @@ echo "  mkbootimg: $MKBOOTIMG_BIN"
 echo "  lz4: $(command -v lz4)"
 
 # 2. Dependency Validation: Kernel & Hardware Assets
-echo "2. Checking required hardware kernel assets..."
+echo "2. Checking and strictly validating required hardware kernel assets..."
 MISSING_ASSETS=()
 
 if [ ! -f "$KERNEL_SRC/kernel" ]; then
@@ -86,6 +86,45 @@ if [ "${#MISSING_ASSETS[@]}" -gt 0 ]; then
     echo "See docs/BUILD_DEPENDENCIES.md for complete details and checksums." >&2
     exit 1
 fi
+
+EXP_KERNEL_SHA="c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129"
+EXP_DTB_SHA="e4faf7c553f88246077343de51487d90517bb534e345ee44893d2e4fb348df3c"
+EXP_DTBO_SHA="7cfdd1984a7be7edd8ef4e761540cf32e69f1cba6a844afe6ba6780dd12223c1"
+
+act_k_sha=$(sha256sum "$KERNEL_SRC/kernel" | awk '{print $1}')
+if [ "$act_k_sha" != "$EXP_KERNEL_SHA" ]; then
+    echo "ERROR: Kernel SHA-256 mismatch ($act_k_sha != $EXP_KERNEL_SHA)!" >&2
+    exit 1
+fi
+
+act_dtb_sha=$(sha256sum "$KERNEL_SRC/dtb" | awk '{print $1}')
+if [ "$act_dtb_sha" != "$EXP_DTB_SHA" ]; then
+    echo "ERROR: DTB SHA-256 mismatch ($act_dtb_sha != $EXP_DTB_SHA)!" >&2
+    exit 1
+fi
+
+act_dtbo_sha=$(sha256sum "$KERNEL_SRC/recovery_dtbo" | awk '{print $1}')
+if [ "$act_dtbo_sha" != "$EXP_DTBO_SHA" ]; then
+    echo "ERROR: Recovery DTBO SHA-256 mismatch ($act_dtbo_sha != $EXP_DTBO_SHA)!" >&2
+    exit 1
+fi
+
+if ! strings "$KERNEL_SRC/kernel" | grep -F "4.14.357-perf-gcd3073fb68f1" >/dev/null 2>&1; then
+    echo "ERROR: Kernel does not match expected banner 4.14.357-perf-gcd3073fb68f1!" >&2
+    exit 1
+fi
+
+if ! strings "$KERNEL_SRC/dtb" | grep -F "qcom,sm8150" >/dev/null 2>&1; then
+    echo "ERROR: DTB is not compatible with Qualcomm SM8150 (Snapdragon 855+)!" >&2
+    exit 1
+fi
+
+if ! strings "$KERNEL_SRC/recovery_dtbo" | grep -F "samsung_oneplus" >/dev/null 2>&1; then
+    echo "ERROR: Recovery DTBO lacks OnePlus Samsung AMOLED panel definitions!" >&2
+    exit 1
+fi
+
+echo "  Hardware assets verified: Kernel 4.14.357-perf-gcd3073fb68f1, SM8150 DTB, Samsung AMOLED DTBO."
 
 if [ ! -d "$NATIVE_RAMDISK" ]; then
     echo "ERROR: Native ramdisk directory $NATIVE_RAMDISK does not exist!" >&2

@@ -5,8 +5,8 @@
 [![Device](https://img.shields.io/badge/Device-OnePlus%207T%20(hotdogb)-blue.svg)](https://wiki.lineageos.org/devices/hotdogb/)
 [![SoC](https://img.shields.io/badge/SoC-Snapdragon%20855%2B%20(SM8150--AC)-orange.svg)](https://www.qualcomm.com/)
 [![Storage](https://img.shields.io/badge/Storage-100%25%20Read--Only%20RAM-red.svg)](#non-negotiable-safety-contract)
-[![Tests](https://img.shields.io/badge/Tests-141%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
-[![Audit](https://img.shields.io/badge/Audit-31%2F31%20Passed-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Tests](https://img.shields.io/badge/Tests-153%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Audit](https://img.shields.io/badge/Audit-33%2F33%20Passed-brightgreen.svg)](#7-verification-status--test-matrix)
 
 ---
 
@@ -80,6 +80,7 @@ oos16-port/
 │   ├── test_safe_adb.py           # ADB safety proxy unit tests
 │   ├── test_safe_fastboot.py      # Fastboot safety proxy unit tests
 │   ├── test_watchdog.py           # Watchdog supervisor protocol test suite
+│   ├── test_storage_safety.py     # Physical storage discovery, fail-closed mknod & inventory tests
 │   └── test_integration_stage2.py # End-to-end integration tests (Mock ADB, auditor, build validation)
 ├── stage1/                        # Stage-1 RAM harness sources
 │   ├── loader_ramdisk/            # Minimal shell init ramdisk (init, stage2_init.sh, watchdog.sh)
@@ -199,12 +200,14 @@ Running an entire mobile operating system purely from RAM requires strict memory
 * Target device: OnePlus 7T (`hotdogb`), 8 GB LPDDR4X physical RAM.
 * Staged partition images (`system`, `system_ext`, `vendor`, `odm`, `my_product`, APEXes): ~3,300 MB.
 * Exact upward integer rounding: `TOTAL_STAGED_MB=$(((TOTAL_STAGED_BYTES + 1048575) / 1048576))`.
-* Memory reservations:
-  * Ephemeral `/data` tmpfs: 1,024 MB
+* Authoritative Bringup Allocation: **3,392 MB**:
+  * Direct APEX loop backing buffer: 64 MB (direct loop mounted from staged images)
+  * Ephemeral `/data` tmpfs quota: 1,024 MB
   * Volatile staging `/tmp` & OverlayFS upper layers: 512 MB
   * Kernel, base drivers, display buffers & Android runtime headroom: 1,536 MB
-  * **Total Peak Budget**: ~6,372 MB ($\approx 6.4\text{ GB}$).
-* In `tools/safe/run_stage2.sh`, `/mnt` tmpfs mount is verified via `/proc/mounts`, and `df -m /mnt` is parsed strictly with numeric validation. The runner verifies `MemTotal >= 6500MB` and `MemAvailable >= REQUIRED_RAM_MB` before initiating image transfer and fails closed immediately if capacity is insufficient or unreadable.
+  * Filesystem metadata & safety headroom: 256 MB
+* **Total Peak Memory Required**: `TOTAL_STAGED_MB + 3392` (~6,692 MB, $\approx 6.7\text{ GB}$).
+* In `tools/safe/run_stage2.sh` and `scripts/stage2_init.sh`, the budget model is strictly unified. `/mnt` tmpfs mount is verified via `/proc/mounts`, and `df -m /mnt` is parsed strictly with numeric validation. The runner verifies `MemTotal >= 6500MB` and `MemAvailable >= REQUIRED_RAM_MB` before initiating image transfer and fails closed immediately if capacity is insufficient or unreadable.
 * Extended monitoring loop (`OOS16_WAIT_FOR_BOOT=1`) continues petting the safety watchdog heartbeat while awaiting `sys.boot_completed=1` or `watchdog_state=BOOT_COMPLETED`.
 
 ### OnePlus 7T Display & Graphics Bringup Technical Analysis:
@@ -280,8 +283,8 @@ To maintain rigorous engineering honesty, verification states are strictly parti
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (31/31)** | Passed on local packaged boot images: `loader.img` (SHA-256: `dfb5e2e6...`, 31/31), `stage1.img` (SHA-256: `69810689...`, 31/31), and ramdisks (29/29). In CI without device kernel inputs, ramdisks pass 29/29 and packaged boot-image audits are logged as skipped. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (141/141)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & lifecycle (22), Stage-2 runner integration mocks (67), and Go BinderFS unit tests (15). Total Python unittests: 126/126; Go unit tests: 15/15. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (33/33)** | Passed on local packaged boot images: `loader.img` (SHA-256: `ba58599d...`, 33/33), `stage1.img` (SHA-256: `edcd45f0...`, 33/33), and ramdisks (31/31). In CI without device kernel inputs, ramdisks pass 31/31 and packaged boot-image audits are logged as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (153/153)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & lifecycle (22), Stage-2 runner integration mocks (67), Storage safety & inventory revalidation (12), and Go BinderFS unit tests (15). Total Python unittests: 138/138; Go unit tests: 15/15. |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |

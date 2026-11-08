@@ -19,14 +19,14 @@
 
 ---
 
-## 2. Donor Selection & Recommendation
+## 2. Donor Selection & Final Working Donor
 
-### Recommended Donor: **Candidate 1 — OxygenOS 16 (v16.0.10.501) for OnePlus 8T (`KB2003`)**
-- **SoC Generation**: SM8250 (Snapdragon 865) — the immediate successor to the 7T's SM8150.
-- **Display**: 1080 x 2400 AMOLED (virtually identical to the 7T's 1080 x 2340 panel).
-- **Tooling Support**: Directly supported by the `coloros_port` project (`external/coloros_port`) with pre-engineered Android 16 smali patches and feature shims.
-- **Why not OnePlus 9 / 12 donors?**:
-  - Higher generation devices (SM8350, SM8550) use 64-bit-only userspaces, different display pipelines, different thermal HALs, and camera provider interfaces that will cause immediate framework crash loops.
+> [!NOTE] Historical Context
+> Candidate 1 (OnePlus 8T `KB2003`) was initially evaluated during early research on November 5, 2026. However, the project converged on and finalized the official **OnePlus 9 standard (`LE2113` / `lemonade`) OxygenOS 16 release (`ota_full-LE2113_16.0.10.500.zip`, SHA-256: `5ea5f120a2bce5eb98bd2a5d1aca872f5888903825861142bd0900772b8d0844`, Build: `BP2A.250605.015` / `LE2113_16.0.10.500(EX01)`)** as the active working donor because it provided complete authentic Android 16 Baklava partition images (`system`, `system_ext`, `my_product`, `my_region`, and bootstrap APEXes) with matching SDK 36 interfaces.
+
+### Exploratory Candidates Evaluated:
+- **Initial Candidate: OxygenOS 16 for OnePlus 8T (`KB2003`)**: Evaluated for SM8250 similarity and display dimensions.
+- **Final Active Working Donor**: **OnePlus 9 EEA (`LE2113_16.0.10.500(EX01)`, `BP2A.250605.015`, Android 16 SDK 36 `Baklava`, `ota_full-LE2113_16.0.10.500.zip`)**. See `docs/INPUTS.md` for full provenance and SHA-256 verification.
 
 ### Fallback Donor: **OxygenOS 16 GSI (Galaxy S21 / Treble)**
 - Generic System Image format; useful as a reference if OnePlus-specific system services prove too tightly coupled to proprietary HALs.

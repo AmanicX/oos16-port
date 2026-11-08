@@ -160,10 +160,81 @@ log_kmsg "=========================================================="
 log_kmsg "  STAGE-1 RAM LOADER SUPERVISOR (PID 1) STARTING         "
 log_kmsg "=========================================================="
 
-# 5. Dynamic Physical Storage Discovery & Mandatory Read-Only Verification
-log_kmsg "[LOADER-PID1] Discovering physical storage block devices..."
+# 5. Mount RAM Volatile Staging Filesystems
+/system/bin/toybox mount -t tmpfs -o mode=0777,size=6500M tmpfs /mnt
+/system/bin/toybox mount -t tmpfs -o mode=0777,size=512M tmpfs /tmp
+log_kmsg "[LOADER-PID1] RAM staging tmpfs mounted (6500MB available at /mnt)"
+
+# 6. Strict Physical Storage Discovery, Validation, Write-Locking & Inventory
+# Note on Linux block-layer read-only limitations:
+# blockdev --setro enforces the BLKROSET flag on the kernel gendisk/block device,
+# preventing write requests submitted through block layer I/O queues and filesystems.
+# Raw kernel drivers could theoretically bypass the block layer if directly instructed,
+# but in this volatile RAM-only environment, zero write drivers or physical mount targets exist.
+log_kmsg "[LOADER-PID1] Discovering and locking physical storage block devices..."
+rm -f /tmp/physical_storage_inventory /mnt/physical_storage_inventory 2>/dev/null || true
 PHYSICAL_DEV_COUNT=0
 LOCKED_DEV_COUNT=0
+
+lock_and_record_physical_node() {
+    local sysfs_dir="$1"
+    local dev_name="$2"
+    local node_type="$3"
+
+    if [ ! -f "$sysfs_dir/dev" ]; then
+        fatal_halt "CRITICAL SAFETY FAILURE: sysfs node $sysfs_dir lacks a readable dev file!"
+    fi
+
+    local maj_min
+    maj_min=$(cat "$sysfs_dir/dev" 2>/dev/null | tr -d '[:space:]')
+    case "$maj_min" in
+        ''|*[!0-9:]*|*:*[:]*|*:|:*)
+            fatal_halt "CRITICAL SAFETY FAILURE: Malformed major:minor '$maj_min' in $sysfs_dir/dev!"
+            ;;
+    esac
+
+    local maj="${maj_min%%:*}"
+    local min="${maj_min##*:}"
+
+    case "$maj" in
+        ''|*[!0-9]*) fatal_halt "CRITICAL: Non-numeric major number '$maj' in $sysfs_dir/dev!" ;;
+    esac
+    case "$min" in
+        ''|*[!0-9]*) fatal_halt "CRITICAL: Non-numeric minor number '$min' in $sysfs_dir/dev!" ;;
+    esac
+
+    local dev_node="/dev/block/$dev_name"
+    /system/bin/toybox mkdir -p /dev/block 2>/dev/null || true
+
+    if [ ! -b "$dev_node" ]; then
+        if ! /system/bin/toybox mknod "$dev_node" b "$maj" "$min"; then
+            fatal_halt "CRITICAL SAFETY FAILURE: mknod failed for $dev_node (b $maj $min)!"
+        fi
+    fi
+
+    if [ ! -b "$dev_node" ]; then
+        fatal_halt "CRITICAL SAFETY FAILURE: Device node $dev_node is not a block device after mknod!"
+    fi
+
+    # Apply strict read-only lock to block device
+    if ! /system/bin/toybox blockdev --setro "$dev_node"; then
+        fatal_halt "CRITICAL SAFETY FAILURE: blockdev --setro failed on $dev_node!"
+    fi
+
+    local ro_status
+    ro_status=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
+    if [ "$ro_status" != "1" ]; then
+        fatal_halt "CRITICAL SAFETY FAILURE: Failed to lock $dev_node read-only (ro=$ro_status, expected 1)!"
+    fi
+
+    # Record into physical storage inventory
+    echo "$dev_node:$maj:$min:$sysfs_dir" >> /tmp/physical_storage_inventory
+    echo "$dev_node:$maj:$min:$sysfs_dir" >> /mnt/physical_storage_inventory 2>/dev/null || true
+
+    PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
+    LOCKED_DEV_COUNT=$((LOCKED_DEV_COUNT + 1))
+    log_kmsg "[LOADER-PID1] Locked physical $node_type read-only: $dev_node (ro=1, major=$maj, minor=$min)"
+}
 
 for bdir in /sys/block/*; do
     [ -d "$bdir" ] || continue
@@ -176,68 +247,23 @@ for bdir in /sys/block/*; do
 
     # Physical devices have a sysfs hardware device backing node
     if [ -e "$bdir/device" ] || case "$bname" in sd*|mmcblk*) true ;; *) false ;; esac; then
-        dev_node="/dev/block/$bname"
-        if [ ! -b "$dev_node" ]; then
-            # Read major:minor from sysfs dev file
-            if [ -f "$bdir/dev" ]; then
-                maj_min=$(cat "$bdir/dev")
-                maj="${maj_min%%:*}"
-                min="${maj_min##*:}"
-                /system/bin/toybox mknod "$dev_node" b "$maj" "$min" 2>/dev/null || true
-            fi
-        fi
+        lock_and_record_physical_node "$bdir" "$bname" "disk"
 
-        if [ -b "$dev_node" ]; then
-            PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
-            # Apply hardware read-only lock to whole disk
-            /system/bin/toybox blockdev --setro "$dev_node" 2>/dev/null || true
-            ro_status=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
-            if [ "$ro_status" = "1" ]; then
-                LOCKED_DEV_COUNT=$((LOCKED_DEV_COUNT + 1))
-                log_kmsg "[LOADER-PID1] Locked physical device read-only: $dev_node (ro=1)"
-            else
-                fatal_halt "CRITICAL SAFETY FAILURE: Failed to lock $dev_node read-only (ro=$ro_status)!"
-            fi
-
-            # Discover and lock all child partitions of this physical device
-            for pdir in "$bdir"/"$bname"*; do
-                [ -d "$pdir" ] || continue
-                pname=$(basename "$pdir")
-                part_node="/dev/block/$pname"
-                if [ ! -b "$part_node" ]; then
-                    if [ -f "$pdir/dev" ]; then
-                        pmaj_min=$(cat "$pdir/dev")
-                        pmaj="${pmaj_min%%:*}"
-                        pmin="${pmaj_min##*:}"
-                        /system/bin/toybox mknod "$part_node" b "$pmaj" "$pmin" 2>/dev/null || true
-                    fi
-                fi
-                if [ -b "$part_node" ]; then
-                    PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
-                    /system/bin/toybox blockdev --setro "$part_node" 2>/dev/null || true
-                    pro_status=$(/system/bin/toybox blockdev --getro "$part_node" 2>/dev/null || echo "0")
-                    if [ "$pro_status" = "1" ]; then
-                        LOCKED_DEV_COUNT=$((LOCKED_DEV_COUNT + 1))
-                        log_kmsg "[LOADER-PID1] Locked physical partition read-only: $part_node (ro=1)"
-                    else
-                        fatal_halt "CRITICAL SAFETY FAILURE: Failed to lock partition $part_node read-only (ro=$pro_status)!"
-                    fi
-                fi
-            done
-        fi
+        # Discover and lock all child partitions of this physical device
+        for pdir in "$bdir"/"$bname"*; do
+            [ -d "$pdir" ] || continue
+            pname=$(basename "$pdir")
+            lock_and_record_physical_node "$pdir" "$pname" "partition"
+        done
     fi
 done
 
 if [ "$PHYSICAL_DEV_COUNT" -eq 0 ]; then
-    fatal_halt "CRITICAL SAFETY FAILURE: No physical storage block devices discovered!"
+    fatal_halt "CRITICAL SAFETY FAILURE: No physical storage block devices discovered in /sys/block!"
 fi
 
-log_kmsg "[LOADER-PID1] Storage verified: $LOCKED_DEV_COUNT/$PHYSICAL_DEV_COUNT physical devices locked strictly read-only."
-
-# 6. Mount RAM Volatile Staging Filesystems
-/system/bin/toybox mount -t tmpfs -o mode=0777,size=6500M tmpfs /mnt
-/system/bin/toybox mount -t tmpfs -o mode=0777,size=512M tmpfs /tmp
-log_kmsg "[LOADER-PID1] RAM staging tmpfs mounted (6500MB available at /mnt)"
+log_kmsg "[LOADER-PID1] Storage verified: $LOCKED_DEV_COUNT/$PHYSICAL_DEV_COUNT physical devices & partitions locked strictly read-only."
+log_kmsg "[LOADER-PID1] Physical storage inventory recorded at /mnt/physical_storage_inventory."
 
 # 7. Configure USB Gadget for Root ADB
 log_kmsg "[LOADER-PID1] Configuring USB gadget for ADB..."

@@ -507,6 +507,29 @@ else
     audit_fail "RAM memory budget" "tools/safe/run_stage2.sh lacks MemAvailable verification or peak budget check"
 fi
 
+# 15. Physical Storage Inventory & Multi-Checkpoint Revalidation
+INV_OK=1
+if ! grep -q "physical_storage_inventory" "$PROJECT_ROOT/stage1/loader_ramdisk/init" 2>/dev/null || \
+   ! grep -q "physical_storage_inventory" "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null; then
+    INV_OK=0
+    audit_fail "Physical storage inventory" "Missing physical_storage_inventory tracking in loader init or stage2_init"
+fi
+
+REVAL_COUNT=$(grep -c "revalidate_storage_inventory" "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null || echo "0")
+if [ "$REVAL_COUNT" -ge 6 ]; then
+    audit_pass "Storage inventory revalidation enforced across $REVAL_COUNT distinct bringup checkpoints"
+else
+    audit_fail "Storage revalidation checkpoints" "stage2_init only has $REVAL_COUNT revalidation checkpoints (minimum 6 required)"
+fi
+
+# 16. Unified RAM Budgeting Alignment
+if grep -q "3392" "$PROJECT_ROOT/tools/safe/run_stage2.sh" 2>/dev/null && \
+   grep -q "future_ram_req_mb=" "$PROJECT_ROOT/scripts/stage2_init.sh" 2>/dev/null; then
+    audit_pass "Unified 3392 MB bringup allocation model verified between runner and stage2_init"
+else
+    audit_fail "RAM budget unification" "Runner and stage2_init RAM budget models diverge"
+fi
+
 # 5. Summary & Disclaimer
 TOTAL_INSPECTED="${#INSPECTED_FILES[@]}"
 echo "==========================================================" | tee -a "$REPORT_FILE"

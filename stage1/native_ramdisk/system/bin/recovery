@@ -9,6 +9,54 @@ echo "  STAGE-1 SAFE RAM HARNESS STARTING ON ONEPLUS 7T         " > /dev/kmsg
 echo "==========================================================" > /dev/kmsg
 
 # 1. Enforce read-only lock on all physical storage devices and partitions dynamically
+rm -f /tmp/physical_storage_inventory /mnt/physical_storage_inventory 2>/dev/null || true
+PHYSICAL_DEV_COUNT=0
+
+lock_node() {
+    local sdir="$1"
+    local dname="$2"
+    if [ ! -f "$sdir/dev" ]; then
+        echo "[STAGE1-FATAL] Missing sysfs dev in $sdir" > /dev/kmsg 2>/dev/null || true
+        /system/bin/reboot bootloader 2>/dev/null || exit 1
+    fi
+    local mm
+    mm=$(cat "$sdir/dev" 2>/dev/null | tr -d '[:space:]')
+    case "$mm" in
+        ''|*[!0-9:]*|*:*[:]*|*:|:*)
+            echo "[STAGE1-FATAL] Malformed major:minor '$mm' in $sdir/dev" > /dev/kmsg 2>/dev/null || true
+            /system/bin/reboot bootloader 2>/dev/null || exit 1
+            ;;
+    esac
+    local maj="${mm%%:*}"
+    local min="${mm##*:}"
+    local dnode="/dev/block/$dname"
+    /system/bin/toybox mkdir -p /dev/block 2>/dev/null || true
+    if [ ! -b "$dnode" ]; then
+        /system/bin/toybox mknod "$dnode" b "$maj" "$min" || {
+            echo "[STAGE1-FATAL] mknod failed for $dnode" > /dev/kmsg 2>/dev/null || true
+            /system/bin/reboot bootloader 2>/dev/null || exit 1
+        }
+    fi
+    if [ ! -b "$dnode" ]; then
+        echo "[STAGE1-FATAL] Node $dnode is not a block device" > /dev/kmsg 2>/dev/null || true
+        /system/bin/reboot bootloader 2>/dev/null || exit 1
+    fi
+    /system/bin/toybox blockdev --setro "$dnode" || {
+        echo "[STAGE1-FATAL] blockdev --setro failed on $dnode" > /dev/kmsg 2>/dev/null || true
+        /system/bin/reboot bootloader 2>/dev/null || exit 1
+    }
+    local ro_val
+    ro_val=$(/system/bin/toybox blockdev --getro "$dnode" 2>/dev/null || echo "0")
+    if [ "$ro_val" != "1" ]; then
+        echo "[STAGE1-FATAL] $dnode is not read-only (ro=$ro_val)" > /dev/kmsg 2>/dev/null || true
+        /system/bin/reboot bootloader 2>/dev/null || exit 1
+    fi
+    echo "$dnode:$maj:$min:$sdir" >> /tmp/physical_storage_inventory
+    echo "$dnode:$maj:$min:$sdir" >> /mnt/physical_storage_inventory 2>/dev/null || true
+    PHYSICAL_DEV_COUNT=$((PHYSICAL_DEV_COUNT + 1))
+    echo "[STAGE1] Physical node $dnode locked read-only (ro=$ro_val, $maj:$min)" > /dev/kmsg
+}
+
 for bdir in /sys/block/*; do
     [ -d "$bdir" ] || continue
     bname=$(basename "$bdir")
@@ -17,26 +65,21 @@ for bdir in /sys/block/*; do
     esac
 
     if [ -e "$bdir/device" ] || case "$bname" in sd*|mmcblk*) true ;; *) false ;; esac; then
-        dev_node="/dev/block/$bname"
-        if [ -b "$dev_node" ]; then
-            /system/bin/toybox blockdev --setro "$dev_node" 2>/dev/null || true
-            ro_val=$(/system/bin/toybox blockdev --getro "$dev_node" 2>/dev/null || echo "0")
-            echo "[STAGE1] Physical device $dev_node locked read-only (ro=$ro_val)" > /dev/kmsg
-        fi
+        lock_node "$bdir" "$bname"
 
         # Discover and lock all child partitions
         for pdir in "$bdir"/"$bname"*; do
             [ -d "$pdir" ] || continue
             pname=$(basename "$pdir")
-            part_node="/dev/block/$pname"
-            if [ -b "$part_node" ]; then
-                /system/bin/toybox blockdev --setro "$part_node" 2>/dev/null || true
-                pro_val=$(/system/bin/toybox blockdev --getro "$part_node" 2>/dev/null || echo "0")
-                echo "[STAGE1] Physical partition $part_node locked read-only (ro=$pro_val)" > /dev/kmsg
-            fi
+            lock_node "$pdir" "$pname"
         done
     fi
 done
+
+if [ "$PHYSICAL_DEV_COUNT" -eq 0 ]; then
+    echo "[STAGE1-FATAL] No physical storage block devices discovered!" > /dev/kmsg 2>/dev/null || true
+    /system/bin/reboot bootloader 2>/dev/null || exit 1
+fi
 
 # 2. Continuous Safety Guard Loop in background
 (

@@ -13,6 +13,62 @@ OTATOOLS="$PROJECT_ROOT/external/coloros_port/otatools/bin"
 
 mkdir -p "$BUILD_DIR"
 
+validate_hardware_assets() {
+    local k_src="$STAGE1_DIR/kernel_src"
+    echo "0. Validating authentic OnePlus 7T hardware kernel assets..."
+
+    local EXP_KERNEL_SHA="c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129"
+    local EXP_DTB_SHA="e4faf7c553f88246077343de51487d90517bb534e345ee44893d2e4fb348df3c"
+    local EXP_DTBO_SHA="7cfdd1984a7be7edd8ef4e761540cf32e69f1cba6a844afe6ba6780dd12223c1"
+
+    [ -f "$k_src/kernel" ] || { echo "ERROR: Missing $k_src/kernel" >&2; exit 1; }
+    [ -f "$k_src/dtb" ] || { echo "ERROR: Missing $k_src/dtb" >&2; exit 1; }
+    [ -f "$k_src/recovery_dtbo" ] || { echo "ERROR: Missing $k_src/recovery_dtbo" >&2; exit 1; }
+
+    local act_k_sha
+    act_k_sha=$(sha256sum "$k_src/kernel" | awk '{print $1}')
+    if [ "$act_k_sha" != "$EXP_KERNEL_SHA" ]; then
+        echo "ERROR: Kernel SHA-256 mismatch ($act_k_sha != $EXP_KERNEL_SHA)!" >&2
+        exit 1
+    fi
+
+    local act_dtb_sha
+    act_dtb_sha=$(sha256sum "$k_src/dtb" | awk '{print $1}')
+    if [ "$act_dtb_sha" != "$EXP_DTB_SHA" ]; then
+        echo "ERROR: DTB SHA-256 mismatch ($act_dtb_sha != $EXP_DTB_SHA)!" >&2
+        exit 1
+    fi
+
+    local act_dtbo_sha
+    act_dtbo_sha=$(sha256sum "$k_src/recovery_dtbo" | awk '{print $1}')
+    if [ "$act_dtbo_sha" != "$EXP_DTBO_SHA" ]; then
+        echo "ERROR: Recovery DTBO SHA-256 mismatch ($act_dtbo_sha != $EXP_DTBO_SHA)!" >&2
+        exit 1
+    fi
+
+    # Verify kernel version banner
+    if ! strings "$k_src/kernel" | grep -F "4.14.357-perf-gcd3073fb68f1" >/dev/null 2>&1; then
+        echo "ERROR: Kernel does not match expected banner 4.14.357-perf-gcd3073fb68f1!" >&2
+        exit 1
+    fi
+
+    # Verify DTB target platform
+    if ! strings "$k_src/dtb" | grep -F "qcom,sm8150" >/dev/null 2>&1; then
+        echo "ERROR: DTB is not compatible with Qualcomm SM8150 (Snapdragon 855+)!" >&2
+        exit 1
+    fi
+
+    # Verify Recovery DTBO display compatibility
+    if ! strings "$k_src/recovery_dtbo" | grep -F "samsung_oneplus" >/dev/null 2>&1; then
+        echo "ERROR: Recovery DTBO lacks OnePlus Samsung AMOLED panel definitions!" >&2
+        exit 1
+    fi
+
+    echo "  Hardware assets verified: Kernel 4.14.357-perf-gcd3073fb68f1, SM8150 DTB, Samsung AMOLED DTBO."
+}
+
+validate_hardware_assets
+
 if [ ! -d "$LOADER_RAMDISK" ]; then
     echo "Error: $LOADER_RAMDISK does not exist!"
     exit 1

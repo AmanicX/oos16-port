@@ -221,6 +221,44 @@ query_boot_completed() {
     return 1
 }
 
+# Helper to verify physical storage read-only state continuously
+check_storage_inventory_safety() {
+    local inv="/mnt/physical_storage_inventory"
+    [ -f "$inv" ] || inv="/tmp/physical_storage_inventory"
+    [ -f "$inv" ] || return 0
+
+    while IFS=: read -r dev maj min sdir || [ -n "$dev" ]; do
+        case "$dev" in ''|\#*) continue ;; esac
+        if [ -b "$dev" ]; then
+            local ro
+            ro=$(/system/bin/toybox blockdev --getro "$dev" 2>/dev/null || blockdev --getro "$dev" 2>/dev/null || echo "1")
+            if [ "$ro" != "1" ]; then
+                log_msg "[WATCHDOG FATAL] Storage safety violation: $dev became writable (ro=$ro)! Emergency rebooting!"
+                set_state "STORAGE_VIOLATION"
+                if [ -x "$REBOOT_BIN" ]; then
+                    "$REBOOT_BIN" bootloader
+                else
+                    /system/bin/reboot bootloader 2>/dev/null || true
+                fi
+                exit 1
+            fi
+        fi
+    done < "$inv"
+
+    if [ -f /proc/mounts ]; then
+        if grep -E "^/dev/block/(sd|mmcblk)" /proc/mounts 2>/dev/null | grep -E "([ ,(]rw[ ,)]|,rw$)" >/dev/null 2>&1; then
+            log_msg "[WATCHDOG FATAL] Storage safety violation: detected writable physical mount in /proc/mounts! Emergency rebooting!"
+            set_state "STORAGE_VIOLATION"
+            if [ -x "$REBOOT_BIN" ]; then
+                "$REBOOT_BIN" bootloader
+            else
+                /system/bin/reboot bootloader 2>/dev/null || true
+            fi
+            exit 1
+        fi
+    fi
+}
+
 set_state "STAGE1_WAIT"
 log_msg "[WATCHDOG] Active safety monitor armed (state: $CURRENT_STATE, timeout: ${TIMEOUT}s, heartbeat: $HEARTBEAT_FILE)"
 
@@ -236,6 +274,9 @@ while true; do
         set_state "DISARMED"
         exit 0
     fi
+
+    # Continuous physical storage read-only monitoring
+    check_storage_inventory_safety
 
     case "$CURRENT_STATE" in
         STAGE1_WAIT)

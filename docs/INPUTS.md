@@ -12,6 +12,7 @@ The active donor operating system package used in this port is the official Oxyg
 | Field | Detail |
 | :--- | :--- |
 | **Package Filename** | `ota_full-LE2113_16.0.10.500.zip` |
+| **Package SHA-256** | `5ea5f120a2bce5eb98bd2a5d1aca872f5888903825861142bd0900772b8d0844` (7,402,464,442 bytes) |
 | **Donor Device / Architecture** | OnePlus 9 (`lemonade` / `OnePlus9_EEA`, Model `LE2113`, Snapdragon 888 / SM8350, ARM64-v8a) |
 | **Android Version** | Android 16 (`Baklava` / SDK 36) |
 | **Build ID / Fingerprint** | `BP2A.250605.015` / `LE2113_16.0.10.500(EX01)` (`OnePlus/OnePlus9_EEA/OnePlus9:16/BP2A.250605.015/1785498910198:user/release-keys`) |

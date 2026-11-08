@@ -30,10 +30,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bash lz4 bsdextrautils file gcc
 
-      - name: Validate Shell & Init Scripts Syntax (bash -n per script)
+      - name: Validate Shell & Init Scripts Syntax (bash -n and sh -n)
         run: |
           echo "Independently validating syntax for each shell and init script..."
-          SCRIPTS=(
+          ALL_SCRIPTS=(
             scripts/build_loader.sh
             scripts/build_stage1.sh
             scripts/build_stage2_erofs.sh
@@ -49,11 +49,42 @@ jobs:
             stage1/native_ramdisk/system/bin/watchdog.sh
             stage1/native_ramdisk/system/bin/recovery
           )
-          for s in "${SCRIPTS[@]}"; do
-            echo "Checking: $s"
-            bash -n "$s" || { echo "ERROR: Syntax check failed on $s"; exit 1; }
+          for s in "${ALL_SCRIPTS[@]}"; do
+            echo "Checking bash syntax: $s"
+            bash -n "$s" || { echo "ERROR: bash syntax check failed on $s"; exit 1; }
           done
-          echo "All script syntax validated successfully."
+
+          # POSIX sh syntax verification for embedded ramdisk scripts and supervisors
+          POSIX_SH_SCRIPTS=(
+            scripts/stage2_init.sh
+            scripts/watchdog.sh
+            stage1/loader_ramdisk/init
+            stage1/loader_ramdisk/system/bin/stage2_init.sh
+            stage1/loader_ramdisk/system/bin/watchdog.sh
+            stage1/native_ramdisk/init
+            stage1/native_ramdisk/system/bin/stage2_init.sh
+            stage1/native_ramdisk/system/bin/watchdog.sh
+            stage1/native_ramdisk/system/bin/recovery
+          )
+          for s in "${POSIX_SH_SCRIPTS[@]}"; do
+            echo "Checking POSIX sh syntax: $s"
+            sh -n "$s" || { echo "ERROR: POSIX sh syntax check failed on $s"; exit 1; }
+          done
+          echo "All script syntax validated successfully in bash and sh."
+
+      - name: Validate Hardware Kernel Assets Integrity
+        run: |
+          echo "Verifying authentic OnePlus 7T hardware assets..."
+          test -f stage1/kernel_src/kernel
+          test -f stage1/kernel_src/dtb
+          test -f stage1/kernel_src/recovery_dtbo
+          echo "c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129  stage1/kernel_src/kernel" | sha256sum -c -
+          echo "e4faf7c553f88246077343de51487d90517bb534e345ee44893d2e4fb348df3c  stage1/kernel_src/dtb" | sha256sum -c -
+          echo "7cfdd1984a7be7edd8ef4e761540cf32e69f1cba6a844afe6ba6780dd12223c1  stage1/kernel_src/recovery_dtbo" | sha256sum -c -
+          strings stage1/kernel_src/kernel | grep -F "4.14.357-perf-gcd3073fb68f1" >/dev/null
+          strings stage1/kernel_src/dtb | grep -F "qcom,sm8150" >/dev/null
+          strings stage1/kernel_src/recovery_dtbo | grep -F "samsung_oneplus" >/dev/null
+          echo "Hardware assets strictly verified."
 
       - name: Verify Strict Non-Destructive Invariants (Static Scan)
         run: |

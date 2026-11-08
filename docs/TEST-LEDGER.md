@@ -4,19 +4,25 @@
 
 | Test ID | Scope | Target / Subject | Verification Details | Result | Pass/Fail |
 |---|---|---|---|---|---|
-| **H0** | Script Syntax | 14 shell & init scripts | `bash -n` per script (runner, watchdog, stage2_init, ramdisk inits) | 14/14 scripts valid | **PASS** |
+| **H0** | Script Syntax | 14 shell & init scripts | `bash -n` and POSIX `sh -n` for all scripts (runner, watchdog, stage2_init, ramdisk inits, recovery) | 14/14 scripts valid under both bash and sh | **PASS** |
 | **H1** | Invariant Scan | Repository codebase | Static scan for forbidden `fastboot flash/erase/format`, `mkfs.ext4 /dev/block` | Zero violations detected | **PASS** |
 | **H2** | Go Helper Unit Tests | `src/binderfs_init.go` | 15 Go tests: Linux dev_t mkdev encoding, major 1 rejection (/dev/null, /dev/zero), BINDER_VERSION ioctl, collision-resistant temp paths, atomic replacement, rollback ownership, safeSymlink, idempotency | 15/15 Go tests pass | **PASS** |
-| **H3** | ARM64 Compilation | `src/binderfs_init_arm64` | Cross-compiled static ELF 64-bit ARM aarch64 with stripped symbols (SHA-256: `a2bec3dac63b6fd26fa0d59bb00ae9f660812fd89ed98ed8ad9af3345d068f76`) | Verified static ELF aarch64 | **PASS** |
+| **H3** | ARM64 Compilation | `src/binderfs_init_arm64` | Cross-compiled static ELF 64-bit ARM aarch64 with stripped symbols | Verified static ELF aarch64 | **PASS** |
 | **H4** | C Reference Test | `src/binderfs_init.c` | Strict gcc compilation (-Wall -Wextra -Werror -pedantic) | Clean compilation | **PASS** |
 | **H5** | Embedded Consistency | Ramdisk binaries & scripts | `cmp -s` across `loader_ramdisk`, `native_ramdisk`, and source files | All embedded files byte-identical | **PASS** |
 | **H6** | APEX Metadata Tests | `tests/test_apex_info.py` | 26 unit tests: varint tags, wire types, duplicate fields, ZIP limits, XML schema validation, tag 11 provideSharedApexLibs, active mounts | 26/26 tests pass | **PASS** |
 | **H7** | Watchdog Unit Tests | `tests/test_watchdog.py` | 22 unit tests: numeric parsing, timeout arithmetic bounds, ADB disconnect, prop fail, config bounds | 22/22 tests pass | **PASS** |
 | **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 67 integration tests: RAM accounting, 4-field PARTITION_MAP contract, product mapping, APEX staging, fail-closed SELinux checks | 67/67 tests pass | **PASS** |
 | **H9** | Safe ADB & Fastboot Tests | `tests/test_safe_*.py` | 11 tests: command interception, metacharacter protection, flash bans (8 ADB + 3 Fastboot) | 11/11 tests pass | **PASS** |
-| **H10** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets | 29/29 Passed, 0 Failed | **PASS** |
-| **H11** | Packaged Loader Audit | `build/loader.img` | SHA-256: `dfb5e2e67896143b47aa062f84ae3245cb7a27118ee11be1c61cfa3bb781e435` | 31/31 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `6981068924f56a687ad351c9f2e045200d8f766c828f45b02eb796e0053c704e` | 31/31 Passed, 0 Failed | **PASS** |
+| **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 12 tests: multi-disk sysfs discovery, child partitions, major:minor parsing, fail-closed mknod, blockdev ro=1, newly appearing partitions, disappearing device abort, multi-checkpoint revalidation | 12/12 tests pass | **PASS** |
+| **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (31 checks per directory) | 31/31 Passed, 0 Failed | **PASS** |
+| **H12** | Packaged Loader Audit | `build/loader.img` | SHA-256: `ba58599d17de58d2668f4e871669664669852cab4e9484c2b6973994e333161b` (33 static & handover checks) | 33/33 Passed, 0 Failed | **PASS** |
+| **H13** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `edcd45f0d8594c38ef6f0982b2eee5345ecd247b20de92773231b61dfecbb33a` (33 static & handover checks) | 33/33 Passed, 0 Failed | **PASS** |
+| **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`) | Strict SHA-256 and symbol match | **PASS** |
+
+Total automated Python test suite: **138 tests**, 100% pass rate.
+Total Go test suite: **15 tests**, 100% pass rate.
+Total pre-boot auditor checks on packaged boot images: **33 checks**, 0 failures.
 
 ## 2. Physical Device Bring-Up Stages (OnePlus 7T Hardware)
 
