@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -408,3 +409,98 @@ func TestProcFilesystemsAndMountsParsing(t *testing.T) {
 		t.Errorf("Expected isBinderfsMounted to return false for unmounted path")
 	}
 }
+
+func TestRejectFakeBinderNull(t *testing.T) {
+	tmpDir := t.TempDir()
+	devDir := filepath.Join(tmpDir, "dev")
+	mountDir := filepath.Join(devDir, "binderfs")
+	sysDir := filepath.Join(tmpDir, "sys")
+	procDir := filepath.Join(tmpDir, "proc")
+
+	os.MkdirAll(mountDir, 0755)
+	os.MkdirAll(filepath.Join(sysDir, "class/misc"), 0755)
+	os.MkdirAll(procDir, 0755)
+
+	os.WriteFile(filepath.Join(procDir, "filesystems"), []byte("nodev\tbinder\n"), 0644)
+	os.WriteFile(filepath.Join(procDir, "mounts"), []byte("binder /dev/binderfs binder rw,relatime 0 0\n"), 0644)
+
+	// Direct call to validateOrCreateLegacyNode with major 1 must fail
+	fakeBinderPath := filepath.Join(devDir, "binder")
+	_, err := validateOrCreateLegacyNode(fakeBinderPath, 1, 3, true)
+	if err == nil {
+		t.Fatalf("Expected validateOrCreateLegacyNode to reject major 1 (/dev/null), got nil")
+	}
+
+	// Symlink pointing to real /dev/null must be rejected
+	nullSymlink := filepath.Join(devDir, "null_symlink")
+	if err := os.Symlink("/dev/null", nullSymlink); err == nil {
+		_, err := validateOrCreateLegacyNode(nullSymlink, 10, 237, true)
+		if err == nil {
+			t.Fatalf("Expected validateOrCreateLegacyNode to reject symlink pointing to /dev/null, got nil")
+		}
+	}
+}
+
+func TestRejectFakeBinderZero(t *testing.T) {
+	tmpDir := t.TempDir()
+	devDir := filepath.Join(tmpDir, "dev")
+
+	// Direct call to validateOrCreateLegacyNode with major 1 minor 5 must fail
+	fakeZeroPath := filepath.Join(devDir, "zero_binder")
+	_, err := validateOrCreateLegacyNode(fakeZeroPath, 1, 5, true)
+	if err == nil {
+		t.Fatalf("Expected validateOrCreateLegacyNode to reject major 1 minor 5 (/dev/zero), got nil")
+	}
+
+	// Symlink pointing to real /dev/zero must be rejected
+	zeroSymlink := filepath.Join(devDir, "zero_symlink")
+	if err := os.Symlink("/dev/zero", zeroSymlink); err == nil {
+		_, err := validateOrCreateLegacyNode(zeroSymlink, 10, 237, true)
+		if err == nil {
+			t.Fatalf("Expected validateOrCreateLegacyNode to reject symlink pointing to /dev/zero, got nil")
+		}
+	}
+}
+
+func TestRejectConflictingDeviceNumbers(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Real char device /dev/null has major 1, minor 3
+	// Testing with a mismatch in minor/major
+	if _, err := os.Stat("/dev/null"); err == nil {
+		// Try validateOrCreateLegacyNode targeting /dev/null with diff rdev
+		_, err := validateOrCreateLegacyNode("/dev/null", 10, 237, true)
+		if err == nil {
+			t.Fatalf("Expected error when targeting /dev/null with conflicting rdev, got nil")
+		}
+	}
+
+	// Also test with regular file pretending to be wrong device
+	filePath := filepath.Join(tmpDir, "wrong_dev")
+	os.WriteFile(filePath, []byte("wrong"), 0644)
+	_, err := validateOrCreateLegacyNode(filePath, 10, 237, false)
+	if err == nil {
+		t.Fatalf("Expected validateOrCreateLegacyNode to fail for regular file in non-test mode")
+	}
+}
+
+func TestCollisionResistantTempPath(t *testing.T) {
+	basePath := "/tmp/test_node"
+	path1 := generateCollisionResistantTempPath(basePath)
+	path2 := generateCollisionResistantTempPath(basePath)
+
+	if path1 == path2 {
+		t.Fatalf("Generated identical temp paths: %s and %s", path1, path2)
+	}
+	if !filepath.IsAbs(path1) || !filepath.IsAbs(path2) {
+		t.Fatalf("Expected absolute paths, got %s and %s", path1, path2)
+	}
+	pidStr := fmt.Sprintf(".%d.", os.Getpid())
+	if !filepath.HasPrefix(filepath.Base(path1), filepath.Base(basePath)+".tmp.") {
+		t.Errorf("Path %s does not have expected prefix", path1)
+	}
+	if !filepath.HasPrefix(filepath.Base(path2), filepath.Base(basePath)+".tmp.") {
+		t.Errorf("Path %s does not have expected prefix", path2)
+	}
+	_ = pidStr
+}
+

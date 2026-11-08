@@ -407,6 +407,13 @@ extract_and_stage_apex() {
     # Extract authentic APEX version code from manifest without silent fallback
     local expected_pkg="com.android.${apex_id}"
     echo " -> Extracting and validating manifest metadata via tools/extract_apex_info.py..."
+    local pkg_name
+    if ! pkg_name=$(python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --name-only); then
+        echo "CRITICAL BUILD ERROR: APEX package name extraction failed for $target_pkg!" >&2
+        exit 1
+    fi
+    pkg_name=$(echo "$pkg_name" | tr -d '[:space:]')
+
     local pkg_version
     if ! pkg_version=$(python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --expect-package "$expected_pkg" --version-only); then
         echo "CRITICAL BUILD ERROR: APEX manifest extraction failed for $target_pkg ($expected_pkg)!" >&2
@@ -418,6 +425,13 @@ extract_and_stage_apex() {
         echo "CRITICAL BUILD ERROR: APEX version code for $target_pkg is invalid or non-numeric: '$pkg_version'!" >&2
         exit 1
     fi
+
+    # Output authentic extended metadata files
+    python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --output-version-name "$STAGING_DIR/${output_base}.version_name"
+    python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --output-shared-libs "$STAGING_DIR/${output_base}.provide_shared_libs"
+    echo "$pkg_name" > "$STAGING_DIR/${output_base}.package"
+    echo "/system/apex/$(basename "$target_pkg")" > "$STAGING_DIR/${output_base}.preinstalled_path"
+    echo "SYSTEM" > "$STAGING_DIR/${output_base}.partition"
 
     # Measure expanded payload uncompressed size for accurate RAM budgeting
     local exp_size=0
@@ -518,9 +532,33 @@ MANDATORY_OUTPUTS=(
     "art_apex.img"
     "i18n_apex.img"
     "tzdata_apex.img"
+    "runtime_apex.version"
+    "runtime_apex.version_name"
+    "runtime_apex.package"
+    "runtime_apex.preinstalled_path"
+    "runtime_apex.provide_shared_libs"
+    "runtime_apex.partition"
     "runtime_apex.expanded_size"
+    "art_apex.version"
+    "art_apex.version_name"
+    "art_apex.package"
+    "art_apex.preinstalled_path"
+    "art_apex.provide_shared_libs"
+    "art_apex.partition"
     "art_apex.expanded_size"
+    "i18n_apex.version"
+    "i18n_apex.version_name"
+    "i18n_apex.package"
+    "i18n_apex.preinstalled_path"
+    "i18n_apex.provide_shared_libs"
+    "i18n_apex.partition"
     "i18n_apex.expanded_size"
+    "tzdata_apex.version"
+    "tzdata_apex.version_name"
+    "tzdata_apex.package"
+    "tzdata_apex.preinstalled_path"
+    "tzdata_apex.provide_shared_libs"
+    "tzdata_apex.partition"
     "tzdata_apex.expanded_size"
     "PARTITION_MAP"
 )
@@ -534,7 +572,7 @@ done
 
 # Generate SHA256 checksums in staging directory
 echo "Generating and verifying SHA256SUMS in staging..."
-(cd "$STAGING_DIR" && sha256sum *.img *.fstype *.version *.expanded_size PARTITION_MAP > SHA256SUMS)
+(cd "$STAGING_DIR" && sha256sum *.img *.fstype *.version *.version_name *.package *.preinstalled_path *.provide_shared_libs *.partition *.expanded_size PARTITION_MAP > SHA256SUMS)
 (cd "$STAGING_DIR" && sha256sum -c SHA256SUMS >/dev/null 2>&1) || {
     echo "CRITICAL BUILD ERROR: Checksum validation failed in staging!" >&2
     exit 1

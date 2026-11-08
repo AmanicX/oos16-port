@@ -39,8 +39,26 @@ The authentic in-kernel configuration stream (`IKCONFIG`) was decompressed and a
 
 ---
 
-## 4. Architectural Verification Conclusions
+## 4. APEX Kernel Requirements & Command-Line Audit
+
+Android APEX runtime activation requires specific block, cryptographic, and loop device driver features:
+
+| APEX Requirement | Symbol / Parameter | Value in Kernel / Cmdline | Evaluation |
+|:---|:---|:---|:---|
+| **Asynchronous I/O** | `CONFIG_AIO` | `=y` | **PASS**. Built-in. Required by `apexd` for asynchronous block device operations. |
+| **Loop Device Driver** | `CONFIG_BLK_DEV_LOOP` | `=y` | **PASS**. Built-in. Required for loop-mounting APEX filesystem payloads. |
+| **Loop Device Min Count** | `CONFIG_BLK_DEV_LOOP_MIN_COUNT` | `16` | **PASS**. Pre-allocates 16 loop devices (`/dev/loop0`..`/dev/loop15`), sufficient for 6 partitions + 4 APEXes + staging headroom. |
+| **Crypto SHA-1** | `CONFIG_CRYPTO_SHA1` | `=y` | **PASS**. Built-in (`CONFIG_CRYPTO_SHA1_ARM64_CE=y` hardware accelerated). |
+| **Crypto SHA-256** | `CONFIG_CRYPTO_SHA256` | `=y` | **PASS**. Built-in (`CONFIG_CRYPTO_SHA256_ARM64=y` hardware accelerated). Required for dm-verity hash verification. |
+| **Device Mapper Verity** | `CONFIG_DM_VERITY` | `=y` | **PASS**. Built-in with `CONFIG_DM_VERITY_FEC=y` and `CONFIG_FS_VERITY=y`. Kernel supports dm-verity targets. |
+| **Kernel Cmdline: max_loop** | `loop.max_loop` | `Not set` | **PASS**. AOSP APEX specification mandates `loop.max_loop` must NOT be set to prevent artificial ceiling on loop allocations. |
+| **Kernel Cmdline: max_part** | `loop.max_part` | `7` | **PASS**. AOSP APEX specification mandates `loop.max_part` must be 0 or 7 (or unset). Verified `loop.max_part=7` across both loader and stage1 boot cmdlines. |
+
+---
+
+## 5. Architectural Verification Conclusions
 
 1. **Full Read-Only RAM Feasibility**: The kernel has all required filesystems (`erofs`, `overlayfs`, `tmpfs`) compiled directly into the monolithic kernel image (`=y`), meaning no external kernel modules (`.ko`) need to be loaded during Stage 1 or Stage 2 to mount compressed EROFS images or construct the OverlayFS hierarchy.
 2. **Device Nodes & devtmpfs**: Because `CONFIG_DEVTMPFS` is not set, the userspace supervisor must mount tmpfs on `/dev` and populate essential nodes (`null`, `zero`, `ptmx`, `kmsg`, `loop-control`, `loop0..15`, `dri/card0`, `kgsl-3d0`, etc.) before Android init handover. This is fully implemented and verified in `stage1/loader_ramdisk/init` and `scripts/stage2_init.sh`.
 3. **IPC Compatibility**: Both `CONFIG_ANDROID_BINDERFS=y` and `CONFIG_ANDROID_BINDER_IPC=y` are present, enabling transactional BinderFS initialization with fallback to traditional Binder nodes.
+4. **APEX Execution Model**: All kernel prerequisites for loop-backed APEX payloads and dm-verity (`CONFIG_AIO=y`, `CONFIG_BLK_DEV_LOOP=y`, `CONFIG_DM_VERITY=y`, `CONFIG_CRYPTO_SHA256=y`, `loop.max_part=7`, unset `loop.max_loop`) are verified built-in. Direct loop mounting of APEX payload images (`runtime_apex.img`, `art_apex.img`, `i18n_apex.img`, `tzdata_apex.img`) preserves authentic filesystem xattrs, SELinux labels, and permissions without copying into tmpfs.

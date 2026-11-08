@@ -12,6 +12,7 @@ Tests:
 8. Watchdog timeout and heartbeat recovery behavior.
 """
 
+import hashlib
 import unittest
 import os
 import sys
@@ -295,14 +296,18 @@ sys.exit(0)
                 f.write("1\n")
             with open(os.path.join(img_dir, f"{apex}.expanded_size"), "w") as f:
                 f.write("20971520\n")
+        def get_sha(fname):
+            with open(os.path.join(img_dir, fname), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
         with open(os.path.join(img_dir, "PARTITION_MAP"), "w") as f:
             f.write(
-                "system.erofs.img:/mnt/sysroot:mandatory\n"
-                "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
-                "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
-                "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
-                "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
-                "my_region.erofs.img:/mnt/sysroot/my_region:optional\n"
+                f"system.erofs.img:/mnt/sysroot:mandatory:{get_sha('system.erofs.img')}\n"
+                f"system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:{get_sha('system_ext.erofs.img')}\n"
+                f"vendor.erofs.img:/mnt/sysroot/vendor:mandatory:{get_sha('vendor.erofs.img')}\n"
+                f"odm.erofs.img:/mnt/sysroot/odm:mandatory:{get_sha('odm.erofs.img')}\n"
+                f"my_product.erofs.img:/mnt/sysroot/my_product:mandatory:{get_sha('my_product.erofs.img')}\n"
+                f"my_region.erofs.img:/mnt/sysroot/my_region:optional:{get_sha('my_region.erofs.img')}\n"
             )
 
     def run_stage2_runner(self, images_dir, mock_adb):
@@ -1228,8 +1233,22 @@ exit 1
             f.write(identical_data)
         with open(os.path.join(test_images, "product.erofs.img"), "wb") as f:
             f.write(identical_data)
-        with open(os.path.join(test_images, "PARTITION_MAP"), "a") as f:
-            f.write("product.erofs.img:/mnt/sysroot/product:mandatory\n")
+        ident_sha = hashlib.sha256(identical_data).hexdigest()
+
+        def get_sha(fname):
+            with open(os.path.join(test_images, fname), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        with open(os.path.join(test_images, "PARTITION_MAP"), "w") as f:
+            f.write(
+                f"system.erofs.img:/mnt/sysroot:mandatory:{get_sha('system.erofs.img')}\n"
+                f"system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:{get_sha('system_ext.erofs.img')}\n"
+                f"vendor.erofs.img:/mnt/sysroot/vendor:mandatory:{get_sha('vendor.erofs.img')}\n"
+                f"odm.erofs.img:/mnt/sysroot/odm:mandatory:{get_sha('odm.erofs.img')}\n"
+                f"my_product.erofs.img:/mnt/sysroot/my_product:mandatory:{ident_sha}\n"
+                f"product.erofs.img:/mnt/sysroot/product:mandatory:{ident_sha}\n"
+                f"my_region.erofs.img:/mnt/sysroot/my_region:optional:{get_sha('my_region.erofs.img')}\n"
+            )
 
         mock_adb = self.create_mock_adb({"ro_status": "1"})
         res = self.run_stage2_runner(test_images, mock_adb)
@@ -1245,8 +1264,23 @@ exit 1
             f.write(b"MY_PRODUCT_CONTENT_UNIQUE")
         with open(os.path.join(test_images, "product.erofs.img"), "wb") as f:
             f.write(b"PRODUCT_CONTENT_UNIQUE")
-        with open(os.path.join(test_images, "PARTITION_MAP"), "a") as f:
-            f.write("product.erofs.img:/mnt/sysroot/product:mandatory\n")
+        my_sha = hashlib.sha256(b"MY_PRODUCT_CONTENT_UNIQUE").hexdigest()
+        p_sha = hashlib.sha256(b"PRODUCT_CONTENT_UNIQUE").hexdigest()
+
+        def get_sha(fname):
+            with open(os.path.join(test_images, fname), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        with open(os.path.join(test_images, "PARTITION_MAP"), "w") as f:
+            f.write(
+                f"system.erofs.img:/mnt/sysroot:mandatory:{get_sha('system.erofs.img')}\n"
+                f"system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:{get_sha('system_ext.erofs.img')}\n"
+                f"vendor.erofs.img:/mnt/sysroot/vendor:mandatory:{get_sha('vendor.erofs.img')}\n"
+                f"odm.erofs.img:/mnt/sysroot/odm:mandatory:{get_sha('odm.erofs.img')}\n"
+                f"my_product.erofs.img:/mnt/sysroot/my_product:mandatory:{my_sha}\n"
+                f"product.erofs.img:/mnt/sysroot/product:mandatory:{p_sha}\n"
+                f"my_region.erofs.img:/mnt/sysroot/my_region:optional:{get_sha('my_region.erofs.img')}\n"
+            )
 
         mock_adb = self.create_mock_adb({
             "ro_status": "1",
@@ -1394,27 +1428,68 @@ exec "$@"
     def test_stage2_manifest_validation_success(self):
         """Verify authoritative PARTITION_MAP strictly succeeds with full valid mapping."""
         valid_map = (
-            "system.erofs.img:/mnt/sysroot:mandatory\n"
-            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
-            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
-            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
-            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
-            "my_region.erofs.img:/mnt/sysroot/my_region:optional\n"
+            "system.erofs.img:/mnt/sysroot:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "my_region.erofs.img:/mnt/sysroot/my_region:optional:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
         )
         res = self.run_stage2_manifest_check(valid_map)
         self.assertEqual(res.returncode, 0, f"Failed: {res.stdout}\n{res.stderr}")
         self.assertIn("Partition manifest", res.stdout)
         self.assertIn("strictly validated", res.stdout)
 
+    def test_stage2_manifest_missing_sha256_fatal(self):
+        """Verify manifest parser rejects entries missing the mandatory 4th SHA-256 field."""
+        invalid_map = (
+            "system.erofs.img:/mnt/sysroot:mandatory\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        )
+        res = self.run_stage2_manifest_check(invalid_map)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("must have exactly 4 fields separated by 3 colons", res.stderr)
+
+    def test_stage2_manifest_invalid_sha256_hex_fatal(self):
+        """Verify manifest parser rejects malformed non-64-hex SHA-256 checksums."""
+        invalid_map = (
+            "system.erofs.img:/mnt/sysroot:mandatory:not-a-valid-sha256\n"
+        )
+        res = self.run_stage2_manifest_check(invalid_map)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("Invalid 64-hex SHA-256 checksum", res.stderr)
+
+    def test_stage2_manifest_path_traversal_fatal(self):
+        """Verify manifest parser rejects path traversal attempts in image filename."""
+        invalid_map = (
+            "../system.erofs.img:/mnt/sysroot:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        )
+        res = self.run_stage2_manifest_check(invalid_map)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("must be safe basename without path traversal", res.stderr)
+
+    def test_stage2_manifest_mandatory_target_marked_optional_fatal(self):
+        """Verify manifest parser rejects core partition targets marked as optional."""
+        invalid_map = (
+            "system.erofs.img:/mnt/sysroot:optional:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        )
+        res = self.run_stage2_manifest_check(invalid_map)
+        self.assertEqual(res.returncode, 42)
+        self.assertIn("must have nature 'mandatory'", res.stderr)
+
     def test_stage2_manifest_disallowed_target_fatal(self):
         """Verify manifest parser rejects mountpoints not present in explicit allowlist."""
         invalid_map = (
-            "system.erofs.img:/mnt/sysroot:mandatory\n"
-            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
-            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
-            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
-            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
-            "evil.img:/mnt/sysroot/evil_dir:mandatory\n"
+            "system.erofs.img:/mnt/sysroot:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "evil.img:/mnt/sysroot/evil_dir:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
         )
         res = self.run_stage2_manifest_check(invalid_map)
         self.assertEqual(res.returncode, 42)
@@ -1423,10 +1498,10 @@ exec "$@"
     def test_stage2_manifest_missing_mandatory_mapping_fatal(self):
         """Verify manifest parser halts fail-closed if mandatory partition (e.g. vendor) is missing."""
         missing_vendor_map = (
-            "system.erofs.img:/mnt/sysroot:mandatory\n"
-            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
-            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
-            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
+            "system.erofs.img:/mnt/sysroot:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
         )
         res = self.run_stage2_manifest_check(missing_vendor_map)
         self.assertEqual(res.returncode, 42)
@@ -1435,12 +1510,12 @@ exec "$@"
     def test_stage2_manifest_duplicate_target_fatal(self):
         """Verify manifest parser rejects duplicate target mountpoints."""
         dup_target_map = (
-            "system.erofs.img:/mnt/sysroot:mandatory\n"
-            "system2.erofs.img:/mnt/sysroot:mandatory\n"
-            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory\n"
-            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory\n"
-            "odm.erofs.img:/mnt/sysroot/odm:mandatory\n"
-            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory\n"
+            "system.erofs.img:/mnt/sysroot:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "system2.erofs.img:/mnt/sysroot:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "system_ext.erofs.img:/mnt/sysroot/system_ext:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "vendor.erofs.img:/mnt/sysroot/vendor:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "odm.erofs.img:/mnt/sysroot/odm:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "my_product.erofs.img:/mnt/sysroot/my_product:mandatory:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
         )
         res = self.run_stage2_manifest_check(dup_target_map)
         self.assertEqual(res.returncode, 42)

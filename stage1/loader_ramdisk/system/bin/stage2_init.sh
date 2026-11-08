@@ -173,17 +173,17 @@ validate_device_ram() {
     local exp_apex_mb=$(( (total_exp_apex_bytes + 1048575) / 1048576 ))
 
     # 5. Future RAM allocations model:
-    # Staged images in /mnt are already counted by kernel VM.
+    # Staged images in /mnt tmpfs are already counted by kernel VM.
     # Future allocations:
-    # - Expanded APEX tmpfs:           exp_apex_mb
+    # - Direct APEX loop mount buffer: 64 MB (direct loop backed, no duplicate copy)
     # - Ephemeral /data tmpfs:         1024 MB
     # - OverlayFS upper/work on tmpfs: 512 MB
     # - Kernel, GPU, display runtime:  1536 MB
     # - Safety headroom:               256 MB
-    local future_ram_req_mb=$((exp_apex_mb + 1024 + 512 + 1536 + 256))
+    local future_ram_req_mb=$((64 + 1024 + 512 + 1536 + 256))
 
     if [ "$dev_mem_avail_mb" -lt "$future_ram_req_mb" ]; then
-        fatal "Device-side RAM check: Insufficient device RAM! MemAvailable is ${dev_mem_avail_mb}MB, but future bringup allocations require ${future_ram_req_mb}MB (APEX: ${exp_apex_mb}MB, /data: 1024MB, overlay: 512MB, runtime: 1536MB, buffer: 256MB). Halting."
+        fatal "Device-side RAM check: Insufficient device RAM! MemAvailable is ${dev_mem_avail_mb}MB, but future bringup allocations require ${future_ram_req_mb}MB (APEX loop buffer: 64MB, /data: 1024MB, overlay: 512MB, runtime: 1536MB, buffer: 256MB). Halting."
     fi
     log_msg "[STAGE2] Device-side total RAM verified: ${dev_mem_avail_mb}MB available >= ${future_ram_req_mb}MB future required."
 }
@@ -215,13 +215,29 @@ parse_and_validate_partition_map() {
             ''|\#*) continue ;;
         esac
 
+        # Strict contract: image_filename:target_mountpoint:nature:sha256 (exactly 4 fields, 3 colons)
+        local num_colons=$(echo "$trimmed" | tr -cd ':' | wc -c)
+        if [ "$num_colons" -ne 3 ]; then
+            fatal "Malformed manifest entry in $map_file: '$line' (must have exactly 4 fields separated by 3 colons)"
+        fi
+
         local img=$(echo "$trimmed" | cut -d: -f1 | tr -d '[:space:]')
         local target=$(echo "$trimmed" | cut -d: -f2 | tr -d '[:space:]')
         local nature=$(echo "$trimmed" | cut -d: -f3 | tr -d '[:space:]')
         local sha=$(echo "$trimmed" | cut -d: -f4 | tr -d '[:space:]')
 
-        if [ -z "$img" ] || [ -z "$target" ] || [ -z "$nature" ]; then
-            fatal "Malformed manifest entry in $map_file: '$line' (expected image:target:nature[:sha256])"
+        if [ -z "$img" ] || [ -z "$target" ] || [ -z "$nature" ] || [ -z "$sha" ]; then
+            fatal "Malformed manifest entry in $map_file: '$line' (empty field detected)"
+        fi
+
+        # Safe basename validation: reject path traversal, slashes, or special characters
+        if [ "$img" != "$(basename "$img")" ] || echo "$img" | grep -qE '/|\.\.'; then
+            fatal "Unsafe image filename '$img' in manifest entry '$line' (must be safe basename without path traversal)"
+        fi
+
+        # Strict 64-hex SHA-256 enforcement
+        if ! echo "$sha" | grep -qE '^[0-9a-fA-F]{64}$'; then
+            fatal "Invalid 64-hex SHA-256 checksum '$sha' in manifest entry '$line'"
         fi
 
         # Validate target against allowlist
@@ -234,6 +250,15 @@ parse_and_validate_partition_map() {
         if [ "$nature" != "mandatory" ] && [ "$nature" != "optional" ]; then
             fatal "Invalid partition nature '$nature' in manifest entry '$line' (must be 'mandatory' or 'optional')"
         fi
+
+        # Core partition targets MUST be marked mandatory
+        case "$target" in
+            /mnt/sysroot|/mnt/sysroot/system_ext|/mnt/sysroot/vendor|/mnt/sysroot/odm)
+                if [ "$nature" != "mandatory" ]; then
+                    fatal "Core partition target '$target' must have nature 'mandatory' in $map_file!"
+                fi
+                ;;
+        esac
 
         # Check duplicate target mountpoints
         case " $SEEN_TARGETS " in
@@ -579,6 +604,46 @@ populate_apex() {
         [ -z "$fstype" ] && fstype="erofs"
     fi
 
+    local base_name="${img_name%.img}"
+    local mod_pkg="$mod_name"
+    if [ -f "/mnt/${base_name}.package" ]; then
+        mod_pkg=$(cat "/mnt/${base_name}.package" | tr -d '[:space:]')
+    elif [ -f "/tmp/${base_name}.package" ]; then
+        mod_pkg=$(cat "/tmp/${base_name}.package" | tr -d '[:space:]')
+    fi
+
+    local mod_ver="$version"
+    local mod_ver_name=""
+    if [ -f "/mnt/${base_name}.version_name" ]; then
+        mod_ver_name=$(cat "/mnt/${base_name}.version_name" | tr -d '[:space:]')
+    elif [ -f "/tmp/${base_name}.version_name" ]; then
+        mod_ver_name=$(cat "/tmp/${base_name}.version_name" | tr -d '[:space:]')
+    fi
+
+    local mod_preinstalled="/system/apex/${mod_pkg}.apex"
+    if [ -f "/mnt/${base_name}.preinstalled_path" ]; then
+        mod_preinstalled=$(cat "/mnt/${base_name}.preinstalled_path" | tr -d '[:space:]')
+    elif [ -f "/tmp/${base_name}.preinstalled_path" ]; then
+        mod_preinstalled=$(cat "/tmp/${base_name}.preinstalled_path" | tr -d '[:space:]')
+    fi
+
+    local mod_shared_libs="false"
+    if [ -f "/mnt/${base_name}.provide_shared_libs" ]; then
+        mod_shared_libs=$(cat "/mnt/${base_name}.provide_shared_libs" | tr -d '[:space:]')
+    elif [ -f "/tmp/${base_name}.provide_shared_libs" ]; then
+        mod_shared_libs=$(cat "/tmp/${base_name}.provide_shared_libs" | tr -d '[:space:]')
+    fi
+
+    local mod_part="SYSTEM"
+    if [ -f "/mnt/${base_name}.partition" ]; then
+        mod_part=$(cat "/mnt/${base_name}.partition" | tr -d '[:space:]')
+    elif [ -f "/tmp/${base_name}.partition" ]; then
+        mod_part=$(cat "/tmp/${base_name}.partition" | tr -d '[:space:]')
+    fi
+
+    [ -n "$mod_pkg" ] && mod_name="$mod_pkg"
+    [ -n "$mod_ver" ] && version="$mod_ver"
+
     # Canonical AOSP structure:
     # Versioned payload directory: /mnt/sysroot/apex/${mod_name}@${version}
     # Active APEX mountpoint:      /mnt/sysroot/apex/${mod_name} (bind-mounted to versioned dir)
@@ -586,56 +651,15 @@ populate_apex() {
     local active_mount="/mnt/sysroot/apex/${mod_name}"
 
     /system/bin/toybox mkdir -p "$versioned_dir" "$active_mount"
-    /system/bin/toybox mkdir -p "/tmp/apex_stage_${mod_name}"
 
-    echo "[STAGE2] Staging $mod_name to $versioned_dir from image $img_path (fstype: $fstype, version: $version)..." > /dev/kmsg
-    if ! try_mount -t "$fstype" -o ro,loop "$img_path" "/tmp/apex_stage_${mod_name}"; then
+    echo "[STAGE2] Direct loop mounting $mod_name payload to $versioned_dir from $img_path (fstype: $fstype, version: $version)..." > /dev/kmsg
+    if ! try_mount -t "$fstype" -o ro,loop "$img_path" "$versioned_dir"; then
         fatal "Failed to mount $mod_name payload image from $img_path with filesystem $fstype!"
     fi
 
-    # Pre-copy RAM capacity verification for this APEX module (Strict fail-closed)
-    local exp_meta_file="/mnt/${img_name%.img}.expanded_size"
-    [ -f "$exp_meta_file" ] || exp_meta_file="/tmp/${img_name%.img}.expanded_size"
-    if [ ! -f "$exp_meta_file" ] || [ ! -s "$exp_meta_file" ]; then
-        fatal "APEX staging for $mod_name: Missing mandatory metadata $exp_meta_file!"
-    fi
-    local mod_exp_bytes
-    mod_exp_bytes=$(cat "$exp_meta_file" 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
-    case "$mod_exp_bytes" in
-        ''|*[!0-9]*)
-            fatal "APEX staging for $mod_name: Malformed non-numeric expanded size in $exp_meta_file: '$mod_exp_bytes'!" ;;
-    esac
-    if [ "$mod_exp_bytes" -le 0 ]; then
-        fatal "APEX staging for $mod_name: Invalid non-positive expanded size in $exp_meta_file: $mod_exp_bytes bytes!"
-    fi
-
-    if ! /system/bin/toybox mount | grep -q " /mnt/sysroot/apex type tmpfs "; then
-        fatal "APEX staging for $mod_name: /mnt/sysroot/apex is NOT mounted as tmpfs!"
-    fi
-
-    local apex_df_out
-    apex_df_out=$(/system/bin/toybox df -k /mnt/sysroot/apex 2>/dev/null || true)
-    if [ -z "$apex_df_out" ]; then
-        fatal "APEX staging for $mod_name: df -k /mnt/sysroot/apex returned empty output! Failing closed."
-    fi
-    local apex_free_kb
-    apex_free_kb=$(echo "$apex_df_out" | /system/bin/toybox awk 'NR>1 {print $4}' | /system/bin/toybox tr -d '[:space:]')
-    case "$apex_free_kb" in
-        ''|*[!0-9]*)
-            fatal "APEX staging for $mod_name: Failed to parse numeric free capacity from df ('$apex_df_out')! Failing closed." ;;
-    esac
-    local apex_free_bytes=$(( apex_free_kb * 1024 ))
-    local required_apex_bytes=$(( mod_exp_bytes + 5242880 ))
-
-    if [ "$apex_free_bytes" -lt "$required_apex_bytes" ]; then
-        fatal "APEX staging for $mod_name: Insufficient free capacity in /mnt/sysroot/apex tmpfs! Free: ${apex_free_bytes} bytes, required: ${required_apex_bytes} bytes. Halting."
-    fi
-
-    /system/bin/toybox cp -a "/tmp/apex_stage_${mod_name}"/* "$versioned_dir/" || fatal "Failed to copy $mod_name payload to $versioned_dir!"
-    /system/bin/toybox umount "/tmp/apex_stage_${mod_name}" 2>/dev/null || true
-
-    if [ -z "$(/system/bin/toybox ls -A "$versioned_dir" 2>/dev/null)" ]; then
-        fatal "APEX staging for $mod_name: Payload directory $versioned_dir is empty after copy!"
+    # Verify versioned mount in /proc/mounts
+    if ! /system/bin/toybox grep -q " $versioned_dir " /proc/mounts 2>/dev/null; then
+        fatal "Direct loop mount verification failed for $versioned_dir in /proc/mounts!"
     fi
 
     # Establish canonical active bind mount (Android 13+ standard)
@@ -645,12 +669,27 @@ populate_apex() {
     fi
 
     # Establish backward-compatibility convenience link @1 if version != 1
-    if [ "$version" != "1" ]; then
-        /system/bin/toybox rm -rf "/mnt/sysroot/apex/${mod_name}@1" 2>/dev/null || true
-        (cd /mnt/sysroot/apex && /system/bin/toybox ln -sfn "${mod_name}@${version}" "${mod_name}@1" 2>/dev/null || true)
+    if [ "$mod_ver" != "1" ]; then
+        /system/bin/toybox rm -rf "/mnt/sysroot/apex/${mod_pkg}@1" 2>/dev/null || true
+        (cd /mnt/sysroot/apex && /system/bin/toybox ln -sfn "${mod_pkg}@${mod_ver}" "${mod_pkg}@1" 2>/dev/null || true)
     fi
 
-    echo "[STAGE2] Verified active APEX mount: $active_mount -> $versioned_dir (version: $version)" > /dev/kmsg
+    echo "[STAGE2] Verified authentic active APEX loop mount: $active_mount -> $versioned_dir (version: $mod_ver)" > /dev/kmsg
+}
+
+# Helper to read APEX metadata or use defaults
+get_apex_meta() {
+    local base="$1"
+    local ext="$2"
+    local def="$3"
+    local f="/mnt/${base}.${ext}"
+    [ -f "$f" ] || f="/tmp/${base}.${ext}"
+    if [ -f "$f" ]; then
+        local v
+        v=$(cat "$f" 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
+        [ -n "$v" ] && { echo "$v"; return; }
+    fi
+    echo "$def"
 }
 
 # Populate All 4 Mandatory Bootstrap APEX Modules
@@ -659,18 +698,24 @@ populate_apex "com.android.art" "art_apex.img" 1
 populate_apex "com.android.i18n" "i18n_apex.img" 1
 populate_apex "com.android.tzdata" "tzdata_apex.img" 1
 
-# Generate canonical active APEX info list for Android 16 userspace
-cat > /mnt/sysroot/apex/apex-info-list.xml << 'EOF'
+# Generate canonical active APEX info list for Android 16 userspace strictly adhering to ApexInfoList.xsd
+cat > /mnt/sysroot/apex/apex-info-list.xml << EOF
 <?xml version="1.0" encoding="utf-8"?>
 <apex-info-list>
-  <apex-info moduleName="com.android.runtime" isFactory="true" isActive="true" />
-  <apex-info moduleName="com.android.art" isFactory="true" isActive="true" />
-  <apex-info moduleName="com.android.i18n" isFactory="true" isActive="true" />
-  <apex-info moduleName="com.android.tzdata" isFactory="true" isActive="true" />
+  <apex-info moduleName="$(get_apex_meta runtime_apex package com.android.runtime)" modulePath="/apex/$(get_apex_meta runtime_apex package com.android.runtime)@$(get_apex_meta runtime_apex version 1)" preinstalledModulePath="$(get_apex_meta runtime_apex preinstalled_path /system/apex/com.android.runtime.apex)" versionCode="$(get_apex_meta runtime_apex version 1)" versionName="$(get_apex_meta runtime_apex version_name "")" isFactory="true" isActive="true" provideSharedApexLibs="$(get_apex_meta runtime_apex provide_shared_libs false)" partition="$(get_apex_meta runtime_apex partition SYSTEM)" />
+  <apex-info moduleName="$(get_apex_meta art_apex package com.android.art)" modulePath="/apex/$(get_apex_meta art_apex package com.android.art)@$(get_apex_meta art_apex version 361501120)" preinstalledModulePath="$(get_apex_meta art_apex preinstalled_path /system/apex/com.google.android.art_compressed.apex)" versionCode="$(get_apex_meta art_apex version 361501120)" versionName="$(get_apex_meta art_apex version_name "")" isFactory="true" isActive="true" provideSharedApexLibs="$(get_apex_meta art_apex provide_shared_libs false)" partition="$(get_apex_meta art_apex partition SYSTEM)" />
+  <apex-info moduleName="$(get_apex_meta i18n_apex package com.android.i18n)" modulePath="/apex/$(get_apex_meta i18n_apex package com.android.i18n)@$(get_apex_meta i18n_apex version 1)" preinstalledModulePath="$(get_apex_meta i18n_apex preinstalled_path /system/apex/com.android.i18n.apex)" versionCode="$(get_apex_meta i18n_apex version 1)" versionName="$(get_apex_meta i18n_apex version_name "")" isFactory="true" isActive="true" provideSharedApexLibs="$(get_apex_meta i18n_apex provide_shared_libs false)" partition="$(get_apex_meta i18n_apex partition SYSTEM)" />
+  <apex-info moduleName="$(get_apex_meta tzdata_apex package com.android.tzdata)" modulePath="/apex/$(get_apex_meta tzdata_apex package com.android.tzdata)@$(get_apex_meta tzdata_apex version 361157000)" preinstalledModulePath="$(get_apex_meta tzdata_apex preinstalled_path /system/apex/com.google.android.tzdata6.apex)" versionCode="$(get_apex_meta tzdata_apex version 361157000)" versionName="$(get_apex_meta tzdata_apex version_name "")" isFactory="true" isActive="true" provideSharedApexLibs="$(get_apex_meta tzdata_apex provide_shared_libs false)" partition="$(get_apex_meta tzdata_apex partition SYSTEM)" />
 </apex-info-list>
 EOF
 chmod 0644 /mnt/sysroot/apex/apex-info-list.xml
 cp /mnt/sysroot/apex/apex-info-list.xml /mnt/sysroot/apex/.bootstrap-apex-info-list.xml 2>/dev/null || true
+
+# Validate apex-info-list.xml against ApexInfoList.xsd schema and active mounts
+if command -v python3 >/dev/null 2>&1 && [ -f /system/bin/extract_apex_info.py ]; then
+    python3 /system/bin/extract_apex_info.py --validate-xml /mnt/sysroot/apex/apex-info-list.xml --active-mounts-from /proc/mounts || fatal "Generated apex-info-list.xml failed AOSP schema or active mount validation!"
+    echo "[STAGE2] apex-info-list.xml verified compliant with Android 16 ApexInfoList.xsd." > /dev/kmsg
+fi
 
 # Strict Validation of Authentic ART, I18N, and TZDATA Modules
 [ -f /mnt/sysroot/apex/com.android.art/lib64/libart.so ] || fatal "ART libart.so is MISSING from art APEX!"
@@ -700,13 +745,55 @@ chmod 0775 /mnt/sysroot/data/local/tmp
 chmod 0700 /mnt/sysroot/data/system
 chmod 01771 /mnt/sysroot/data/misc
 
-# 11. Bind Core Kernel Interfaces
+# 11. Bind Core Kernel Interfaces & Fail-Closed SELinux Initialization
 mount_or_fail --bind /dev /mnt/sysroot/dev
 mount_or_fail -t devpts devpts /mnt/sysroot/dev/pts
 mount_or_fail -t proc proc /mnt/sysroot/proc
 mount_or_fail --bind /sys /mnt/sysroot/sys
-/system/bin/toybox mkdir -p /mnt/sysroot/sys/fs/selinux
-/system/bin/toybox mount -t selinuxfs selinuxfs /mnt/sysroot/sys/fs/selinux 2>/dev/null || true
+
+/system/bin/toybox mkdir -p /sys/fs/selinux /mnt/sysroot/sys/fs/selinux
+if ! /system/bin/toybox grep -q " /sys/fs/selinux selinuxfs " /proc/mounts 2>/dev/null && \
+   ! /system/bin/toybox grep -q " /mnt/sysroot/sys/fs/selinux selinuxfs " /proc/mounts 2>/dev/null; then
+    if /system/bin/toybox grep -q "selinuxfs" /proc/filesystems 2>/dev/null; then
+        mount_or_fail -t selinuxfs selinuxfs /mnt/sysroot/sys/fs/selinux
+    elif [ "${STAGE2_TEST_MODE:-0}" != "1" ]; then
+        fatal "Kernel /proc/filesystems does not list selinuxfs! SELinux kernel subsystem missing."
+    fi
+fi
+
+# Verify kernel SELinux interface accessibility
+if [ "${STAGE2_TEST_MODE:-0}" != "1" ]; then
+    if [ ! -d /mnt/sysroot/sys/fs/selinux ] && [ ! -d /sys/fs/selinux ]; then
+        fatal "SELinux kernel interface directory /sys/fs/selinux is not accessible!"
+    fi
+fi
+
+# Verify mandatory SELinux CIL policies across partitions
+if [ "${STAGE2_TEST_MODE:-0}" != "1" ] || [ -d /mnt/sysroot/system/etc/selinux ]; then
+    [ -f /mnt/sysroot/system/etc/selinux/plat_sepolicy.cil ] || fatal "Mandatory plat_sepolicy.cil missing from system partition!"
+    [ -f /mnt/sysroot/system_ext/etc/selinux/system_ext_sepolicy.cil ] || fatal "Mandatory system_ext_sepolicy.cil missing from system_ext partition!"
+    [ -f /mnt/sysroot/vendor/etc/selinux/vendor_sepolicy.cil ] || fatal "Mandatory vendor_sepolicy.cil missing from vendor partition!"
+    [ -f /mnt/sysroot/odm/etc/selinux/odm_sepolicy.cil ] || fatal "Mandatory odm_sepolicy.cil missing from odm partition!"
+    [ -f /mnt/sysroot/system/etc/selinux/plat_sepolicy_and_mapping.sha256 ] || fatal "Mandatory plat_sepolicy_and_mapping.sha256 missing from system partition!"
+
+    # Detect precompiled policy hash mismatch
+    local plat_sha
+    plat_sha=$(cat /mnt/sysroot/system/etc/selinux/plat_sepolicy_and_mapping.sha256 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
+    local precompiled_sha=""
+    if [ -f /mnt/sysroot/odm/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256 ]; then
+        precompiled_sha=$(cat /mnt/sysroot/odm/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
+    elif [ -f /mnt/sysroot/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256 ]; then
+        precompiled_sha=$(cat /mnt/sysroot/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256 2>/dev/null | /system/bin/toybox tr -d '[:space:]')
+    fi
+
+    if [ -n "$precompiled_sha" ] && [ "$plat_sha" != "$precompiled_sha" ]; then
+        echo "[STAGE2] SELinux precompiled policy hash mismatch detected (platform: ${plat_sha:0:16}... vs precompiled: ${precompiled_sha:0:16}...). Runtime CIL compilation required via secilc." > /dev/kmsg
+        if [ ! -x /mnt/sysroot/system/bin/secilc ]; then
+            fatal "SELinux policy hash mismatch requires runtime CIL compilation, but /system/bin/secilc is missing or not executable!"
+        fi
+        echo "[STAGE2] Verified /system/bin/secilc compiler is present and executable for runtime policy compilation." > /dev/kmsg
+    fi
+fi
 
 # Isolate property workspace and socket dirs to eliminate SIGSEGV Code 139
 /system/bin/toybox mkdir -p /mnt/sysroot/dev/__properties__ /mnt/sysroot/dev/socket

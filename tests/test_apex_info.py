@@ -23,7 +23,14 @@ import zipfile
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "tools"))
-from extract_apex_info import parse_manifest_pb, extract_manifest_from_apex, validate_package_name
+from extract_apex_info import (
+    parse_manifest_pb,
+    extract_manifest_from_apex,
+    validate_package_name,
+    validate_apex_info_xml,
+    generate_apex_info_xml,
+    get_apex_manifest_info,
+)
 
 
 def encode_varint(value: int) -> bytes:
@@ -287,6 +294,116 @@ class TestApexInfoParser(unittest.TestCase):
             self.assertIn("Invalid or corrupted ZIP", str(ctx.exception))
         finally:
             os.unlink(temp_path)
+
+    def test_provide_shared_apex_libs_pb_and_json(self):
+        # Protobuf with tag 11 = 1 (true)
+        data = bytearray(build_manifest_pb("com.android.runtime", 1, "1.0"))
+        data.append((11 << 3) | 0)
+        data.extend(encode_varint(1))
+
+        res = parse_manifest_pb(bytes(data), include_extended=True)
+        self.assertEqual(res, ("com.android.runtime", 1, "1.0", True))
+
+        # Protobuf with tag 11 = 0 (false)
+        data2 = bytearray(build_manifest_pb("com.android.runtime", 1, "1.0"))
+        data2.append((11 << 3) | 0)
+        data2.extend(encode_varint(0))
+        res2 = parse_manifest_pb(bytes(data2), include_extended=True)
+        self.assertEqual(res2, ("com.android.runtime", 1, "1.0", False))
+
+        # Tag 11 with wrong wire type
+        data3 = bytearray(build_manifest_pb("com.android.runtime", 1, "1.0"))
+        data3.append((11 << 3) | 2)
+        data3.extend(encode_varint(1))
+        data3.append(0)
+        with self.assertRaises(ValueError) as ctx:
+            parse_manifest_pb(bytes(data3), include_extended=True)
+        self.assertIn("Wrong wire type", str(ctx.exception))
+
+    def test_validate_apex_info_xml_valid(self):
+        xml_content = """<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+  <apex-info moduleName="com.android.runtime" modulePath="/apex/com.android.runtime@1" preinstalledModulePath="/system/apex/com.android.runtime.apex" versionCode="1" versionName="16.0" isFactory="true" isActive="true" provideSharedApexLibs="false" partition="SYSTEM" />
+  <apex-info moduleName="com.android.art" modulePath="/apex/com.android.art@361501120" preinstalledModulePath="/system/apex/com.google.android.art_compressed.apex" versionCode="361501120" versionName="" isFactory="true" isActive="true" provideSharedApexLibs="false" partition="SYSTEM" />
+</apex-info-list>
+"""
+        self.assertTrue(validate_apex_info_xml(xml_content))
+
+    def test_validate_apex_info_xml_missing_attribute(self):
+        # Missing modulePath
+        xml_missing = """<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+  <apex-info moduleName="com.android.runtime" versionCode="1" versionName="16.0" isFactory="true" isActive="true" />
+</apex-info-list>
+"""
+        with self.assertRaises(ValueError) as ctx:
+            validate_apex_info_xml(xml_missing)
+        self.assertIn("Invalid or missing 'modulePath'", str(ctx.exception))
+
+    def test_validate_apex_info_xml_invalid_version_code(self):
+        xml_bad_ver = """<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+  <apex-info moduleName="com.android.runtime" modulePath="/apex/com.android.runtime@0" versionCode="0" versionName="16.0" isFactory="true" isActive="true" />
+</apex-info-list>
+"""
+        with self.assertRaises(ValueError) as ctx:
+            validate_apex_info_xml(xml_bad_ver)
+        self.assertIn("must be positive", str(ctx.exception))
+
+    def test_validate_apex_info_xml_invalid_partition(self):
+        xml_bad_part = """<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+  <apex-info moduleName="com.android.runtime" modulePath="/apex/com.android.runtime@1" versionCode="1" versionName="" isFactory="true" isActive="true" partition="INVALID_PART" />
+</apex-info-list>
+"""
+        with self.assertRaises(ValueError) as ctx:
+            validate_apex_info_xml(xml_bad_part)
+        self.assertIn("Invalid 'partition'", str(ctx.exception))
+
+    def test_validate_apex_info_xml_duplicate_module(self):
+        xml_dup = """<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+  <apex-info moduleName="com.android.runtime" modulePath="/apex/com.android.runtime@1" versionCode="1" versionName="" isFactory="true" isActive="true" />
+  <apex-info moduleName="com.android.runtime" modulePath="/apex/com.android.runtime@2" versionCode="2" versionName="" isFactory="false" isActive="true" />
+</apex-info-list>
+"""
+        with self.assertRaises(ValueError) as ctx:
+            validate_apex_info_xml(xml_dup)
+        self.assertIn("Duplicate moduleName", str(ctx.exception))
+
+    def test_validate_apex_info_xml_active_mount_check(self):
+        xml_content = """<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+  <apex-info moduleName="com.android.runtime" modulePath="/apex/com.android.runtime@1" versionCode="1" versionName="" isFactory="true" isActive="true" />
+</apex-info-list>
+"""
+        # Active mounts lacking this path
+        with self.assertRaises(ValueError) as ctx:
+            validate_apex_info_xml(xml_content, active_mounts=["/dev", "/proc", "/sys"])
+        self.assertIn("NOT present in active filesystem mounts", str(ctx.exception))
+
+        # Active mounts containing this path
+        self.assertTrue(validate_apex_info_xml(xml_content, active_mounts=["/apex/com.android.runtime@1", "/apex/com.android.runtime"]))
+
+    def test_generate_apex_info_xml(self):
+        entries = [
+            {
+                "moduleName": "com.android.runtime",
+                "modulePath": "/apex/com.android.runtime@1",
+                "preinstalledModulePath": "/system/apex/com.android.runtime.apex",
+                "versionCode": 1,
+                "versionName": "",
+                "isFactory": True,
+                "isActive": True,
+                "provideSharedApexLibs": False,
+                "partition": "SYSTEM",
+            }
+        ]
+        xml_out = generate_apex_info_xml(entries)
+        self.assertIn('<apex-info-list>', xml_out)
+        self.assertIn('moduleName="com.android.runtime"', xml_out)
+        self.assertIn('provideSharedApexLibs="false"', xml_out)
+        self.assertTrue(validate_apex_info_xml(xml_out))
 
 
 if __name__ == "__main__":
