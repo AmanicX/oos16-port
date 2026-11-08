@@ -23,13 +23,13 @@
 
 ### Summary of Automated Test Suite
 
-- **Total Defined Test Methods**:
-  - Codebase grand total: **239 test methods** (224 Python test methods across 9 classes in 7 files + 15 Go test functions).
-- **Actual Latest CI Environment Execution (GitHub Actions Run #18, commit `4cabd5e`)**:
+- **Total Defined Test Methods in Codebase**: **239** (224 Python test methods across 9 classes in 7 files + 15 Go test functions).
+- **Actual Latest CI Environment Execution (GitHub Actions Run #19 / Run #18)**:
   - Python tests executed: **224 tests ran, 224 passed, 0 failed, 0 errors, 0 skipped**.
   - Live loop-device tests: **All 5 live loop-device integration tests executed and passed** in the privileged CI container environment.
   - Go tests executed: **15 passed, 0 failed**.
-  - **Actual combined CI result**: **239 passed** (100% of defined tests executed and passed).
+  - **Actual combined CI result**: **239 passed (100% of defined tests executed and passed)**.
+  - Static safety audits: Ramdisks pass 34/34 checks each. Packaged boot-image and kernel asset checks are explicitly skipped (`SKIPPED`) in CI because binary assets are excluded from Git checkout per `.gitignore`.
 - **Actual Local Environment Execution (Developer Workstation)**:
   - Python tests executed: **219 tests ran, 219 passed, 0 failed, 0 errors**.
   - Live loop-device tests: **1 test suite class skipped** (`TestLiveLoopBlockDeviceSafety`, containing 5 live loop test methods) because local loop-device capabilities were unavailable (`CAN_LOOP: False`).
@@ -45,20 +45,27 @@
   - Ramdisks (`stage1/native_ramdisk`, `stage1/loader_ramdisk`): **34/34 checks passed**, 0 failed, 1 optional unverified cmdline.
   - CI checkout status: Ramdisk audits pass (34/34), while kernel assets and packaged boot-image audits are explicitly logged as skipped (`SKIPPED`) because binary artifacts are excluded from git checkout per `.gitignore`.
 - **Physical Device Verification Status**:
-  - Status: **PENDING INDEPENDENT SAFETY REVIEW & PHYSICAL HARDWARE TEST** (All T0–T7 physical stages strictly pending live fastboot execution; physical storage safety remains subject to live device-level verification).
+  - Status: **PRE-BOOT VERIFICATION IN PROGRESS — HARDWARE BOOT NOT APPROVED.** (All T0–T7 physical stages strictly pending live fastboot execution; physical storage safety remains subject to live device-level verification).
 
 ## 2. Boot Artifact Provenance & Physical Device Bring-Up Stages
 
 ### Boot Artifact Provenance Ledger
 
-| Artifact Filename | Full SHA-256 Checksum | Proven Source Commit / Tree State | Proven Build Completion Timestamp | Kernel / Hardware Provenance | Static Audit Result | Independent Availability | Verification Scope & Status |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`build/stage1.img`** *(Intended T0 Target)* | `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` | Active HEAD was `f073d8d`; tree contained uncommitted edits subsequently committed in `cd6afa5` at 01:53:30 (built prior to `cd6afa5`) | 2026-11-09 01:49:58 +0500 *(proven by mtime & audit log 20261109_014958)* | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Local build tree only (`build/stage1.img`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified via static audit; Skipped in CI checkout via `.gitignore`. **LOCAL BUILD VERIFIED; PHYSICAL BOOT PENDING** |
-| **`build/loader.img`** *(Intended T1 Alternative)* | `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` | Active HEAD was `f073d8d`; tree contained uncommitted edits subsequently committed in `cd6afa5` at 01:53:30 (built prior to `cd6afa5`) | 2026-11-09 01:49:46 +0500 *(proven by mtime & audit log 20261109_014946)* | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Local build tree only (`build/loader.img`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified via static audit; Skipped in CI checkout via `.gitignore`. **LOCAL BUILD VERIFIED; PHYSICAL BOOT PENDING** |
-| **`build/stage1.img`** *(Historical Baseline)* | `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` | `f073d8d` | 2026-11-08 20:00:51 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Replaced by rebuilt image `01ba479d...` | **SUPERSEDED BY REBUILD** |
-| **`build/loader.img`** *(Historical Baseline)* | `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` | `f073d8d` | 2026-11-08 20:00:51 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Replaced by rebuilt image `6ec49586...` | **SUPERSEDED BY REBUILD** |
-| **`build/images/SHA256SUMS`** *(Stage-2 Manifest)* | `4fb28aabe75bfa39089d783f35fb4700445ee58dadebdeb99533243bcf6c3743` | Active HEAD was `e18fff3`; tree contained edits subsequently committed in `9bb95a1` at 16:32:36 (built 9 hours before `cd6afa5`) | 2026-11-08 16:26:14 +0500 *(proven by mtime & audit log 20261108_162724)* | Packaging manifest covering all 6 EROFS partitions and 4 APEX modules (37 artifact entries) | **PASSED (37/37 OK via `sha256sum -c`)** | Local build tree only (`build/images/`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified. **LOCAL BUILD VERIFIED; RAM STAGING PENDING** |
-| **`build/images/PARTITION_MAP`** *(Stage-2 Partition Contract)* | `e7142764a3f46cb20b4fbc5aa87cb15e9c7b37a6bf3b36c7713af32e26dd8226` | Active HEAD was `e18fff3`; tree contained edits subsequently committed in `9bb95a1` at 16:32:36 (built 9 hours before `cd6afa5`) | 2026-11-08 16:25:57 +0500 *(proven by mtime)* | 4-field partition-to-mountpoint contract (`image:mountpoint:nature:sha256`) covering all 6 partitions | **PASSED (4-field schema validated)** | Local build tree only (`build/images/`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified. **LOCAL BUILD VERIFIED; RAM STAGING PENDING** |
+| Field | `build/stage1.img` (T0 Target) | `build/loader.img` (T1 Target) | `build/images/SHA256SUMS` (Manifest) | `build/images/PARTITION_MAP` (Contract) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Full SHA-256 Checksum** | `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` | `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` | `4fb28aabe75bfa39089d783f35fb4700445ee58dadebdeb99533243bcf6c3743` | `e7142764a3f46cb20b4fbc5aa87cb15e9c7b37a6bf3b36c7713af32e26dd8226` |
+| **File Size** | 80,166,912 bytes | 80,166,912 bytes | 3,766 bytes | 798 bytes |
+| **Proven Build Timestamp** | `2026-11-09 01:49:58.164786100 +0500` | `2026-11-09 01:49:46.920550200 +0500` | `2026-11-08 16:26:14.494358500 +0500` | `2026-11-08 16:25:57.415544000 +0500` |
+| **Active Git HEAD at Build** | `f073d8dde6380a2fbe04eb5aa8e8cdc78952fa5a` | `f073d8dde6380a2fbe04eb5aa8e8cdc78952fa5a` | `e18fff3141d9ab8d34b91e71b6e877c8d4962411` | `e18fff3141d9ab8d34b91e71b6e877c8d4962411` |
+| **Active Git Tree SHA at Build** | `516d5e9de285687189e100748fd2345021e132e7` | `516d5e9de285687189e100748fd2345021e132e7` | `7fe1f7868516fb83df1e52003cffc82fb66a12df` | `7fe1f7868516fb83df1e52003cffc82fb66a12df` |
+| **Uncommitted Working Edits** | Built from dirty working tree with `--verify-block-node` additions; subsequently committed at 01:53:30 as `cd6afa5` (tree `ced6d485...`) | Built from dirty working tree with `--verify-block-node` additions; subsequently committed at 01:53:30 as `cd6afa5` (tree `ced6d485...`) | Built during transition between `e18fff3` and `9bb95a1`; subsequently committed at 16:32:36 as `9bb95a1` (tree `eb9d8ae8...`) | Built alongside `SHA256SUMS` during transition between `e18fff3` and `9bb95a1` |
+| **Reproducible Patch SHA-256** | `c8781e55f35d1390ceb910eeae5122aedfe960da663811f4a1e3d17c3c09e355` (`f073d8d..cd6afa5`) | `c8781e55f35d1390ceb910eeae5122aedfe960da663811f4a1e3d17c3c09e355` (`f073d8d..cd6afa5`) | `91b6767ad37ad0cbb6eec1f05fb52399c9249b7c3f6b6dcfd8f7debf67efca20` (`e18fff3..9bb95a1`) | `91b6767ad37ad0cbb6eec1f05fb52399c9249b7c3f6b6dcfd8f7debf67efca20` (`e18fff3..9bb95a1`) |
+| **Embedded Subsystem Tree SHA** | `26e11caaf151a41a3d8cf940ba49f0fe3b1f8be5` (`stage1/native_ramdisk`) | `9c6cc4a9dbfcc972908affad2ea76995fc8f20f5` (`stage1/loader_ramdisk`) | N/A (Stage-2 EROFS master manifest) | N/A (Stage-2 4-field contract) |
+| **Build Command & Tools** | `scripts/build_stage1.sh` (`mkbootimg` AOSP v2, `lz4` v1.10.0, `python` 3.14.8) | `scripts/build_loader.sh` (`mkbootimg` AOSP v2, `lz4` v1.10.0, `python` 3.14.8) | `scripts/build_stage2_erofs.sh` (`mkfs.erofs`, `fsck.erofs`, coreutils `sha256sum`) | `scripts/build_stage2_erofs.sh` |
+| **Kernel / DTB / DTBO Inputs** | Kernel `c32e3a26...` (48,713,752 B), DTB `e4faf7c5...` (9,055,368 B), DTBO `7cfdd198...` (3,219,456 B) | Kernel `c32e3a26...` (48,713,752 B), DTB `e4faf7c5...` (9,055,368 B), DTBO `7cfdd198...` (3,219,456 B) | N/A | N/A |
+| **Audit Result & Log Reference** | **PASSED (36/36 checks)**; `logs/audit-report-20261109_014958.log` & `021932.log` | **PASSED (36/36 checks)**; `logs/audit-report-20261109_014946.log` & `021929.log` | **PASSED (37/37 OK via `sha256sum -c`)**; verified across all 6 partitions + 4 APEX modules | **PASSED (Contract validated)**; 4-field schema verified across all 6 partitions |
+| **Availability in Workspace** | Available locally (`build/stage1.img`); excluded via `.gitignore` (not in clone) | Available locally (`build/loader.img`); excluded via `.gitignore` (not in clone) | Available locally (`build/images/SHA256SUMS`); excluded via `.gitignore` | Available locally (`build/images/PARTITION_MAP`); excluded via `.gitignore` |
+| **Provenance Status** | **PARTIALLY VERIFIED** (Clean reproducible rebuild required before live hardware testing) | **PARTIALLY VERIFIED** (Clean reproducible rebuild required before live hardware testing) | **PARTIALLY VERIFIED** (Clean reproducible rebuild required before live hardware staging) | **PARTIALLY VERIFIED** (Clean reproducible rebuild required before live hardware staging) |
 
 ### Reproducible Independent Artifact Verification Procedure
 

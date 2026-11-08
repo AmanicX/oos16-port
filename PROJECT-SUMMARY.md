@@ -298,31 +298,41 @@ Designed for RAM-only execution with fail-closed block-layer read-only protectio
 
 ---
 
-## 3. Verification Matrix & Current Status
+## 3. Verification Architecture & Matrix Summary
 
-| Verification Tier | Scope | Status | Notes |
+The authoritative 6-tier verification status is maintained in [`README.md`](README.md#7-verification-status--test-matrix) and the detailed test ledger in [`docs/TEST-LEDGER.md`](docs/TEST-LEDGER.md):
+
+| Verification Tier | Scope | Status | Local vs. CI Execution Details |
 | :--- | :--- | :--- | :--- |
-| **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36 local, 34/34 CI)** | Local-only static audit passed on local packaged boot images: `build/loader.img` (Rebuilt SHA-256: `6ec49586...` / Baseline: `25c5433e...`, 36/36 checks passed) and `build/stage1.img` (Rebuilt SHA-256: `01ba479d...` / Baseline: `c04480b5...`, 36/36 checks passed); ramdisk directories pass 34/34 checks (0 failures, 1 optional unverified cmdline). In CI without device kernel inputs, ramdisks pass (34/34) and packaged boot-image audits are logged as skipped via `.gitignore`. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (239 CI / 234 local)** | Total defined test methods in codebase: 239 (224 Python across 9 classes + 15 Go). Latest CI execution (Run #18): 239 passed (224 Python + 15 Go; all 5 live loop-device integration tests executed and passed). Local workstation execution: 234 passed, 1 skipped test class (219 simulated Python tests passed, 0 failed, 1 unprivileged loop class skipped containing 5 tests; 15 Go tests passed). Verified across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol, two-copy inventory synchronization & fail-closed lifecycle (62), Stage-2 runner integration mocks (72), Storage safety, strict block-node identity & 6-checkpoint inventory revalidation (39), Disposable loop & block device safety (9 simulated passed + 5 live loop tests), and Go BinderFS unit tests (15). |
-| **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | Locally built and verified: `stage1.img` (`01ba479d...`), `loader.img` (`6ec49586...`), and all Stage-2 images with master checksums (`build/images/SHA256SUMS`: `4fb28aab...`, 37/37 OK) and `PARTITION_MAP` (`e7142764...`). Excluded from git checkout via `.gitignore` (not available via direct clone). |
-| **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Physical device boot not performed. Zero physical boots executed; hardware storage safety has not yet been proven on physical UFS hardware. Do not run `fastboot boot` until exact boot artifacts undergo independent safety review. |
-| **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor on physical hardware. |
+| **Tier 1: Implemented** | Codebase, ramdisks, APEX staging, scripts, safety proxies | **COMPLETE** | Architectural implementation complete across all supervisors and wrappers. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36 local, 34/34 CI)** | **Local**: Rebuilt `loader.img` (`6ec49586...`) and `stage1.img` (`01ba479d...`) pass 36/36 checks; ramdisk directories pass 34/34 checks.<br>**CI**: Ramdisk directories pass 34/34 checks; packaged image audits skipped (`SKIPPED`) via `.gitignore`. |
+| **Tier 3: Host Tests Passed** | Python, Go & Shell unit/integration test suites | **PASSED (239 CI / 234 local)** | **CI (Run #19 / #18)**: 239 passed (224 Python + 15 Go; all 5 live loop tests ran and passed).<br>**Local**: 234 passed, 1 skipped test class (219 simulated Python + 15 Go; loop class skipped due to unprivileged userspace). Grand total defined in codebase: 239 test methods. |
+| **Tier 4: Build Passed** | Boot images & Stage-2 EROFS partition images | **PASSED (Partially Verified)** | Built locally: `stage1.img` (`01ba479d...`), `loader.img` (`6ec49586...`), `SHA256SUMS` (`4fb28aab...`, 37/37 OK), `PARTITION_MAP` (`e7142764...`). Excluded from Git checkout via `.gitignore`. Clean reproducible rebuild required before live hardware testing. |
+| **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **NOT PERFORMED** | Zero physical boots executed; physical storage safety remains unproven on physical hardware. |
+| **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor post-boot. |
 
 ---
 
-## 4. Hardware Boot Readiness Assessment
+## 4. Authoritative Hardware Boot Readiness Assessment
 
-The repository is in a verified, build-clean, and audited state:
-* **Source Implementation**: COMPLETE across all Stage-1/Stage-2 supervisors, watchdog, proxies, and APEX staging.
-* **Host Automated Tests**: COMPLETE (Latest CI execution Run #18: 239 passed out of 239 defined test methods: 224 Python + 15 Go; Local execution: 234 passed, 1 skipped test class out of 235 discovered units: 219 simulated Python passed + 1 unprivileged loop class skipped; 15 Go passed).
-* **Local Boot Image Status**: Rebuilt images (`build/stage1.img`: `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2`, `build/loader.img`: `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257`) generated locally and verified with 36/36 static audit checks. Excluded from git checkout via `.gitignore`.
-* **Stage-2 RAM Partition Packaging**: All 6 EROFS images and 4 bootstrap APEX modules verified with `SHA256SUMS` (`4fb28aab...`, 37/37 OK) and `PARTITION_MAP` (`e7142764...`). Excluded from git checkout via `.gitignore`.
-* **CI Status**: Ramdisks pass 34/34 pre-boot audits; device kernel assets and packaged boot images are explicitly logged as `SKIPPED` in CI checkout via `.gitignore`.
-* **Physical Device Boot**: NOT PERFORMED (zero physical boots executed).
-* **Hardware Storage Safety**: NOT YET PROVEN on physical device (safety remains theoretical at the block layer until validated on actual OnePlus 7T hardware).
-* **Verdict**: **PENDING INDEPENDENT SAFETY REVIEW & CONTROLLED HARDWARE VERIFICATION** — Do not execute `fastboot boot` until the exact boot artifact has undergone an independent safety review and tethered physical device read-only verification is confirmed.
-* **CI Status**: Ramdisks pass 34/34 pre-boot audits; device kernel assets and packaged boot images are explicitly logged as `SKIPPED` in CI checkout via `.gitignore`.
-* **Physical Device Boot**: NOT PERFORMED (zero physical boots executed).
-* **Hardware Storage Safety**: NOT YET PROVEN on physical device (safety remains theoretical at the block layer until validated on actual OnePlus 7T hardware).
-* **Verdict**: **PENDING INDEPENDENT SAFETY REVIEW & CONTROLLED HARDWARE VERIFICATION** — Do not execute `fastboot boot` until the exact boot artifact has undergone an independent safety review and tethered physical device read-only verification is confirmed.
+To eliminate ambiguity across documentation, project readiness is partitioned strictly by verification domain:
+
+1. **Local Workstation Verification**:
+   - Rebuilt packaged boot images (`build/stage1.img`: `01ba479d...`, `build/loader.img`: `6ec49586...`) pass 36/36 static safety and handover audit checks.
+   - Stage-2 partition images and bootstrap APEX payloads are verified against master checksums (`build/images/SHA256SUMS`: `4fb28aab...`, 37/37 entries OK) and 4-field contract (`build/images/PARTITION_MAP`: `e7142764...`).
+   - Automated host tests execute cleanly: 234 passed, 1 test class skipped (`TestLiveLoopBlockDeviceSafety`, 5 tests, due to unprivileged environment without loop-device attachment capabilities).
+2. **CI Pipeline Verification (GitHub Actions Run #19 / Run #18)**:
+   - Full automated test suite passes 100% green: 239 passed out of 239 defined test methods (224 Python + 15 Go).
+   - All 5 live loop-device integration tests execute and pass in the privileged CI container environment.
+   - Both ramdisk directories (`stage1/native_ramdisk`, `stage1/loader_ramdisk`) pass 34/34 pre-boot safety checks.
+   - Shell scripts pass `bash -n` and POSIX `sh -n` syntax validation.
+3. **Skipped Checks in CI Checkout**:
+   - Hardware kernel assets (`stage1/kernel_src/`) and packaged boot images (`build/*.img`) are excluded from Git checkout via `.gitignore`.
+   - The CI pipeline explicitly logs these audits as `SKIPPED`, verifying ramdisk directory sources rather than packaged binaries.
+4. **Physical Device Verification**:
+   - **NOT PERFORMED**: Zero physical boots have been executed.
+   - Physical UFS storage write protection (`blockdev --setro /dev/block/sd*`) has not yet been proven on physical hardware.
+5. **Final Readiness Verdict**:
+   - **PRE-BOOT VERIFICATION IN PROGRESS — HARDWARE BOOT NOT APPROVED.**
+   - Do not execute `fastboot boot`, `fastboot flash`, erase, format, or any physical storage modifications.
+   - Physical hardware boot is strictly blocked until boot artifacts undergo a clean reproducible rebuild and independent safety review.
