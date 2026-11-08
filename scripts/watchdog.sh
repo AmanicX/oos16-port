@@ -404,25 +404,63 @@ check_storage_inventory_safety() {
                         [ -n "${DEV_BLOCK_DIR:-}" ] && check_dnode="$dev_block_root/$bname"
 
                         if [ ! -e "$check_dnode" ]; then
+                            local d_mknod_err=""
+                            local d_mknod_st=0
                             if [ -x /system/bin/toybox ]; then
-                                /system/bin/toybox mknod "$check_dnode" b "$d_maj" "$d_min" 2>/dev/null || true
+                                d_mknod_err=$(/system/bin/toybox mknod "$check_dnode" b "$d_maj" "$d_min" 2>&1) || d_mknod_st=$?
                             elif command -v mknod >/dev/null 2>&1; then
-                                mknod "$check_dnode" b "$d_maj" "$d_min" 2>/dev/null || true
+                                d_mknod_err=$(mknod "$check_dnode" b "$d_maj" "$d_min" 2>&1) || d_mknod_st=$?
+                            else
+                                trigger_storage_violation "No mknod binary available to create device node for newly appearing disk '$disk_dev'"
+                            fi
+                            if [ "$d_mknod_st" -ne 0 ]; then
+                                trigger_storage_violation "mknod failed for newly appearing disk '$disk_dev' with exit code $d_mknod_st ($d_mknod_err)"
                             fi
                         fi
-                        if [ "$WATCHDOG_TEST_MODE" != "1" ] && [ ! -b "$check_dnode" ]; then
-                            trigger_storage_violation "Failed to create block node for newly appearing disk '$disk_dev'"
+                        if [ "$WATCHDOG_TEST_MODE" = "1" ]; then
+                            if [ ! -b "$check_dnode" ] && [ ! -f "$check_dnode" ]; then
+                                trigger_storage_violation "Device node '$check_dnode' for newly appearing disk '$disk_dev' is neither block special nor test mock file"
+                            fi
+                        else
+                            if [ ! -b "$check_dnode" ]; then
+                                trigger_storage_violation "Device node '$check_dnode' for newly appearing disk '$disk_dev' is NOT a block device"
+                            fi
+                        fi
+
+                        # Verify major/minor match against sysfs disk
+                        local cur_d_mm
+                        cur_d_mm=$(cat "$bdir/dev" 2>/dev/null | tr -d '[:space:]')
+                        if [ "$cur_d_mm" != "$d_maj:$d_min" ]; then
+                            trigger_storage_violation "Major:minor mismatch for newly appearing disk '$disk_dev' ($cur_d_mm != $d_maj:$d_min)"
+                        fi
+
+                        # If real block special node, verify node device numbers match sysfs
+                        if [ -b "$check_dnode" ]; then
+                            local dnode_hex_mm
+                            dnode_hex_mm=$(/system/bin/toybox stat -L -c "%t:%T" "$check_dnode" 2>/dev/null || stat -L -c "%t:%T" "$check_dnode" 2>/dev/null || true)
+                            if [ -n "$dnode_hex_mm" ] && [ "$dnode_hex_mm" != "0:0" ]; then
+                                local dn_hmaj="${dnode_hex_mm%%:*}"
+                                local dn_hmin="${dnode_hex_mm##*:}"
+                                local dn_dmaj=$(( 0x$dn_hmaj ))
+                                local dn_dmin=$(( 0x$dn_hmin ))
+                                if [ "$dn_dmaj" != "$d_maj" ] || [ "$dn_dmin" != "$d_min" ]; then
+                                    trigger_storage_violation "Block node '$check_dnode' major:minor ($dn_dmaj:$dn_dmin) does not match sysfs disk ($d_maj:$d_min)"
+                                fi
+                            fi
                         fi
 
                         # Lock read-only
                         local setro_status=0
+                        local setro_err=""
                         if [ -x /system/bin/toybox ]; then
-                            /system/bin/toybox blockdev --setro "$check_dnode" >/dev/null 2>&1 || setro_status=$?
+                            setro_err=$(/system/bin/toybox blockdev --setro "$check_dnode" 2>&1) || setro_status=$?
                         elif command -v blockdev >/dev/null 2>&1; then
-                            blockdev --setro "$check_dnode" >/dev/null 2>&1 || setro_status=$?
+                            setro_err=$(blockdev --setro "$check_dnode" 2>&1) || setro_status=$?
+                        else
+                            trigger_storage_violation "No blockdev binary available to set read-only on newly appearing disk '$disk_dev'"
                         fi
                         if [ "$setro_status" -ne 0 ]; then
-                            trigger_storage_violation "Failed to execute blockdev --setro on newly appearing disk '$disk_dev'"
+                            trigger_storage_violation "Failed to execute blockdev --setro on newly appearing disk '$disk_dev' (exit code $setro_status: $setro_err)"
                         fi
 
                         local d_ro=""
@@ -431,9 +469,16 @@ check_storage_inventory_safety() {
                             d_ro=$(/system/bin/toybox blockdev --getro "$check_dnode" 2>&1) || d_ro_st=$?
                         elif command -v blockdev >/dev/null 2>&1; then
                             d_ro=$(blockdev --getro "$check_dnode" 2>&1) || d_ro_st=$?
+                        else
+                            trigger_storage_violation "No blockdev binary available to query read-only on newly appearing disk '$disk_dev'"
                         fi
-                        if [ "$d_ro_st" -ne 0 ] || [ "$(echo "$d_ro" | tr -d '[:space:]')" != "1" ]; then
-                            trigger_storage_violation "Newly appearing disk '$disk_dev' could not be locked read-only (ro=$d_ro)"
+                        if [ "$d_ro_st" -ne 0 ]; then
+                            trigger_storage_violation "blockdev --getro failed on newly appearing disk '$disk_dev' with exit code $d_ro_st ($d_ro)"
+                        fi
+                        local clean_d_ro
+                        clean_d_ro=$(echo "$d_ro" | tr -d '[:space:]')
+                        if [ "$clean_d_ro" != "1" ]; then
+                            trigger_storage_violation "Newly appearing disk '$disk_dev' could not be locked read-only (ro=$clean_d_ro, expected 1)"
                         fi
 
                         echo "$disk_dev:$d_maj:$d_min:$bdir" >> "$inv" || trigger_storage_violation "Failed to append newly appearing disk to inventory $inv"
@@ -466,24 +511,63 @@ check_storage_inventory_safety() {
                             [ -n "${DEV_BLOCK_DIR:-}" ] && check_pnode="$dev_block_root/$pname"
 
                             if [ ! -e "$check_pnode" ]; then
+                                local p_mknod_err=""
+                                local p_mknod_st=0
                                 if [ -x /system/bin/toybox ]; then
-                                    /system/bin/toybox mknod "$check_pnode" b "$p_maj" "$pmin" 2>/dev/null || true
+                                    p_mknod_err=$(/system/bin/toybox mknod "$check_pnode" b "$p_maj" "$p_min" 2>&1) || p_mknod_st=$?
                                 elif command -v mknod >/dev/null 2>&1; then
-                                    mknod "$check_pnode" b "$p_maj" "$pmin" 2>/dev/null || true
+                                    p_mknod_err=$(mknod "$check_pnode" b "$p_maj" "$p_min" 2>&1) || p_mknod_st=$?
+                                else
+                                    trigger_storage_violation "No mknod binary available to create device node for newly appearing partition '$part_dev'"
+                                fi
+                                if [ "$p_mknod_st" -ne 0 ]; then
+                                    trigger_storage_violation "mknod failed for newly appearing partition '$part_dev' with exit code $p_mknod_st ($p_mknod_err)"
                                 fi
                             fi
-                            if [ "$WATCHDOG_TEST_MODE" != "1" ] && [ ! -b "$check_pnode" ]; then
-                                trigger_storage_violation "Failed to create block node for newly appearing partition '$part_dev'"
+
+                            if [ "$WATCHDOG_TEST_MODE" = "1" ]; then
+                                if [ ! -b "$check_pnode" ] && [ ! -f "$check_pnode" ]; then
+                                    trigger_storage_violation "Device node '$check_pnode' for newly appearing partition '$part_dev' is neither block special nor test mock file"
+                                fi
+                            else
+                                if [ ! -b "$check_pnode" ]; then
+                                    trigger_storage_violation "Device node '$check_pnode' for newly appearing partition '$part_dev' is NOT a block device"
+                                fi
+                            fi
+
+                            # Verify major/minor match against sysfs partition
+                            local cur_p_mm
+                            cur_p_mm=$(cat "$pdir/dev" 2>/dev/null | tr -d '[:space:]')
+                            if [ "$cur_p_mm" != "$p_maj:$p_min" ]; then
+                                trigger_storage_violation "Major:minor mismatch for newly appearing partition '$part_dev' ($cur_p_mm != $p_maj:$p_min)"
+                            fi
+
+                            # If real block special node, verify node device numbers match sysfs
+                            if [ -b "$check_pnode" ]; then
+                                local pnode_hex_mm
+                                pnode_hex_mm=$(/system/bin/toybox stat -L -c "%t:%T" "$check_pnode" 2>/dev/null || stat -L -c "%t:%T" "$check_pnode" 2>/dev/null || true)
+                                if [ -n "$pnode_hex_mm" ] && [ "$pnode_hex_mm" != "0:0" ]; then
+                                    local pn_hmaj="${pnode_hex_mm%%:*}"
+                                    local pn_hmin="${pnode_hex_mm##*:}"
+                                    local pn_dmaj=$(( 0x$pn_hmaj ))
+                                    local pn_dmin=$(( 0x$pn_hmin ))
+                                    if [ "$pn_dmaj" != "$p_maj" ] || [ "$pn_dmin" != "$p_min" ]; then
+                                        trigger_storage_violation "Block node '$check_pnode' major:minor ($pn_dmaj:$pn_dmin) does not match sysfs partition ($p_maj:$p_min)"
+                                    fi
+                                fi
                             fi
 
                             local p_setro_st=0
+                            local p_setro_err=""
                             if [ -x /system/bin/toybox ]; then
-                                /system/bin/toybox blockdev --setro "$check_pnode" >/dev/null 2>&1 || p_setro_st=$?
+                                p_setro_err=$(/system/bin/toybox blockdev --setro "$check_pnode" 2>&1) || p_setro_st=$?
                             elif command -v blockdev >/dev/null 2>&1; then
-                                blockdev --setro "$check_pnode" >/dev/null 2>&1 || p_setro_st=$?
+                                p_setro_err=$(blockdev --setro "$check_pnode" 2>&1) || p_setro_st=$?
+                            else
+                                trigger_storage_violation "No blockdev binary available to set read-only on newly appearing partition '$part_dev'"
                             fi
                             if [ "$p_setro_st" -ne 0 ]; then
-                                trigger_storage_violation "Failed to execute blockdev --setro on newly appearing partition '$part_dev'"
+                                trigger_storage_violation "Failed to execute blockdev --setro on newly appearing partition '$part_dev' (exit code $p_setro_st: $p_setro_err)"
                             fi
 
                             local p_ro=""
@@ -492,9 +576,16 @@ check_storage_inventory_safety() {
                                 p_ro=$(/system/bin/toybox blockdev --getro "$check_pnode" 2>&1) || p_ro_st=$?
                             elif command -v blockdev >/dev/null 2>&1; then
                                 p_ro=$(blockdev --getro "$check_pnode" 2>&1) || p_ro_st=$?
+                            else
+                                trigger_storage_violation "No blockdev binary available to query read-only on newly appearing partition '$part_dev'"
                             fi
-                            if [ "$p_ro_st" -ne 0 ] || [ "$(echo "$p_ro" | tr -d '[:space:]')" != "1" ]; then
-                                trigger_storage_violation "Newly appearing partition '$part_dev' could not be locked read-only (ro=$p_ro)"
+                            if [ "$p_ro_st" -ne 0 ]; then
+                                trigger_storage_violation "blockdev --getro failed on newly appearing partition '$part_dev' with exit code $p_ro_st ($p_ro)"
+                            fi
+                            local clean_p_ro
+                            clean_p_ro=$(echo "$p_ro" | tr -d '[:space:]')
+                            if [ "$clean_p_ro" != "1" ]; then
+                                trigger_storage_violation "Newly appearing partition '$part_dev' could not be locked read-only (ro=$clean_p_ro, expected 1)"
                             fi
 
                             echo "$part_dev:$p_maj:$p_min:$pdir" >> "$inv" || trigger_storage_violation "Failed to append newly appearing partition to inventory $inv"

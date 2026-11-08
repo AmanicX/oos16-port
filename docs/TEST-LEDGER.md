@@ -11,32 +11,36 @@
 | **H4** | C Reference Test | `src/binderfs_init.c` | Strict gcc compilation (-Wall -Wextra -Werror -pedantic) | Clean compilation | **PASS** |
 | **H5** | Embedded Consistency | Ramdisk binaries & scripts | `cmp -s` across `loader_ramdisk`, `native_ramdisk`, and source files | All embedded files byte-identical | **PASS** |
 | **H6** | APEX Metadata Tests | `tests/test_apex_info.py` | 26 unit tests: varint tags, wire types, duplicate fields, ZIP limits, XML schema validation, tag 11 provideSharedApexLibs, active mounts | 26/26 tests pass | **PASS** |
-| **H7** | Watchdog Unit Tests | `tests/test_watchdog.py` | 34 unit tests: numeric parsing, timeout bounds, fail-closed storage validation (missing, empty, malformed inventory), blockdev ro=1, duplicate detection, emergency reboot trigger | 34/34 tests pass | **PASS** |
+| **H7** | Watchdog Unit Tests | `tests/test_watchdog.py` | 41 unit tests: numeric parsing, timeout bounds, fail-closed storage validation (missing, empty, malformed inventory), blockdev ro=1, duplicate detection, newly appearing disk/partition discovery, mknod argument construction, emergency reboot trigger | 41/41 tests pass | **PASS** |
 | **H8** | Stage-2 Integration Tests | `tests/test_integration_stage2.py` | 72 integration tests: RAM accounting, 4-field PARTITION_MAP contract, runner storage parity enforcement, APEX staging, fail-closed SELinux checks | 72/72 tests pass | **PASS** |
 | **H9** | Safe ADB & Fastboot Tests | `tests/test_safe_*.py` | 11 tests: command interception, metacharacter protection, flash bans (8 ADB + 3 Fastboot) | 11/11 tests pass | **PASS** |
-| **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 20 tests: multi-disk sysfs discovery, duplicate detection, byte-identity verification, mount_and_verify_tmpfs, capacity exhaustion, 6 checkpoint tracking | 20/20 tests pass | **PASS** |
-| **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (34 checks per directory, 0 failures) | 34/34 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Loader Audit | `build/loader.img` | SHA-256: `6064d5fdd8d8e9e4e07649c662706a14178641877227425ea5fc3c766581d4d4` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
-| **H13** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `2030aa31278dd863f755dba20e68c33d2f8ffcd6141fddf44a347403bd359a57` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
+| **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 27 tests: multi-disk sysfs discovery, duplicate detection, byte-identity verification, mount_and_verify_tmpfs extraction, capacity exhaustion, 6 checkpoint tracking | 27/27 tests pass | **PASS** |
+| **H10b** | Loop & Block Device Safety Tests | `tests/test_storage_loop.py` | 9 tests: live kernel loop-device semantics (when privileged in CI/VM), simulated block-special node construction, major/minor hex matching, blockdev --setro/--getro state machine, multi-partition revalidation, disappearing/corrupt device handling | 9/9 verified (8 pass + 1 unprivileged skip locally, 9 in CI) | **PASS** |
+| **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (34 checks per directory, 0 failures, 1 optional unverified cmdline) | 34/34 Passed, 0 Failed | **PASS** |
+| **H12** | Packaged Loader Audit | `build/loader.img` | SHA-256: `d09ad5a59c42c73fe62c17235e73f38d0d676e0191af32ea7e3fb056a41215ab` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
+| **H13** | Packaged Stage1 Audit | `build/stage1.img` | SHA-256: `eefcce94b79578966e077a4d3c5c87d39ea2d4017f5e4bb0104943ad3824b8f2` (36 static & handover checks) | 36/36 Passed, 0 Failed | **PASS** |
 | **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`) | Strict SHA-256 and symbol match | **PASS** |
 
-Total automated Python test suite: **163 tests**, 100% pass rate.
-Total Go test suite: **15 tests**, 100% pass rate.
-Total pre-boot auditor checks on packaged boot images: **36 checks**, 0 failures.
+Total automated Python test suite: **186 tests**, 100% pass rate.  
+Total Go test suite: **15 tests**, 100% pass rate.  
+Total automated host tests: **201 tests**, 100% pass rate.  
+Total pre-boot auditor checks on packaged boot images: **36 checks**, 0 failures.  
+Total pre-boot auditor checks on ramdisks: **34 checks**, 0 failures.
 
 ## 2. Physical Device Bring-Up Stages (OnePlus 7T Hardware)
 
 > [!IMPORTANT]
 > The following hardware stages track physical execution on the device via `fastboot boot`.
-> Stages T3 through T7 have not yet been executed on physical hardware and remain strictly pending live test.
+> Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to live device-level verification.
+> All physical device execution stages (T0 through T7) remain strictly pending live test.
 
 | ID | Date | Build Hash | Change / Target | Hypothesis | Command | Timeout | Result | Pass/Fail | Next Step |
 |---|---|---|---|---|---|---|---|---|---|
-| **T0** | 2026-11-05 | `0c45df5a...` | Stage-1 Native RAM Boot | Native static init + adbd; all fstabs removed; disks setro; 90s watchdog; adb root | `tools/safe/fastboot boot build/stage1.img` | 60s | Booted in 3.6s, adb root (u:r:su:s0), zero storage touched | **PASS** | T1 |
-| **T1** | 2026-11-05 | `0c45df5a...` | Block Layer Read-Only Proof | All physical UFS block devices (`/dev/block/sd*`) are read-only; write attempts fail | `blockdev --getro /dev/block/sd[a-f]` -> all return 1 | 30s | All LUNs sda-sdf ro=1, mount table 100% tmpfs/rootfs, 7.37GB free RAM | **PASS** | T2 |
-| **T2** | 2026-11-06 | `adfce4c4...` | RAM Image Build & Packaging | Built 6 high-compression EROFS partitions; zero userdata/metadata/super references; crDroid PIF + Photos spoof injected | `tools/safe/run_stage2.sh` | 300s | All 6 EROFS images built (4.58 GB total), fsck.erofs clean, audit 100% passed | **PASS** | T3 |
-| **T3** | Planned | Pending | RAM Mounts | EROFS images loop-mount; /data is RAM-backed; zero physical partitions mounted rw | `tools/safe/adb shell mount` check | 30s | Pending | - | T4 |
-| **T4** | Planned | Pending | Android Init | Android init starts; core services launch; no update/verifier or bootctl services active | `tools/safe/adb logcat -d` | 60s | Pending | - | T5 |
-| **T5** | Planned | Pending | Framework | Zygote and system_server stay up for >= 5 minutes without crashing | `tools/safe/adb shell ps -ef` | 300s | Pending | - | T6 |
-| **T6** | Planned | Pending | UI & Lockscreen | Boot animation finishes, SystemUI and launcher render lock screen | Visual inspection & SurfaceFlinger dump | 120s | Pending | - | T7 |
-| **T7** | Planned | Pending | Return Path & Integrity | Reboot into Android works; device fingerprint and small partition hashes 100% identical | Fingerprint comparison script | 60s | Pending | - | Phase B |
+| **T0** | Planned | `d09ad5a5...` | Stage-1 Native RAM Boot | Native static init + adbd; all fstabs removed; disks setro; 60s watchdog; adb root | `tools/safe/fastboot boot build/stage1.img` | 60s | Pending live hardware test | **PENDING** | T1 |
+| **T1** | Planned | `d09ad5a5...` | Block Layer Read-Only Proof | All physical UFS block devices (`/dev/block/sd*`) are read-only; write attempts fail | `blockdev --getro /dev/block/sd[a-f]` -> all return 1 | 30s | Pending live hardware test | **PENDING** | T2 |
+| **T2** | Planned | `d09ad5a5...` | RAM Image Build & Packaging | Built 6 high-compression EROFS partitions; zero userdata/metadata/super references; crDroid PIF + Photos spoof injected | `tools/safe/run_stage2.sh` | 300s | Pending live hardware test | **PENDING** | T3 |
+| **T3** | Planned | Pending | RAM Mounts | EROFS images loop-mount; /data is RAM-backed; zero physical partitions mounted rw | `tools/safe/adb shell mount` check | 30s | Pending live hardware test | **PENDING** | T4 |
+| **T4** | Planned | Pending | Android Init | Android init starts; core services launch; no update/verifier or bootctl services active | `tools/safe/adb logcat -d` | 60s | Pending live hardware test | **PENDING** | T5 |
+| **T5** | Planned | Pending | Framework | Zygote and system_server stay up for >= 5 minutes without crashing | `tools/safe/adb shell ps -ef` | 300s | Pending live hardware test | **PENDING** | T6 |
+| **T6** | Planned | Pending | UI & Lockscreen | Boot animation finishes, SystemUI and launcher render lock screen | Visual inspection & SurfaceFlinger dump | 120s | Pending live hardware test | **PENDING** | T7 |
+| **T7** | Planned | Pending | Return Path & Integrity | Reboot into Android works; device fingerprint and small partition hashes 100% identical | Fingerprint comparison script | 60s | Pending live hardware test | **PENDING** | Phase B |

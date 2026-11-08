@@ -15,7 +15,7 @@ extracted/
 dyld_shared_cache*
 *.pem
 *.key
-logs/phone-commands.log
+logs/
 external/
 *.part*
 build/
@@ -25,7 +25,6 @@ trimmed_stash/
 stage1/kernel_src/
 stage1/ramdisk_root/
 stage1/*.lz4
-logs/*.log
 __pycache__/
 *.pyc
 src/binderfs_init_arm64

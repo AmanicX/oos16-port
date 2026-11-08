@@ -81,14 +81,44 @@ if [ "$1" = "--getro" ]; then
     if [ "${BLOCKDEV_FAIL:-0}" = "1" ]; then
         exit 1
     fi
+    if [ -n "${BLOCKDEV_FAIL_DEV:-}" ] && [ "$2" = "$BLOCKDEV_FAIL_DEV" ]; then
+        echo "0"
+        exit 0
+    fi
     echo "${BLOCKDEV_RO_VAL:-1}"
     exit 0
 elif [ "$1" = "--setro" ]; then
+    if [ "${BLOCKDEV_SETRO_FAIL:-0}" = "1" ]; then
+        exit 1
+    fi
+    if [ -n "${BLOCKDEV_SETRO_FAIL_DEV:-}" ] && [ "$2" = "$BLOCKDEV_SETRO_FAIL_DEV" ]; then
+        exit 1
+    fi
     exit 0
 fi
 exit 0
 """)
         os.chmod(self.mock_blockdev, stat.S_IRWXU)
+
+        # Mock mknod binary recording invocations and checking strict operands
+        self.mock_mknod = os.path.join(self.bin_dir, "mknod")
+        self.mknod_log = os.path.join(self.test_dir, "mknod_invocations.log")
+        with open(self.mock_mknod, "w") as f:
+            f.write(f"""#!/bin/sh
+echo "$@" >> "{self.mknod_log}"
+if [ "${{MKNOD_FAIL:-0}}" = "1" ]; then
+    echo "mknod: permission denied or I/O error" >&2
+    exit 1
+fi
+if [ "$#" -lt 4 ] || [ -z "$4" ]; then
+    echo "mknod: missing operand: requires device type, major and minor" >&2
+    exit 1
+fi
+# Emulate block device node creation as regular file in test isolation
+touch "$1"
+exit 0
+""")
+        os.chmod(self.mock_mknod, stat.S_IRWXU)
 
         # Default valid disk sda
         self.sda_sys = os.path.join(self.mock_sys_block, "sda")
@@ -666,15 +696,15 @@ exit 0
             self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
 
     def test_watchdog_newly_appearing_partition_locked_and_recorded(self):
-        """Verify watchdog detects newly appearing partition in sysfs, locks it, and appends to inventory."""
-        # Create sda1 partition in sysfs
+        """Verify watchdog detects newly appearing partition in sysfs, creates node via mknod, locks it, and appends to inventory."""
+        # Create sda1 partition in sysfs without pre-creating device node
         sda1_sys = os.path.join(self.sda_sys, "sda1")
         os.makedirs(sda1_sys, exist_ok=True)
         with open(os.path.join(sda1_sys, "dev"), "w") as f:
             f.write("8:1\n")
         sda1_node = os.path.join(self.mock_dev_block, "sda1")
-        with open(sda1_node, "w") as f:
-            f.write("")
+        if os.path.exists(sda1_node):
+            os.remove(sda1_node)
 
         # Heartbeat so watchdog finishes tick 1 cleanly
         with open(self.heartbeat_file, "w") as f:
@@ -687,6 +717,142 @@ exit 0
         with open(self.inv_file) as f:
             content = f.read()
         self.assertIn("/dev/block/sda1:8:1:", content)
+        self.assertTrue(os.path.exists(sda1_node))
+
+    def test_watchdog_newly_appearing_partition_mknod_arg_construction(self):
+        """
+        Verify exact argument construction passed to mknod for newly appearing partition.
+        Catches regression where $pmin was used instead of $p_min (empty minor number).
+        """
+        sda2_sys = os.path.join(self.sda_sys, "sda2")
+        os.makedirs(sda2_sys, exist_ok=True)
+        with open(os.path.join(sda2_sys, "dev"), "w") as f:
+            f.write("8:2\n")
+        sda2_node = os.path.join(self.mock_dev_block, "sda2")
+        if os.path.exists(sda2_node):
+            os.remove(sda2_node)
+
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}")
+        self.assertTrue(os.path.exists(self.mknod_log), "mknod was not invoked")
+        with open(self.mknod_log) as f:
+            mknod_invocations = f.read().splitlines()
+
+        matching = [l for l in mknod_invocations if "sda2" in l]
+        self.assertTrue(len(matching) > 0, f"No mknod invocation found for sda2 in {mknod_invocations}")
+        # Validate exact 4 arguments: <node> b <major> <minor>
+        args = matching[0].split()
+        self.assertEqual(len(args), 4, f"mknod invoked with invalid argument count: {args}")
+        self.assertTrue(args[0].endswith("sda2"))
+        self.assertEqual(args[1], "b")
+        self.assertEqual(args[2], "8")
+        self.assertEqual(args[3], "2", "Minor number must be '2' (not empty, caught $pmin regression)")
+
+    def test_watchdog_newly_appearing_disk_created_locked_and_appended(self):
+        """Verify watchdog detects newly appearing whole disk, creates node, locks ro=1, and appends to inventory."""
+        sdb_sys = os.path.join(self.mock_sys_block, "sdb")
+        os.makedirs(sdb_sys, exist_ok=True)
+        with open(os.path.join(sdb_sys, "device"), "w") as f:
+            f.write("mock_hw\n")
+        with open(os.path.join(sdb_sys, "dev"), "w") as f:
+            f.write("8:16\n")
+        sdb_node = os.path.join(self.mock_dev_block, "sdb")
+        if os.path.exists(sdb_node):
+            os.remove(sdb_node)
+
+        with open(self.heartbeat_file, "w") as f:
+            f.write("pet")
+
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}")
+        self.assertIn("Detected newly appearing physical disk: /dev/block/sdb", res.stderr)
+        self.assertIn("Locked newly appearing disk read-only: /dev/block/sdb (ro=1)", res.stderr)
+        with open(self.inv_file) as f:
+            content = f.read()
+        self.assertIn("/dev/block/sdb:8:16:", content)
+
+    def test_watchdog_newly_appearing_partition_mknod_failure_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION when mknod fails for a newly appearing partition."""
+        sda3_sys = os.path.join(self.sda_sys, "sda3")
+        os.makedirs(sda3_sys, exist_ok=True)
+        with open(os.path.join(sda3_sys, "dev"), "w") as f:
+            f.write("8:3\n")
+        sda3_node = os.path.join(self.mock_dev_block, "sda3")
+        if os.path.exists(sda3_node):
+            os.remove(sda3_node)
+
+        res = self.run_watchdog({"MKNOD_FAIL": "1", "WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("mknod failed for newly appearing partition '/dev/block/sda3'", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_newly_appearing_partition_failed_blockdev_setro_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION when blockdev --setro fails on newly appearing partition."""
+        sda4_sys = os.path.join(self.sda_sys, "sda4")
+        os.makedirs(sda4_sys, exist_ok=True)
+        with open(os.path.join(sda4_sys, "dev"), "w") as f:
+            f.write("8:4\n")
+        sda4_node = os.path.join(self.mock_dev_block, "sda4")
+
+        res = self.run_watchdog({
+            "BLOCKDEV_SETRO_FAIL_DEV": sda4_node,
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Failed to execute blockdev --setro on newly appearing partition", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_newly_appearing_partition_failed_blockdev_getro_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION when blockdev --getro fails or is not 1 on new partition."""
+        sda5_sys = os.path.join(self.sda_sys, "sda5")
+        os.makedirs(sda5_sys, exist_ok=True)
+        with open(os.path.join(sda5_sys, "dev"), "w") as f:
+            f.write("8:5\n")
+        sda5_node = os.path.join(self.mock_dev_block, "sda5")
+
+        res = self.run_watchdog({
+            "BLOCKDEV_FAIL_DEV": sda5_node,
+            "WATCHDOG_MAX_TICKS": "1"
+        })
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("could not be locked read-only (ro=0, expected 1)", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_newly_appearing_partition_malformed_dev_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION when newly appearing partition has malformed sysfs dev."""
+        sda6_sys = os.path.join(self.sda_sys, "sda6")
+        os.makedirs(sda6_sys, exist_ok=True)
+        with open(os.path.join(sda6_sys, "dev"), "w") as f:
+            f.write("invalid_dev\n")
+
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("has malformed dev file", res.stderr)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
+    def test_watchdog_newly_appearing_partition_inventory_append_failure_fails_closed(self):
+        """Verify watchdog triggers STORAGE_VIOLATION if inventory append fails."""
+        sda7_sys = os.path.join(self.sda_sys, "sda7")
+        os.makedirs(sda7_sys, exist_ok=True)
+        with open(os.path.join(sda7_sys, "dev"), "w") as f:
+            f.write("8:7\n")
+
+        # Make directory in place of inv_file to cause append failure
+        os.remove(self.inv_file)
+        os.makedirs(self.inv_file, exist_ok=True)
+
+        res = self.run_watchdog({"WATCHDOG_MAX_TICKS": "1"})
+        self.assertEqual(res.returncode, 1)
+        with open(self.state_file) as f:
+            self.assertEqual(f.read().strip(), "STORAGE_VIOLATION")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

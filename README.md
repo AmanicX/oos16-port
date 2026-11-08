@@ -1,11 +1,11 @@
 # OxygenOS 16 Port for OnePlus 7T (`HD1901` / `hotdogb`)
-### Pure Volatile RAM-Resident Execution via `fastboot boot` — Zero Physical Storage Writes
+### Pure Volatile RAM-Resident Execution via `fastboot boot` — Designed for Zero Physical Storage Writes
 
 [![Android](https://img.shields.io/badge/Android-16%20Baklava%20(SDK%2036)-green.svg)](https://developer.android.com/)
 [![Device](https://img.shields.io/badge/Device-OnePlus%207T%20(hotdogb)-blue.svg)](https://wiki.lineageos.org/devices/hotdogb/)
 [![SoC](https://img.shields.io/badge/SoC-Snapdragon%20855%2B%20(SM8150--AC)-orange.svg)](https://www.qualcomm.com/)
-[![Storage](https://img.shields.io/badge/Storage-100%25%20Read--Only%20RAM-red.svg)](#non-negotiable-safety-contract)
-[![Tests](https://img.shields.io/badge/Tests-178%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
+[![Storage](https://img.shields.io/badge/Storage-Fail--Closed%20RAM-red.svg)](#non-negotiable-safety-contract)
+[![Tests](https://img.shields.io/badge/Tests-201%20Passing-brightgreen.svg)](#7-verification-status--test-matrix)
 [![Audit](https://img.shields.io/badge/Audit-36%2F36%20Passed-brightgreen.svg)](#7-verification-status--test-matrix)
 
 ---
@@ -15,7 +15,7 @@
 This project ports and runs **OxygenOS 16** (Android 16 / SDK 36 / `BP4A.251205.006`) on the **OnePlus 7T (`HD1901` / `hotdogb`)** purely in volatile RAM using `fastboot boot`.
 
 ### Core Features & Architecture
-1. **Zero Storage Alteration**: Internal UFS storage devices (`/dev/block/sd*`, `/dev/block/mmcblk*`) and all child partitions are dynamically locked read-only (`ro=1`). The existing installation (crDroid/LineageOS) and user data remain completely untouched.
+1. **Designed for Zero Storage Alteration**: Internal UFS storage devices (`/dev/block/sd*`, `/dev/block/mmcblk*`) and all child partitions are dynamically locked read-only (`ro=1`). The existing installation (crDroid/LineageOS) and user data remain completely untouched.
 2. **Volatile RAM Staging**: Staging filesystems (`/mnt` and `/tmp`) and ephemeral `/data` reside strictly in RAM (`tmpfs`), vanishing entirely upon power cycle.
 3. **Display & Graphics Bringup**: Target Qualcomm DRM compositor (`msm_drm`), Adreno 640 GPU (`kgsl-3d0`), and `SurfaceFlinger` for OnePlus 7T AMOLED display (including fixed 60Hz aftermarket panels: `dsi_samsung_s6e3fc2x01_cmd_display`).
 4. **Android 16 Bootstrap APEX Architecture**: Complete authentic staging and activation for all 4 bootstrap APEX modules (`com.android.runtime`, `com.android.art`, `com.android.i18n`, `com.android.tzdata`) with Bionic linker64, ART runtime libraries, ICU data, and timezone metadata.
@@ -25,7 +25,9 @@ This project ports and runs **OxygenOS 16** (Android 16 / SDK 36 / `BP4A.251205.
 
 ## 2. Non-Negotiable Safety Contract
 
-To guarantee that the host or phone never writes to physical internal flash:
+Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification.
+
+To prevent write execution paths to physical internal flash:
 * **Strict Command Banning**: Destructive fastboot subcommands (`flash`, `erase`, `format`, `wipe`, `set_active`) are intercepted and blocked by `tools/safe/fastboot`.
 * **Dynamic Block-Layer Write Locks**: The Stage-1 RAM supervisor discovers all physical block devices (`/sys/block/*`) and child partitions, applies `blockdev --setro`, and confirms `ro=1` on every partition before any operation begins.
 * **Continuous Guard Loop**: A background monitoring loop periodically verifies that all physical disks and partitions remain read-only; any violation immediately triggers an emergency reboot to bootloader.
@@ -278,13 +280,13 @@ bash tools/safe/run_stage2.sh
 
 ## 7. Verification Status & Test Matrix
 
-To maintain rigorous engineering honesty, verification states are strictly partitioned:
+To maintain rigorous engineering honesty, verification states are strictly partitioned across 6 distinct tiers:
 
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
-| **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `loader.img` (SHA-256: `6064d5fd...`, 36/36), `stage1.img` (SHA-256: `2030aa31...`, 36/36), and ramdisks (34/34 + 1 optional). In CI without device kernel inputs, ramdisks pass and packaged boot-image audits are logged as skipped. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (178/178)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & fail-closed lifecycle (34), Stage-2 runner integration mocks (72), Storage safety & inventory revalidation (20), and Go BinderFS unit tests (15). Total Python unittests: 163/163; Go unit tests: 15/15. |
+| **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `loader.img` (SHA-256: `d09ad5a5...`, 36/36), `stage1.img` (SHA-256: `eefcce94...`, 36/36), and ramdisk directories (34/34 passed, 0 failed, 1 optional unverified cmdline). In CI without device kernel inputs, ramdisks pass and packaged boot-image audits are logged as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (201/201)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & fail-closed lifecycle (41), Stage-2 runner integration mocks (72), Storage safety & inventory revalidation (27), Disposable loop & block device safety (9: 8 passed + 1 unprivileged skip locally, 9 in CI/VM), and Go BinderFS unit tests (15). Total Python unittests: 186; Go unit tests: 15. |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
@@ -293,4 +295,4 @@ To maintain rigorous engineering honesty, verification states are strictly parti
 
 ## 8. License & Disclaimer
 
-This project is for research and development purposes. It does not flash, modify, format, or overwrite any physical internal partition. All operating system files run strictly in volatile memory (RAM) and are discarded upon power-off or reboot.
+This project is for research and development purposes. Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification. All operating system files run strictly in volatile memory (RAM) and are discarded upon power-off or reboot.

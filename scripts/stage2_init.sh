@@ -295,6 +295,60 @@ parse_and_validate_partition_map() {
     [ -w /dev/kmsg ] && echo "[STAGE2] Partition manifest $map_file strictly validated." > /dev/kmsg 2>/dev/null || true
 }
 
+# Safe Atomic Storage Inventory Updater
+atomic_update_inventory() {
+    local record="$1"
+    local cp_tag="$2"
+    local m_inv="${MNT_DIR:-/mnt}/physical_storage_inventory"
+    local t_inv="${TMP_DIR:-/tmp}/physical_storage_inventory"
+
+    if [ "${STAGE2_TEST_MODE:-0}" != "1" ]; then
+        [ -f "$m_inv" ] || fatal "Atomic update failed: $m_inv missing in production mode at checkpoint $cp_tag!"
+        [ -f "$t_inv" ] || fatal "Atomic update failed: $t_inv missing in production mode at checkpoint $cp_tag!"
+    fi
+
+    local m_target_dir="${MNT_DIR:-/mnt}"
+    local t_target_dir="${TMP_DIR:-/tmp}"
+    local m_staging=""
+    local t_staging=""
+
+    if [ -f "$m_inv" ]; then
+        m_staging="$m_target_dir/inventory.staging.$$.$RANDOM"
+        cp -f "$m_inv" "$m_staging" || fatal "Failed to copy $m_inv to staging $m_staging at checkpoint $cp_tag!"
+        echo "$record" >> "$m_staging" || fatal "Failed to write record to $m_staging at checkpoint $cp_tag!"
+        grep -q -F "$record" "$m_staging" || fatal "Record verification failed in $m_staging at checkpoint $cp_tag!"
+    fi
+
+    if [ -f "$t_inv" ]; then
+        t_staging="$t_target_dir/inventory.staging.$$.$RANDOM"
+        cp -f "$t_inv" "$t_staging" || fatal "Failed to copy $t_inv to staging $t_staging at checkpoint $cp_tag!"
+        echo "$record" >> "$t_staging" || fatal "Failed to write record to $t_staging at checkpoint $cp_tag!"
+        grep -q -F "$record" "$t_staging" || fatal "Record verification failed in $t_staging at checkpoint $cp_tag!"
+    fi
+
+    if [ -n "$m_staging" ] && [ -n "$t_staging" ]; then
+        if ! cmp -s "$m_staging" "$t_staging"; then
+            rm -f "$m_staging" "$t_staging" 2>/dev/null || true
+            fatal "Staged inventory files are not byte-identical at checkpoint $cp_tag!"
+        fi
+    fi
+
+    # Atomic publication via rename
+    if [ -n "$m_staging" ]; then
+        mv -f "$m_staging" "$m_inv" || fatal "Atomic publish to $m_inv failed at checkpoint $cp_tag!"
+    fi
+    if [ -n "$t_staging" ]; then
+        mv -f "$t_staging" "$t_inv" || fatal "Atomic publish to $t_inv failed at checkpoint $cp_tag!"
+    fi
+
+    # Post-publication byte-identity verification
+    if [ -f "$m_inv" ] && [ -f "$t_inv" ]; then
+        if ! cmp -s "$m_inv" "$t_inv"; then
+            fatal "Published inventories byte-identity mismatch after update at checkpoint $cp_tag!"
+        fi
+    fi
+}
+
 # Strict Physical Storage Inventory Revalidator
 # Note on Linux block-layer read-only limitations:
 # blockdev --setro enforces the BLKROSET flag on the kernel gendisk/block device,
@@ -434,9 +488,8 @@ revalidate_storage_inventory() {
                 local n_ro
                 n_ro=$(tb_run blockdev --getro "$check_disk_node" 2>/dev/null || echo "0")
                 [ "$n_ro" = "1" ] || fatal "Newly appearing device $dev_node could not be locked read-only (ro=$n_ro)!"
-                [ -f "$mnt_inv" ] && echo "$dev_node:$n_maj:$n_min:$bdir" >> "$mnt_inv"
-                [ -f "$tmp_inv" ] && echo "$dev_node:$n_maj:$n_min:$bdir" >> "$tmp_inv"
-                log_msg "[STAGE2] Locked newly appearing physical disk read-only: $dev_node (ro=1) and appended to inventory."
+                atomic_update_inventory "$dev_node:$n_maj:$n_min:$bdir" "$checkpoint"
+                log_msg "[STAGE2] Locked newly appearing physical disk read-only: $dev_node (ro=1) and atomically updated inventory."
             fi
 
             # Check child partitions of this disk
@@ -475,9 +528,8 @@ revalidate_storage_inventory() {
                     local p_ro
                     p_ro=$(tb_run blockdev --getro "$check_part_node" 2>/dev/null || echo "0")
                     [ "$p_ro" = "1" ] || fatal "Newly appearing partition $part_node could not be locked read-only (ro=$p_ro)!"
-                    [ -f "$mnt_inv" ] && echo "$part_node:$p_maj:$p_min:$pdir" >> "$mnt_inv"
-                    [ -f "$tmp_inv" ] && echo "$part_node:$p_maj:$p_min:$pdir" >> "$tmp_inv"
-                    log_msg "[STAGE2] Locked newly appearing physical partition read-only: $part_node (ro=1) and appended to inventory."
+                    atomic_update_inventory "$part_node:$p_maj:$p_min:$pdir" "$checkpoint"
+                    log_msg "[STAGE2] Locked newly appearing physical partition read-only: $part_node (ro=1) and atomically updated inventory."
                 fi
             done
         fi

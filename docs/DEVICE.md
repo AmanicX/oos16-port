@@ -133,7 +133,7 @@ UFS LUNs: `sda`, `sdb`, `sdc`, `sdd`, `sde`, `sdf`
 
 ## 8. Linux Block-Device Protection Model & Safety Architecture
 
-Because this port executes exclusively from volatile RAM via `fastboot boot`, physical storage integrity is safety-critical. Internal UFS 3.0 flash must never receive write requests.
+Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification. Internal UFS 3.0 flash must never receive write requests.
 
 ### 8.1 Linux Block-Layer Read-Only Scope (`BLKROSET`)
 - Setting `blockdev --setro` invokes the kernel ioctl `BLKROSET`, which sets the `bdev_read_only()` flag on the target block device descriptor.

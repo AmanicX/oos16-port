@@ -469,8 +469,12 @@ case "$subcmd" in
         ;;
     df)
         if [ "${{MOCK_DF_FAIL:-0}}" = "1" ]; then
-            echo "df: error" >&2
+            echo "df: failed" >&2
             exit 1
+        elif [ "${{MOCK_DF_CORRUPT:-0}}" = "1" ]; then
+            echo "Filesystem 1M-blocks Used Available Use% Mounted on"
+            echo "tmpfs 6500 100 UNKNOWN 2% $1"
+            exit 0
         elif [ "${{MOCK_DF_LOW_CAPACITY:-0}}" = "1" ]; then
             echo "Filesystem 1M-blocks Used Available Use% Mounted on"
             echo "tmpfs 100 90 10 90% $1"
@@ -481,9 +485,16 @@ case "$subcmd" in
             exit 0
         fi
         ;;
+    mkdir)
+        if [ "${{MOCK_MKDIR_FAIL:-0}}" = "1" ]; then
+            echo "mkdir: permission denied" >&2
+            exit 1
+        fi
+        exec /bin/mkdir "$@"
+        ;;
     mount)
         if [ "${{MOCK_MOUNT_FAIL:-0}}" = "1" ]; then
-            echo "mount: error" >&2
+            echo "mount: error: mount failed" >&2
             exit 1
         fi
         exit 0
@@ -502,6 +513,7 @@ esac
         """Extract mount_and_verify_tmpfs definition from stage1/loader_ramdisk/init and run it."""
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}:" + env.get("PATH", "")
+        env["PROC_MOUNTS_FILE"] = self.proc_mounts
         if extra_env:
             env.update(extra_env)
 
@@ -510,9 +522,23 @@ esac
         with open(init_file, "r") as f:
             init_code = f.read()
 
-        # Build runner script
-        test_script = f"""
-#!/usr/bin/env bash
+        start_marker = "mount_and_verify_tmpfs() {"
+        end_marker = '\nmount_and_verify_tmpfs "/mnt"'
+        self.assertIn(start_marker, init_code)
+        self.assertIn(end_marker, init_code)
+        start_idx = init_code.index(start_marker)
+        end_idx = init_code.index(end_marker)
+        prod_function = init_code[start_idx:end_idx].strip()
+
+        # Verify that native_ramdisk/init defines the exact same function
+        native_init_file = os.path.join(PROJECT_ROOT, "stage1/native_ramdisk/init")
+        with open(native_init_file, "r") as f:
+            native_init_code = f.read()
+        native_prod_function = native_init_code[native_init_code.index(start_marker):native_init_code.index(end_marker)].strip()
+        self.assertEqual(prod_function, native_prod_function, "Loader and native ramdisks must have identical mount_and_verify_tmpfs")
+
+        # Build runner script that executes the ACTUAL production function
+        test_script = f"""#!/usr/bin/env bash
 set -e
 fatal_halt() {{
     echo "[FATAL] $1" >&2
@@ -525,53 +551,7 @@ log_kmsg() {{
     "{self.toybox_bin}" "$@"
 }}
 
-# Redirect /proc/mounts to our mock
-sed_mounts="{self.proc_mounts}"
-mount_and_verify_tmpfs() {{
-    local target="$1"
-    local size_opt="$2"
-    local min_free_mb="$3"
-
-    if [ ! -d "$target" ]; then
-        mkdir -p "$target" || fatal_halt "Failed to create directory $target!"
-    fi
-
-    if ! "{self.toybox_bin}" mount -t tmpfs -o "mode=0777,$size_opt" tmpfs "$target"; then
-        fatal_halt "Failed to mount tmpfs on $target (options: $size_opt)!"
-    fi
-
-    local mount_line
-    mount_line=$("{self.toybox_bin}" grep -E "[[:space:]]${{target}}[[:space:]]" "$sed_mounts" 2>/dev/null || true)
-    if [ -z "$mount_line" ]; then
-        fatal_halt "Mount verification failed: $target is not mounted according to /proc/mounts!"
-    fi
-
-    local fs_type
-    fs_type=$(echo "$mount_line" | "{self.toybox_bin}" awk '{{print $3}}')
-    if [ "$fs_type" != "tmpfs" ]; then
-        fatal_halt "Mount verification failed: $target filesystem is '$fs_type', expected 'tmpfs'!"
-    fi
-
-    local fs_src
-    fs_src=$(echo "$mount_line" | "{self.toybox_bin}" awk '{{print $1}}')
-    case "$fs_src" in
-        /dev/block/*|/dev/sd*|/dev/mmcblk*)
-            fatal_halt "CRITICAL SAFETY VIOLATION: $target is backed by physical block device '$fs_src'!" ;;
-    esac
-
-    local df_out
-    df_out=$("{self.toybox_bin}" df -m "$target" 2>/dev/null || true)
-    local free_mb
-    free_mb=$(echo "$df_out" | "{self.toybox_bin}" awk 'NR>1 {{print $4}}' | "{self.toybox_bin}" tr -d '[:space:]')
-    case "$free_mb" in
-        ''|*[!0-9]*) fatal_halt "Failed to parse numeric free capacity for $target from df ('$df_out')!" ;;
-    esac
-
-    if [ "$free_mb" -lt "$min_free_mb" ]; then
-        fatal_halt "Mount capacity error: $target provides only ${{free_mb}}MB free (< ${{min_free_mb}}MB required)!"
-    fi
-    log_kmsg "[LOADER-PID1] Verified $target: tmpfs mounted (free: ${{free_mb}}MB, quota: $size_opt)."
-}}
+{prod_function}
 
 mount_and_verify_tmpfs "$1" "$2" "$3"
 """
@@ -588,14 +568,44 @@ mount_and_verify_tmpfs "$1" "$2" "$3"
             env=env
         )
 
-    def test_stage1_mount_success(self):
-        """Verify successful tmpfs mount and verification in Stage 1."""
+    def test_stage1_mount_success_mnt(self):
+        """Verify successful /mnt tmpfs mount and verification in Stage 1."""
         with open(self.proc_mounts, "a") as f:
             f.write(f"tmpfs {self.mnt_dir} tmpfs rw,mode=777 0 0\n")
 
         res = self._extract_and_run_mount_tmpfs(self.mnt_dir, "size=6500M", 576)
         self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}\n{res.stdout}")
         self.assertIn("Verified", res.stdout)
+        self.assertIn("quota: size=6500M", res.stdout)
+
+    def test_stage1_mount_success_tmp(self):
+        """Verify successful /tmp tmpfs mount and verification in Stage 1."""
+        tmp_dir = os.path.join(self.test_dir, "mock_tmp")
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"tmpfs {tmp_dir} tmpfs rw,mode=777 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(tmp_dir, "size=512M", 64)
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}\n{res.stdout}")
+        self.assertIn("Verified", res.stdout)
+        self.assertIn("quota: size=512M", res.stdout)
+
+    def test_stage1_mount_command_failure_fails_closed(self):
+        """Verify mount failure when mount command fails."""
+        res = self._extract_and_run_mount_tmpfs(
+            self.mnt_dir,
+            "size=6500M",
+            576,
+            extra_env={"MOCK_MOUNT_FAIL": "1"}
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Failed to mount tmpfs on", res.stderr)
+
+    def test_stage1_missing_mount_table_entry_fails_closed(self):
+        """Verify failure when mount command succeeds but /proc/mounts lacks the target."""
+        # proc_mounts is empty
+        res = self._extract_and_run_mount_tmpfs(self.mnt_dir, "size=6500M", 576)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("is not mounted according to /proc/mounts", res.stderr)
 
     def test_stage1_mount_wrong_fstype_fails_closed(self):
         """Verify mount failure when filesystem type is not tmpfs."""
@@ -616,6 +626,34 @@ mount_and_verify_tmpfs "$1" "$2" "$3"
         self.assertIn("CRITICAL SAFETY VIOLATION: ", res.stderr)
         self.assertIn("backed by physical block device", res.stderr)
 
+    def test_stage1_mount_df_failure_fails_closed(self):
+        """Verify mount failure when df command returns non-zero error."""
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"tmpfs {self.mnt_dir} tmpfs rw 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(
+            self.mnt_dir,
+            "size=6500M",
+            576,
+            extra_env={"MOCK_DF_FAIL": "1"}
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Failed to parse numeric free capacity", res.stderr)
+
+    def test_stage1_mount_invalid_capacity_output_fails_closed(self):
+        """Verify mount failure when df returns malformed non-numeric output."""
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"tmpfs {self.mnt_dir} tmpfs rw 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(
+            self.mnt_dir,
+            "size=6500M",
+            576,
+            extra_env={"MOCK_DF_CORRUPT": "1"}
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Failed to parse numeric free capacity", res.stderr)
+
     def test_stage1_mount_capacity_exhaustion_fails_closed(self):
         """Verify mount failure when usable capacity is below requirement."""
         with open(self.proc_mounts, "a") as f:
@@ -630,6 +668,29 @@ mount_and_verify_tmpfs "$1" "$2" "$3"
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("Mount capacity error:", res.stderr)
         self.assertIn("provides only 10MB free", res.stderr)
+
+    def test_stage1_mount_missing_mountpoint_creation_success(self):
+        """Verify mountpoint directory is automatically created if it does not exist."""
+        nonexistent = os.path.join(self.test_dir, "nonexistent_mnt")
+        self.assertFalse(os.path.exists(nonexistent))
+        with open(self.proc_mounts, "a") as f:
+            f.write(f"tmpfs {nonexistent} tmpfs rw 0 0\n")
+
+        res = self._extract_and_run_mount_tmpfs(nonexistent, "size=6500M", 576)
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr}\n{res.stdout}")
+        self.assertTrue(os.path.isdir(nonexistent))
+
+    def test_stage1_mount_mkdir_failure_fails_closed(self):
+        """Verify failure when mountpoint directory creation fails."""
+        nonexistent = os.path.join(self.test_dir, "nonexistent_mnt_fail")
+        res = self._extract_and_run_mount_tmpfs(
+            nonexistent,
+            "size=6500M",
+            576,
+            extra_env={"MOCK_MKDIR_FAIL": "1"}
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Failed to create directory", res.stderr)
 
 
 if __name__ == "__main__":

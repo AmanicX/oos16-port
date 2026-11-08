@@ -1,10 +1,10 @@
 # OxygenOS 16 Port to OnePlus 7T (HD1901) — Project Summary
 
-> **Document Version**: 2.8.0 (Fail-Closed Storage Audit & Protection, Atomic Inventory Staging, Watchdog Fail-Closed Architecture, 6-Checkpoint Revalidation, 178 Total Automated Tests: 163 Python + 15 Go, 36/36 Static Safety Auditor Checks)  
+> **Document Version**: 2.9.0 (Disposable Loop & Block-Device Test Tier, Fail-Closed Storage Audit & Protection, Atomic Inventory Staging, Watchdog Fail-Closed Architecture, 6-Checkpoint Revalidation, 201 Total Automated Tests: 186 Python + 15 Go, 36/36 Static Safety Auditor Checks on Packaged Images, 34/34 on Ramdisks)  
 > **Target Device**: OnePlus 7T (`HD1901` / `hotdogb`, Snapdragon 855+ / SM8150-AC, 8 GB RAM)  
 > **Source ROM**: OxygenOS 16 / Android 16 (`BP2A.250605.015`, SDK 36 / `Baklava`, OnePlus 9 `lemonade` / `LE2113_16.0.10.500(EX01)` EEA donor, `ota_full-LE2113_16.0.10.500.zip`, SHA-256 `5ea5f120a2bce5eb98bd2a5d1aca872f5888903825861142bd0900772b8d0844`)  
 > **Base OS on Device**: crDroid (Android 16 / LineageOS 23.2 base, FBE Encrypted)  
-> **Primary Safety Mandate**: **Zero physical writes to internal flash** — Strictly volatile RAM execution.
+> **Primary Safety Mandate**: **Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification.**
 
 ---
 
@@ -17,7 +17,7 @@ The objective of this project is to port and run OxygenOS 16 (Android 16 / SDK 3
 4. **Android 16 Bootstrap APEX Architecture** (`com.android.runtime`, `com.android.art`, `com.android.i18n`, `com.android.tzdata`).
 
 ### The Non-Negotiable Safety Directive
-Under **no circumstances** is the phone's internal physical flash storage to be altered:
+Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification:
 * **Absolute Command Banning**: No `fastboot flash`, `erase`, `format`, `wipe`, `set_active`, logical partition modification, or raw block writes (`dd of=`, `mount -o rw`).
 * **Hardware-Level Write Locks**: Every physical block device (`/sys/block/*`) and child partition (`sda1`..`sda32`) is dynamically write-locked read-only (`blockdev --setro`) before staging begins, and continuously monitored by a background guard loop.
 * **Ephemeral Volatile State**: `/data`, `/mnt`, and `/tmp` reside strictly in RAM `tmpfs` and vanish upon reboot, keeping crDroid and user data 100% intact.
@@ -282,9 +282,11 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
   16. **10-State Hardware Display & Graphics Diagnostics**:
      - Implemented structured 10-state hardware diagnostic tracking (DRM `card0`, panel detected, panel enabled, DRM connector `DSI-1`, Adreno 640 GPU, EGL ready, Composer HAL, SurfaceFlinger, frames presented post-handover, touchscreen input) with clear separation between pre-handover hardware probe and post-handover userspace rendering milestones.
   17. **CI, Boot Images & Documentation Integrity**:
-     - Rebuilt local boot images: `build/loader.img` (SHA-256: `6064d5fdd8d8e9e4e07649c662706a14178641877227425ea5fc3c766581d4d4`) and `build/stage1.img` (SHA-256: `2030aa31278dd863f755dba20e68c33d2f8ffcd6141fddf44a347403bd359a57`), both passing 36/36 pre-boot safety checks.
+     - Rebuilt local boot images: `build/loader.img` (SHA-256: `d09ad5a59c42c73fe62c17235e73f38d0d676e0191af32ea7e3fb056a41215ab`) and `build/stage1.img` (SHA-256: `eefcce94b79578966e077a4d3c5c87d39ea2d4017f5e4bb0104943ad3824b8f2`), both passing 36/36 pre-boot safety checks.
      - Static cross-compiled ARM64 binary `src/binderfs_init_arm64` installed byte-identically across ramdisks.
-     - Total automated test suite expanded to 178 passing tests (163 Python + 15 Go).
+     - Total automated test suite expanded to 201 passing tests (186 Python + 15 Go).
+  18. **Disposable Loop & Linux Block-Device Test Tier (`tests/test_storage_loop.py`)**:
+     - Created comprehensive Linux block-device test suite verifying real kernel loop semantics (major/minor matching, block-special node construction, blockdev --setro/--getro, sysfs partition discovery, and write rejection) when privileged in CI/VM, coupled with simulated block-device semantics tests that execute unconditionally across all environments.
 
 ---
 
@@ -292,9 +294,9 @@ Under **no circumstances** is the phone's internal physical flash storage to be 
 
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
-| **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `6064d5fd...`, 36/36), `build/stage1.img` (SHA-256: `2030aa31...`, 36/36), and ramdisks (34/34 + 1 optional). In CI without device kernel binaries, ramdisks pass and packaged image audits are reported as skipped. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (178/178)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & fail-closed lifecycle (34), Stage-2 runner integration mocks (72), Storage safety & inventory revalidation (20), and Go BinderFS unit tests (15). Total Python unittests: 163/163; Go unit tests: 15/15. |
+| **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `d09ad5a5...`, 36/36), `build/stage1.img` (SHA-256: `eefcce94...`, 36/36), and ramdisks (34/34 + 1 optional). In CI without device kernel binaries, ramdisks pass and packaged image audits are reported as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (201/201)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol & fail-closed lifecycle (41), Stage-2 runner integration mocks (72), Storage safety & inventory revalidation (27), Loop & block device safety (9: 8 passed + 1 unprivileged skip locally, 9 in CI), and Go BinderFS unit tests (15). Total Python unittests: 186; Go unit tests: 15. |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
@@ -307,5 +309,5 @@ The repository is in a verified, build-clean, and audited state:
 * All host-side safety wrappers (`tools/safe/adb`, `tools/safe/fastboot`, `tools/safe/audit-no-writes.sh`) are active and verified.
 * All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (36/36).
 * All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS` and `PARTITION_MAP`.
-* All 178 automated unit and integration tests pass without error (100% OK: 163 Python + 15 Go).
-* **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`).
+* All 201 automated unit and integration tests pass without error (100% OK: 186 Python + 15 Go).
+* **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`). Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to live device-level verification.

@@ -193,6 +193,7 @@ mount_and_verify_tmpfs() {
     local target="$1"
     local size_opt="$2"
     local min_free_mb="$3"
+    local mounts_f="${PROC_MOUNTS_FILE:-/proc/mounts}"
 
     # 1. Ensure mountpoint exists
     if [ ! -d "$target" ]; then
@@ -206,7 +207,7 @@ mount_and_verify_tmpfs() {
 
     # 3. Inspect /proc/mounts to confirm active mount
     local mount_line
-    mount_line=$(/system/bin/toybox grep -E "[[:space:]]${target}[[:space:]]" /proc/mounts 2>/dev/null || true)
+    mount_line=$(/system/bin/toybox grep -E "[[:space:]]${target}[[:space:]]" "$mounts_f" 2>/dev/null || true)
     if [ -z "$mount_line" ]; then
         fatal_halt "Mount verification failed: $target is not mounted according to /proc/mounts!"
     fi
