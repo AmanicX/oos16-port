@@ -17,35 +17,29 @@
 | **H10** | Physical Storage Safety Tests | `tests/test_storage_safety.py` | 39 tests: multi-disk sysfs discovery, duplicate detection, byte-identity verification, strict block-node identity verification (`stat -L -c "%t:%T"` with hex-to-decimal conversion), mount_and_verify_tmpfs extraction, capacity exhaustion, 6 checkpoint tracking | 39/39 tests pass | **PASS** |
 | **H10b** | Loop & Block Device Safety Tests | `tests/test_storage_loop.py` | 14 total test methods: 9 simulated block-device semantics tests (unconditional) + 5 live kernel loop-device integration tests (exercising production `scripts/stage2_init.sh` `verify_block_node_identity` with real `stat -L -c "%t:%T"` against disposable Linux loop devices when privileged in CI/VM) | 9 tests executed locally (9 passed, 0 failed, 1 class-level unprivileged skip); all executed in CI/VM | **PASS** |
 | **H11** | Ramdisk Safety Audit | `loader_ramdisk` & `native_ramdisk` | `audit-no-writes.sh` on directory targets (34 checks per directory, 0 failures, 1 optional unverified cmdline). Unconditionally validated both locally and in CI | 34/34 Passed, 0 Failed | **PASS** |
-| **H12** | Packaged Loader Audit | `build/loader.img` | Rebuilt SHA-256: `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` (commit `cd6afa5`, 2026-11-09) / Baseline: `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **PASS** |
-| **H13** | Packaged Stage1 Audit | `build/stage1.img` | Rebuilt SHA-256: `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` (commit `cd6afa5`, 2026-11-09) / Baseline: `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **PASS** |
+| **H12** | Packaged Loader Audit | `build/loader.img` | Rebuilt SHA-256: `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` (built 2026-11-09 01:49:46 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **PASS** |
+| **H13** | Packaged Stage1 Audit | `build/stage1.img` | Rebuilt SHA-256: `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` (built 2026-11-09 01:49:58 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **PASS** |
 | **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`). Verified strictly locally; explicitly logged as skipped in CI checkout via `.gitignore` | Strict SHA-256 and symbol match locally, Skipped in CI checkout | **PASS** |
 
 ### Summary of Automated Test Suite
 
-- **Automated Python Tests**:
-  - Total defined test methods: **224 test methods** across 9 test classes.
-  - Simulated / host tests: **219 tests** (unconditional across all environments).
-  - Live loop-device tests: **5 tests** in `TestLiveLoopBlockDeviceSafety` (conditional on loop capabilities / root privileges).
-  - Local environment execution:
-    - Tests run: **219 tests**
-    - Passed: **219 tests**
-    - Failed: **0 tests**
-    - Errors: **0**
-    - Skipped: **1 test suite** (`TestLiveLoopBlockDeviceSafety`, skipped at class level via `setUpClass` due to unprivileged user space without loop-device capabilities; `CAN_LOOP: False`).
-    - Note on test counting: In Python's `unittest`, class-level `setUpClass` skips do not increment `testsRun`; all 219 tests reported in `testsRun` actually executed and passed.
-  - CI environment execution:
-    - Without loop capabilities: **219 passed, 1 skipped**.
-    - With loop capabilities: up to **224 passed**.
-- **Automated Go Tests**:
-  - Total: **15 tests**
-  - Passed: **15 tests**
-  - Failed: **0 tests**
-  - Skipped: **0 tests**
-- **Combined Host Verification**:
-  - Local combined: **234 passed, 1 skipped** (out of 235 test units: 219 simulated Python tests + 1 skipped live loop class + 15 Go tests; 239 total defined test methods across Python and Go).
+- **Total Defined Test Methods**:
+  - Codebase grand total: **239 test methods** (224 Python test methods across 9 classes in 7 files + 15 Go test functions).
+- **Actual Latest CI Environment Execution (GitHub Actions Run #18, commit `4cabd5e`)**:
+  - Python tests executed: **224 tests ran, 224 passed, 0 failed, 0 errors, 0 skipped**.
+  - Live loop-device tests: **All 5 live loop-device integration tests executed and passed** in the privileged CI container environment.
+  - Go tests executed: **15 passed, 0 failed**.
+  - **Actual combined CI result**: **239 passed** (100% of defined tests executed and passed).
+- **Actual Local Environment Execution (Developer Workstation)**:
+  - Python tests executed: **219 tests ran, 219 passed, 0 failed, 0 errors**.
+  - Live loop-device tests: **1 test suite class skipped** (`TestLiveLoopBlockDeviceSafety`, containing 5 live loop test methods) because local loop-device capabilities were unavailable (`CAN_LOOP: False`).
+  - Go tests executed: **15 passed, 0 failed**.
+  - **Actual local combined result**: **234 passed, 1 skipped test class** (out of 235 discovered units).
+  - Note on test counting: In Python's `unittest`, class-level `setUpClass` skips do not increment `testsRun`; all 219 tests reported in `testsRun` actually executed and passed.
   - Local passing percentage: Do not claim 100% passing locally due to the unprivileged loop-device skip.
-  - CI combined: **234 passed** (when loop skipped) / up to **239 passed** (when all 5 live loop tests execute).
+- **Conditional Test Behavior**:
+  - When loop capabilities are present (CI / root / privileged VM): **224 Python + 15 Go = 239 passed** (5 live loop tests run).
+  - When loop capabilities are absent (unprivileged host): **219 Python + 15 Go = 234 passed, 1 class skipped** (5 live loop tests skipped).
 - **Pre-Boot Static Safety Auditor**:
   - Local packaged boot images (`build/loader.img`, `build/stage1.img`): **36/36 checks passed**, 0 failed.
   - Ramdisks (`stage1/native_ramdisk`, `stage1/loader_ramdisk`): **34/34 checks passed**, 0 failed, 1 optional unverified cmdline.
@@ -57,13 +51,41 @@
 
 ### Boot Artifact Provenance Ledger
 
-| Artifact Filename | Full SHA-256 Checksum | Build Source Commit | Build Date | Kernel / Hardware Provenance | Static Audit Result | Independent Availability | Status |
+| Artifact Filename | Full SHA-256 Checksum | Proven Source Commit / Tree State | Proven Build Completion Timestamp | Kernel / Hardware Provenance | Static Audit Result | Independent Availability | Verification Scope & Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `build/stage1.img` (Intended T0 Target) | `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` | `cd6afa5` | 2026-11-09 01:49:58 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | PASSED (36/36 checks) | Available in local build tree (`build/stage1.img`); excluded from git checkout via `.gitignore` | **LOCAL BUILD VERIFIED; PHYSICAL BOOT PENDING** |
-| `build/loader.img` (Intended T1 Alternative) | `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` | `cd6afa5` | 2026-11-09 01:49:46 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | PASSED (36/36 checks) | Available in local build tree (`build/loader.img`); excluded from git checkout via `.gitignore` | **LOCAL BUILD VERIFIED; PHYSICAL BOOT PENDING** |
-| `build/stage1.img` (Historical Baseline) | `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` | `f073d8d` | 2026-11-08 20:00:51 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | PASSED (36/36 checks) | Replaced by rebuilt image `01ba479d...` | **SUPERSEDED BY REBUILD** |
-| `build/loader.img` (Historical Baseline) | `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` | `f073d8d` | 2026-11-08 20:00:51 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | PASSED (36/36 checks) | Replaced by rebuilt image `6ec49586...` | **SUPERSEDED BY REBUILD** |
-| `build/images/SHA256SUMS` (Stage-2 Manifest) | `4fb28aabe75bfa39089d783f35fb4700445ee58dadebdeb99533243bcf6c3743` | `cd6afa5` | 2026-11-08 16:26:00 +0500 | Packaging manifest covering all 6 EROFS partitions and 4 APEX modules | Verified via `sha256sum -c` (37/37 OK) | Available in local build tree (`build/images/`); excluded from git checkout via `.gitignore` | **LOCAL BUILD VERIFIED; RAM STAGING PENDING** |
+| **`build/stage1.img`** *(Intended T0 Target)* | `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` | Active HEAD was `f073d8d`; tree contained uncommitted edits subsequently committed in `cd6afa5` at 01:53:30 (built prior to `cd6afa5`) | 2026-11-09 01:49:58 +0500 *(proven by mtime & audit log 20261109_014958)* | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Local build tree only (`build/stage1.img`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified via static audit; Skipped in CI checkout via `.gitignore`. **LOCAL BUILD VERIFIED; PHYSICAL BOOT PENDING** |
+| **`build/loader.img`** *(Intended T1 Alternative)* | `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` | Active HEAD was `f073d8d`; tree contained uncommitted edits subsequently committed in `cd6afa5` at 01:53:30 (built prior to `cd6afa5`) | 2026-11-09 01:49:46 +0500 *(proven by mtime & audit log 20261109_014946)* | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Local build tree only (`build/loader.img`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified via static audit; Skipped in CI checkout via `.gitignore`. **LOCAL BUILD VERIFIED; PHYSICAL BOOT PENDING** |
+| **`build/stage1.img`** *(Historical Baseline)* | `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` | `f073d8d` | 2026-11-08 20:00:51 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Replaced by rebuilt image `01ba479d...` | **SUPERSEDED BY REBUILD** |
+| **`build/loader.img`** *(Historical Baseline)* | `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` | `f073d8d` | 2026-11-08 20:00:51 +0500 | Authentic OnePlus 7T SM8150 `4.14.357-perf-gcd3073fb68f1` (`c32e3a26...`), SM8150 DTB (`e4faf7c5...`), Samsung AMOLED DTBO (`7cfdd198...`) | **PASSED (36/36 checks)** | Replaced by rebuilt image `6ec49586...` | **SUPERSEDED BY REBUILD** |
+| **`build/images/SHA256SUMS`** *(Stage-2 Manifest)* | `4fb28aabe75bfa39089d783f35fb4700445ee58dadebdeb99533243bcf6c3743` | Active HEAD was `e18fff3`; tree contained edits subsequently committed in `9bb95a1` at 16:32:36 (built 9 hours before `cd6afa5`) | 2026-11-08 16:26:14 +0500 *(proven by mtime & audit log 20261108_162724)* | Packaging manifest covering all 6 EROFS partitions and 4 APEX modules (37 artifact entries) | **PASSED (37/37 OK via `sha256sum -c`)** | Local build tree only (`build/images/`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified. **LOCAL BUILD VERIFIED; RAM STAGING PENDING** |
+| **`build/images/PARTITION_MAP`** *(Stage-2 Partition Contract)* | `e7142764a3f46cb20b4fbc5aa87cb15e9c7b37a6bf3b36c7713af32e26dd8226` | Active HEAD was `e18fff3`; tree contained edits subsequently committed in `9bb95a1` at 16:32:36 (built 9 hours before `cd6afa5`) | 2026-11-08 16:25:57 +0500 *(proven by mtime)* | 4-field partition-to-mountpoint contract (`image:mountpoint:nature:sha256`) covering all 6 partitions | **PASSED (4-field schema validated)** | Local build tree only (`build/images/`); excluded from git checkout via `.gitignore`. Not available via clone. | Locally verified. **LOCAL BUILD VERIFIED; RAM STAGING PENDING** |
+
+### Reproducible Independent Artifact Verification Procedure
+
+For independent reviewers auditing this repository without access to local `build/` files or physical hardware:
+
+1. **Verify Source Code & Safety Invariants**:
+   ```bash
+   # Audit ramdisk directory targets (verifies fail-closed read-only logic, watchdog, absence of writes)
+   tools/safe/audit-no-writes.sh stage1/loader_ramdisk
+   tools/safe/audit-no-writes.sh stage1/native_ramdisk
+   ```
+2. **Compile & Test BinderFS Binary**:
+   ```bash
+   (cd src && go test -v ./...)
+   (cd src && make arm64)
+   ```
+3. **Execute Full Automated Host Test Suite**:
+   ```bash
+   python3 -m unittest discover -s tests -v
+   ```
+4. **Local Boot Image Packaging & Audit** *(Requires OnePlus 7T kernel/dtb/dtbo in `stage1/kernel_src/`)*:
+   ```bash
+   scripts/build_loader.sh
+   scripts/build_stage1.sh
+   tools/safe/audit-no-writes.sh build/loader.img
+   tools/safe/audit-no-writes.sh build/stage1.img
+   ```
 
 ### Stage-2 Partition Image Entries Verified in `PARTITION_MAP` & `SHA256SUMS`
 

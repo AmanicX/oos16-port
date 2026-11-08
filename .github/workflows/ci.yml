@@ -202,7 +202,7 @@ jobs:
           ## Verification Tiers
           1. **Shell Syntax Checks (bash -n & sh -n)**: **PASSED** (Validated across all ramdisks, scripts, and supervisors).
           2. **Host Unit & Integration Test Suites**: **PASSED** ($PY_TOTAL automated tests executed across all safety, watchdog, APEX, and storage modules; 100% green).
-          3. **Go Binder Helper Tests (`binderfs_init`)**: **PASSED** (Host test, ARM64 static build, and C interop verified).
+          3. **Go Binder Helper Tests (\`binderfs_init\`)**: **PASSED** (Host test, ARM64 static build, and C interop verified).
           4. **Source-Level Static Safety Audits**: **PASSED** (Verified zero physical wipe, flash, format, or mount instructions across scripts and tools).
           5. **Ramdisk Pre-Boot Audits**: **PASSED** (loader_ramdisk: $LOADER_CHECKS checks passed; native_ramdisk: $NATIVE_CHECKS checks passed; 0 failures).
           6. **Hardware Kernel Asset Provenance**: $KERNEL_TEXT
