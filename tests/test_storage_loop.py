@@ -221,6 +221,139 @@ class TestLiveLoopBlockDeviceSafety(unittest.TestCase):
             f"Loop backing file {backing_file} still exists after detachment"
         )
 
+    def test_live_loop_stage2_verify_block_node_identity(self):
+        """
+        Verify that scripts/stage2_init.sh verify_block_node_identity executes with the real
+        stat -L -c '%t:%T' command against a live kernel block device:
+        - Matching real major:minor identity succeeds.
+        - Deliberately mismatched major fails closed.
+        - Deliberately mismatched minor fails closed.
+        - Non-block-special file in production mode (STAGE2_TEST_MODE=0) is rejected fail-closed.
+        - Temporary backing file and loop device are cleaned up reliably.
+        """
+        if not CAN_LOOP:
+            self.skipTest(f"Live loop-device tests skipped: {LOOP_REASON}")
+
+        tmp_backing = os.path.join(self.test_dir, "stage2_identity_test.img")
+        with open(tmp_backing, "wb") as f:
+            f.truncate(2 * 1024 * 1024)
+
+        loop_dev = None
+        reg_file = os.path.join(self.test_dir, "fake_block_node")
+        try:
+            attach_cmd = self.cmd_prefix + ["losetup", "-f", "--show", tmp_backing]
+            res = subprocess.run(
+                attach_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            loop_dev = res.stdout.strip()
+            self.assertTrue(os.path.exists(loop_dev), f"Attached loop device {loop_dev} does not exist")
+
+            st = os.stat(loop_dev)
+            self.assertTrue(stat.S_ISBLK(st.st_mode), f"{loop_dev} is not a block-special device")
+
+            real_maj = os.major(st.st_rdev)
+            real_min = os.minor(st.st_rdev)
+
+            # 1. Matching real block-device major/minor identity succeeds
+            cmd_match = ["sh", STAGE2_INIT_SCRIPT, "--verify-block-node", loop_dev, str(real_maj), str(real_min), loop_dev, "live_match_test"]
+            env = os.environ.copy()
+            res_match = subprocess.run(
+                cmd_match,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertEqual(
+                res_match.returncode,
+                0,
+                f"verify_block_node_identity failed on matching live loop device: {res_match.stderr}"
+            )
+            self.assertIn("VERIFIED", res_match.stdout)
+
+            # 2. Deliberately mismatched expected major fails closed
+            bad_maj = str(real_maj + 99)
+            cmd_bad_maj = ["sh", STAGE2_INIT_SCRIPT, "--verify-block-node", loop_dev, bad_maj, str(real_min), loop_dev, "live_bad_maj_test"]
+            res_bad_maj = subprocess.run(
+                cmd_bad_maj,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertNotEqual(
+                res_bad_maj.returncode,
+                0,
+                "verify_block_node_identity unexpectedly passed with mismatched major on live loop device"
+            )
+            self.assertIn("does not match inventory and sysfs", res_bad_maj.stderr)
+
+            # 3. Deliberately mismatched expected minor fails closed
+            bad_min = str(real_min + 99)
+            cmd_bad_min = ["sh", STAGE2_INIT_SCRIPT, "--verify-block-node", loop_dev, str(real_maj), bad_min, loop_dev, "live_bad_min_test"]
+            res_bad_min = subprocess.run(
+                cmd_bad_min,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertNotEqual(
+                res_bad_min.returncode,
+                0,
+                "verify_block_node_identity unexpectedly passed with mismatched minor on live loop device"
+            )
+            self.assertIn("does not match inventory and sysfs", res_bad_min.stderr)
+
+            # 4. Non-block-special file in production mode (STAGE2_TEST_MODE=0) is rejected fail-closed
+            with open(reg_file, "wb") as f:
+                f.write(b"not a block device")
+
+            cmd_non_blk = ["sh", STAGE2_INIT_SCRIPT, "--verify-block-node", reg_file, str(real_maj), str(real_min), reg_file, "live_non_blk_test"]
+            prod_env = os.environ.copy()
+            prod_env["STAGE2_TEST_MODE"] = "0"
+            prod_env["STAGE2_FATAL_TEST_EXIT"] = "1"
+            res_non_blk = subprocess.run(
+                cmd_non_blk,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=prod_env,
+                timeout=10,
+            )
+            self.assertNotEqual(
+                res_non_blk.returncode,
+                0,
+                "verify_block_node_identity unexpectedly passed for regular file in production mode"
+            )
+            self.assertIn("is NOT a block device", res_non_blk.stderr)
+
+        finally:
+            if loop_dev:
+                try:
+                    detach_cmd = self.cmd_prefix + ["losetup", "-d", loop_dev]
+                    subprocess.run(detach_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                except Exception:
+                    pass
+            if os.path.exists(tmp_backing):
+                try:
+                    os.remove(tmp_backing)
+                except Exception:
+                    pass
+            if os.path.exists(reg_file):
+                try:
+                    os.remove(reg_file)
+                except Exception:
+                    pass
+
 
 class TestSimulatedBlockDeviceSafety(unittest.TestCase):
     """

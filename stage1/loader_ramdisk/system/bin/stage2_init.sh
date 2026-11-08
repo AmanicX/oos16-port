@@ -325,7 +325,7 @@ verify_block_node_identity() {
     if [ -b "$check_node" ]; then
         should_verify_stat=1
     elif [ "${STAGE2_TEST_MODE:-0}" = "1" ]; then
-        if [ "${STAGE2_TEST_VERIFY_STAT:-0}" = "1" ] || [ -n "${STAT_RAW_OUTPUT+x}" ] || [ "${STAT_FAIL:-0}" = "1" ]; then
+        if [ "${STAGE2_TEST_VERIFY_STAT:-0}" = "1" ] || [ -n "${STAT_RAW_OUTPUT+x}" ] || [ "${STAT_FAIL:-0}" = "1" ] || [ -n "${STAT_BIN:-}" ]; then
             should_verify_stat=1
         fi
     fi
@@ -703,6 +703,13 @@ fi
 if [ "${1:-}" = "--revalidate-inventory" ]; then
     STAGE2_TEST_MODE="${STAGE2_TEST_MODE:-1}"
     revalidate_storage_inventory "${2:-manual_check}"
+    exit 0
+fi
+
+if [ "${1:-}" = "--verify-block-node" ]; then
+    STAGE2_TEST_MODE="${STAGE2_TEST_MODE:-1}"
+    verify_block_node_identity "$2" "$3" "$4" "$5" "${6:-cli_check}"
+    echo "VERIFIED"
     exit 0
 fi
 

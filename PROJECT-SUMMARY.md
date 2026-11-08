@@ -290,6 +290,11 @@ Designed for RAM-only execution with fail-closed block-layer read-only protectio
   19. **Independent Stage-2 Block-Node Identity Verification**:
      - Implemented `verify_block_node_identity` in `scripts/stage2_init.sh` across existing inventory entries, newly appearing physical disks, newly appearing partitions, and `atomic_update_inventory`.
      - Validated via 12 dedicated regression tests in `tests/test_storage_safety.py` covering hex conversion, matching identity, major/minor mismatches, malformed stat output, zero identity rejection (0:0), stat failure, stat unavailability, and production mode block-special enforcement.
+  20. **Real Stage-2 Block-Node Identity Integration Test & Artifact Provenance**:
+     - Added direct `--verify-block-node` CLI dispatch to `scripts/stage2_init.sh` allowing direct execution of the production shell verification function.
+     - Implemented `test_live_loop_stage2_verify_block_node_identity` in `tests/test_storage_loop.py` executing against real kernel block devices with live `stat -L -c "%t:%T"`.
+     - Reconciled hardware bringup test ledger artifact hashes in `docs/TEST-LEDGER.md` (T0, T1, T2) against actual build artifacts (`stage1.img`: `c04480b5...`, `loader.img`: `25c5433e...`, `SHA256SUMS`: `4fb28aab...`).
+     - Disambiguated local and CI verification reporting: Local combined: 233 passed, 1 skipped; CI combined: 234 passed (219 Python + 15 Go).
 
 ---
 
@@ -298,8 +303,8 @@ Designed for RAM-only execution with fail-closed block-layer read-only protectio
 | Verification Tier | Scope | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Tier 1: Implemented** | Full codebase, ramdisks, APEX extraction, scripts, and wrappers | **COMPLETE** | All modules implemented in accordance with architecture specifications. Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to device-level verification. |
-| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `25c5433e...`, 36/36), `build/stage1.img` (SHA-256: `c04480b5...`, 36/36), and ramdisks (34/34 + 1 optional). In CI without device kernel binaries, ramdisks pass and packaged image audits are reported as skipped. |
-| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (233/234)** | 100% pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol, two-copy inventory synchronization & fail-closed lifecycle (62), Stage-2 runner integration mocks (72), Storage safety, strict block-node identity & 6-checkpoint inventory revalidation (39), Disposable loop & block device safety (9: 8 passed + 1 unprivileged skip locally, 9 in CI/VM), and Go BinderFS unit tests (15). Total Python unittests: 219 (218 pass, 0 fail, 1 skip locally; 219 pass in CI); Go unit tests: 15. |
+| **Tier 2: Static Checks Passed** | `tools/safe/audit-no-writes.sh` | **PASSED (36/36)** | Passed on local packaged boot images: `build/loader.img` (SHA-256: `6ec49586...` rebuilt / `25c5433e...` baseline, 36/36), `build/stage1.img` (SHA-256: `01ba479d...` rebuilt / `c04480b5...` baseline, 36/36), and ramdisks (34/34 + 1 optional). In CI without device kernel binaries, ramdisks pass and packaged image audits are reported as skipped. |
+| **Tier 3: Host Tests Passed** | Automated Python, Go & Shell unit/integration test suites | **PASSED (233/234)** | Local combined: 233 passed, 1 skipped (do not claim 100% passing locally due to unprivileged loop skip); CI combined: 234 passed. Full pass across ADB proxy (8), Fastboot proxy (3), APEX protobuf, ZIP limits & XML schema (26), Watchdog protocol, two-copy inventory synchronization & fail-closed lifecycle (62), Stage-2 runner integration mocks (72), Storage safety, strict block-node identity & 6-checkpoint inventory revalidation (39), Disposable loop & block device safety (local: 8 passed + 1 unprivileged skip, all passed in CI/VM), and Go BinderFS unit tests (15). Total Python unittests: 219 (218 pass, 0 fail, 1 skip locally; 219 pass in CI); Go unit tests: 15 passed. |
 | **Tier 4: Build Passed** | Boot images & EROFS partition images | **PASSED** | `loader.img`, `stage1.img`, and all Stage-2 images generated with valid SHA256SUMS and PARTITION_MAP. |
 | **Tier 5: Device Boot Tested** | Live USB fastboot boot onto physical OnePlus 7T | **PENDING LIVE TEST** | Requires physical device tethering and testing in fastboot mode. |
 | **Tier 6: Hardware Functionality Verified** | Display rendering, touchscreen, and hardware HALs | **PENDING LIVE TEST** | Requires live runtime inspection of `SurfaceFlinger` and DRM compositor. |
@@ -312,5 +317,5 @@ The repository is in a verified, build-clean, and audited state:
 * All host-side safety wrappers (`tools/safe/adb`, `tools/safe/fastboot`, `tools/safe/audit-no-writes.sh`) are active and verified.
 * All Stage-1 boot images (`build/loader.img`, `build/stage1.img`) are generated and pass static audit (36/36).
 * All Stage-2 EROFS partition images and bootstrap APEX payloads are packaged and verified with `SHA256SUMS` and `PARTITION_MAP`.
-* All 201 automated unit and integration tests pass without error (100% OK: 186 Python + 15 Go).
+* Automated test suite: Local execution reports 233 passed, 1 skipped (218 Python + 15 Go); CI execution reports 234 passed (219 Python + 15 Go).
 * **Verdict**: Ready for controlled live device testing via USB 3.0 (`fastboot boot build/loader.img` or `fastboot boot build/stage1.img`). Designed for RAM-only execution with fail-closed block-layer read-only protection. Physical storage safety remains subject to live device-level verification.
