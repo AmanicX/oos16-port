@@ -25,10 +25,13 @@
 ### Summary of Automated Test Suite
 
 - **Total Defined Test Methods in Codebase**: **268** (253 Python test methods across 15 classes in 8 files + 15 Go test functions).
-- **CI Environment Verification (Historical Baseline: Run #20 ID `42530682479`, Run #21 ID `42532420525`)**:
-  - Historical baseline established in CI runs #20 and #21 with 239 tests (224 Python + 15 Go).
-  - Current codebase expands pipeline tests by 29 tests (`tests/test_build_pipeline.py`).
-  - Next CI run will execute all defined Python tests (253 methods, including all 5 live loop-device integration tests) + 15 Go tests = 268 total tests.
+- **CI Environment Verification (Latest CI Execution: Run #26, ID `42541597726`, Result: SUCCESS; Historical Baselines: Run #20 ID `42530682479`, Run #21 ID `42532420525`)**:
+  - Python tests executed: **253 tests ran, 253 passed, 0 failed, 0 errors, 0 skipped**.
+  - Live loop-device tests: **All 5 live loop-device integration tests executed and passed** in the privileged CI container environment.
+  - Go tests executed: **15 passed, 0 failed**.
+  - **Actual combined CI result**: **268 passed (100% of defined tests executed and passed)**.
+  - Static safety audits: Native and loader ramdisk directories pass 34/34 checks each.
+  - Skipped CI checks: Kernel assets (`stage1/kernel_src/`) and packaged boot-image audits (`build/loader.img`, `build/stage1.img`) were skipped because these files were absent from the checkout per `.gitignore`. Do not describe skipped checks as passed.
 - **Actual Local Environment Execution (Developer Workstation)**:
   - Python tests executed: **248 tests ran, 247 passed, 0 failed, 0 errors, 1 skipped** (unprivileged loop capability).
   - Live loop-device tests: **1 test suite class skipped** (`TestLiveLoopBlockDeviceSafety`, containing 5 live loop test methods) because local loop-device capabilities were unavailable (`CAN_LOOP: False`).
