@@ -234,6 +234,22 @@ bash -n "$WATCHDOG_SCRIPT" || { echo "CRITICAL ERROR: watchdog.sh bash syntax er
 sh -n "$WATCHDOG_SCRIPT" || { echo "CRITICAL ERROR: watchdog.sh sh syntax error!" >&2; exit 1; }
 echo " [OK] Embedded watchdog.sh matches repository source and passed syntax checks"
 
+# Distinguish between Loader and Stage-1 Image Types
+IMAGE_BASENAME="$(basename "$TARGET")"
+IS_LOADER=0
+if [[ "$IMAGE_BASENAME" =~ loader ]] || grep -E "^command line args:.*androidboot\.mode=normal" "$TMP_DIR/header_info.txt" >/dev/null 2>&1; then
+    IS_LOADER=1
+fi
+
+if [ "$IS_LOADER" -eq 1 ]; then
+    echo " [INFO] Image classification: Diagnostic RAM Loader (Stage-1 Interactive Bringup)"
+    if [ -f "$RAMDISK_ROOT/adb_keys" ]; then
+        echo " [OK] Diagnostic ADB authorization keys embedded in ramdisk"
+    fi
+else
+    echo " [INFO] Image classification: Autonomous RAM Supervisor (Stage-1 Production Bringup)"
+fi
+
 # 8. Kernel Command Line Inspection
 echo "7. Inspecting kernel command line parameters..."
 CMDLINE=$(grep -E "^command line args:" "$TMP_DIR/header_info.txt" | head -n 1 | sed -E "s/^command line args:[[:space:]]*//" || true)
@@ -249,13 +265,31 @@ done
 echo " [OK] Kernel cmdline free of forbidden write/wipe targets"
 
 # Mandatory hardware parameters
-for req in "androidboot.hardware=qcom" "androidboot.selinux=permissive" "swiotlb=2048" "loop.max_part=7"; do
+for req in "androidboot.hardware=qcom" "swiotlb=2048" "loop.max_part=7"; do
     if ! echo "$CMDLINE" | grep -q "$req"; then
         echo "CRITICAL ERROR: Kernel cmdline missing required parameter '$req'!" >&2
         exit 1
     fi
 done
 echo " [OK] Kernel cmdline contains required Qualcomm SM8150 hardware parameters"
+
+# Loader vs Stage-1 specific cmdline verification
+if [ "$IS_LOADER" -eq 1 ]; then
+    if ! echo "$CMDLINE" | grep -q "androidboot.mode=normal"; then
+        echo "CRITICAL ERROR: Diagnostic loader image requires androidboot.mode=normal in cmdline!" >&2
+        exit 1
+    fi
+    echo " [OK] Diagnostic loader parameter verified: androidboot.mode=normal"
+fi
+
+# SELinux verification (permissive allowed as temporary bringup configuration)
+if echo "$CMDLINE" | grep -q "androidboot.selinux=permissive"; then
+    echo " [OK] SELinux Mode: permissive (TEMPORARY bringup configuration; enforcing policy required before production release)"
+elif echo "$CMDLINE" | grep -q "androidboot.selinux=enforcing"; then
+    echo " [OK] SELinux Mode: enforcing (Production security policy active)"
+else
+    echo "WARNING: Explicit androidboot.selinux parameter not specified in kernel cmdline."
+fi
 
 # 9. Run Static Safety Audit
 echo "8. Running static safety audit (audit-no-writes.sh)..."

@@ -17,6 +17,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Prioritize user-provided OTATOOLS if configured in environment
+export PATH="$PROJECT_ROOT/external/coloros_port/otatools/bin:$HOME/.local/bin:$PATH"
+if [ -n "${OTATOOLS:-}" ]; then
+    if [ -d "$OTATOOLS/bin" ]; then
+        export PATH="$OTATOOLS/bin:$OTATOOLS:$PATH"
+    elif [ -d "$OTATOOLS" ]; then
+        export PATH="$OTATOOLS:$PATH"
+    fi
+fi
+
 WORK_DIR="${WORK_DIR:-$PROJECT_ROOT/work}"
 OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/build/images}"
 
@@ -120,9 +131,25 @@ for m in "${MANDATORY_DIRS[@]}"; do
     fi
 done
 
-APEX_SRC="$WORK_DIR/system/system/apex/com.android.runtime.apex"
-if [ ! -f "$APEX_SRC" ] || [ ! -s "$APEX_SRC" ]; then
-    MISSING_MANDATORY+=("runtime_apex ($APEX_SRC)")
+APEX_DIR=""
+if [ -d "$WORK_DIR/system/system/apex" ]; then
+    APEX_DIR="$WORK_DIR/system/system/apex"
+elif [ -d "$WORK_DIR/system/apex" ]; then
+    APEX_DIR="$WORK_DIR/system/apex"
+elif [ -d "$WORK_DIR/apex" ]; then
+    APEX_DIR="$WORK_DIR/apex"
+fi
+
+if [ -z "$APEX_DIR" ]; then
+    MISSING_MANDATORY+=("apex_dir ($WORK_DIR/system/system/apex or $WORK_DIR/system/apex)")
+else
+    FOUND_RUNTIME=""
+    for cand in "$APEX_DIR/com.android.runtime.apex" "$APEX_DIR/com.google.android.runtime.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_RUNTIME="$cand"; break; fi
+    done
+    if [ -z "$FOUND_RUNTIME" ]; then
+        MISSING_MANDATORY+=("runtime_apex ($APEX_DIR/com.android.runtime.apex)")
+    fi
 fi
 
 if [ "${#MISSING_MANDATORY[@]}" -gt 0 ]; then
@@ -303,7 +330,12 @@ extract_and_stage_apex() {
     local apex_id="$1"
     local output_base="$2"
     local mandatory="${3:-1}"
-    local apex_dir="$WORK_DIR/system/system/apex"
+    local apex_dir="${APEX_DIR:-$WORK_DIR/system/system/apex}"
+    if [ ! -d "$apex_dir" ] && [ -d "$WORK_DIR/system/apex" ]; then
+        apex_dir="$WORK_DIR/system/apex"
+    elif [ ! -d "$apex_dir" ] && [ -d "$WORK_DIR/apex" ]; then
+        apex_dir="$WORK_DIR/apex"
+    fi
     local target_pkg=""
 
     case "$apex_id" in

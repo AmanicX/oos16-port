@@ -17,7 +17,14 @@ STAGE1_DIR="$PROJECT_ROOT/stage1"
 LOADER_RAMDISK="$STAGE1_DIR/loader_ramdisk"
 KERNEL_SRC="$STAGE1_DIR/kernel_src"
 BUILD_DIR="$PROJECT_ROOT/build"
-OTATOOLS="$PROJECT_ROOT/external/coloros_port/otatools/bin"
+if [ -n "${OTATOOLS:-}" ]; then
+    if [ -d "$OTATOOLS/bin" ]; then
+        export PATH="$OTATOOLS/bin:$OTATOOLS:$PATH"
+    elif [ -d "$OTATOOLS" ]; then
+        export PATH="$OTATOOLS:$PATH"
+    fi
+fi
+OTATOOLS="${OTATOOLS:-$PROJECT_ROOT/external/coloros_port/otatools/bin}"
 
 mkdir -p "$BUILD_DIR"
 

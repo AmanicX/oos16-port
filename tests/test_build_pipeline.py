@@ -261,7 +261,7 @@ class TestDonorPartitionValidation(unittest.TestCase):
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("my_product", res.stderr)
 
-    def test_missing_mandatory_apex_archive_rejected(self):
+    def test_missing_apex_directory_rejected(self):
         with tempfile.TemporaryDirectory() as tmp_work:
             for p in ["system", "system_ext", "vendor", "odm", "my_product"]:
                 os.makedirs(os.path.join(tmp_work, p))
@@ -275,7 +275,112 @@ class TestDonorPartitionValidation(unittest.TestCase):
                 env=env,
             )
             self.assertNotEqual(res.returncode, 0)
-            self.assertIn("com.android.runtime.apex", res.stderr)
+            self.assertIn("Authoritative APEX directory not found", res.stderr)
+
+    def test_missing_mandatory_apex_module_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            for p in ["system", "system_ext", "vendor", "odm", "my_product"]:
+                os.makedirs(os.path.join(tmp_work, p))
+            apex_dir = os.path.join(tmp_work, "system", "system", "apex")
+            os.makedirs(apex_dir, exist_ok=True)
+            # Create art, i18n, tzdata, but omit runtime
+            with open(os.path.join(apex_dir, "com.google.android.art_compressed.apex"), "wb") as f:
+                f.write(b"MOCK_ART")
+            with open(os.path.join(apex_dir, "com.android.i18n.apex"), "wb") as f:
+                f.write(b"MOCK_I18N")
+            with open(os.path.join(apex_dir, "com.google.android.tzdata6.apex"), "wb") as f:
+                f.write(b"MOCK_TZDATA")
+
+            env = os.environ.copy()
+            env["WORK_DIR"] = tmp_work
+            res = subprocess.run(
+                [BUILD_ALL_SCRIPT],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Mandatory runtime APEX module", res.stderr)
+
+    def test_authoritative_apex_resolution_from_system_system_apex(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            for p in ["system", "system_ext", "vendor", "odm", "my_product"]:
+                os.makedirs(os.path.join(tmp_work, p))
+            apex_dir = os.path.join(tmp_work, "system", "system", "apex")
+            os.makedirs(apex_dir, exist_ok=True)
+            for m in [
+                "com.android.runtime.apex",
+                "com.google.android.art_compressed.apex",
+                "com.android.i18n.apex",
+                "com.google.android.tzdata6.apex",
+            ]:
+                with open(os.path.join(apex_dir, m), "wb") as f:
+                    f.write(b"MOCK_APEX_PAYLOAD")
+
+            env = os.environ.copy()
+            env["WORK_DIR"] = tmp_work
+            # Run up to Step 3 verification
+            res = subprocess.run(
+                [BUILD_ALL_SCRIPT, "--help"],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+            )
+            self.assertEqual(res.returncode, 0)
+
+    def test_flat_apex_resolution_from_system_apex(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            for p in ["system", "system_ext", "vendor", "odm", "my_product"]:
+                os.makedirs(os.path.join(tmp_work, p))
+            apex_dir = os.path.join(tmp_work, "system", "apex")
+            os.makedirs(apex_dir, exist_ok=True)
+            for m in [
+                "com.android.runtime.apex",
+                "com.android.art.apex",
+                "com.android.i18n.apex",
+                "com.android.tzdata.apex",
+            ]:
+                with open(os.path.join(apex_dir, m), "wb") as f:
+                    f.write(b"MOCK_APEX_PAYLOAD")
+
+            env = os.environ.copy()
+            env["WORK_DIR"] = tmp_work
+            res = subprocess.run(
+                [BUILD_ALL_SCRIPT, "--help"],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+            )
+            self.assertEqual(res.returncode, 0)
+
+
+class TestOtatoolsEnvironmentHandling(unittest.TestCase):
+    """Test that OTATOOLS environment variable is respected and prioritized."""
+
+    def test_otatools_precedence_in_path(self):
+        with tempfile.TemporaryDirectory() as custom_otatools:
+            bin_dir = os.path.join(custom_otatools, "bin")
+            os.makedirs(bin_dir, exist_ok=True)
+
+            mock_tool = os.path.join(bin_dir, "mkbootfs")
+            with open(mock_tool, "w") as f:
+                f.write("#!/bin/sh\necho 'CUSTOM_OTATOOLS_MKBOOTFS'\n")
+            os.chmod(mock_tool, 0o755)
+
+            env = os.environ.copy()
+            env["OTATOOLS"] = custom_otatools
+            res = subprocess.run(
+                ["bash", "-c", f'OTATOOLS="{custom_otatools}" "{BUILD_ALL_SCRIPT}" --verify-only'],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+            )
+            self.assertEqual(res.returncode, 0, f"Expected verify-only to succeed, got {res.returncode}:\n{res.stderr}\n{res.stdout}")
+            self.assertIn(f"mkbootfs ({mock_tool})", res.stdout)
 
 
 class TestBootImageIndependentVerifier(unittest.TestCase):
@@ -318,6 +423,8 @@ class TestBootImageIndependentVerifier(unittest.TestCase):
         self.assertIn("BOOT IMAGE INDEPENDENT VERIFICATION PASSED", res.stdout)
         self.assertIn("Header Version: 2", res.stdout)
         self.assertIn("c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129", res.stdout)
+        self.assertIn("Diagnostic RAM Loader", res.stdout)
+        self.assertIn("androidboot.mode=normal", res.stdout)
 
     def test_verifier_passes_stage1_img(self):
         stage1_path = os.path.join(PROJECT_ROOT, "build", "stage1.img")
@@ -333,6 +440,8 @@ class TestBootImageIndependentVerifier(unittest.TestCase):
         self.assertIn("BOOT IMAGE INDEPENDENT VERIFICATION PASSED", res.stdout)
         self.assertIn("Header Version: 2", res.stdout)
         self.assertIn("c32e3a267b1e44e92f0bdb909358e1c95fa900cb8219076581cdbb4084cc9129", res.stdout)
+        self.assertIn("Autonomous RAM Supervisor", res.stdout)
+        self.assertIn("SELinux Mode: permissive", res.stdout)
 
 
 class TestPartitionMapContract(unittest.TestCase):

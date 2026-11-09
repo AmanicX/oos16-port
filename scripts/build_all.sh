@@ -21,6 +21,16 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Ensure external and user bin paths are available in PATH
 export PATH="$PROJECT_ROOT/external/coloros_port/otatools/bin:$HOME/.local/bin:$PATH"
 
+# Prioritize user-provided OTATOOLS if configured in environment
+if [ -n "${OTATOOLS:-}" ]; then
+    if [ -d "$OTATOOLS/bin" ]; then
+        export PATH="$OTATOOLS/bin:$OTATOOLS:$PATH"
+    elif [ -d "$OTATOOLS" ]; then
+        export PATH="$OTATOOLS:$PATH"
+    fi
+    export OTATOOLS
+fi
+
 # Mode flags
 SKIP_STAGE2=0
 STAGE2_ONLY=0
@@ -264,34 +274,72 @@ if [ "$VERIFY_ONLY" -eq 0 ] && [ "$BOOT_ONLY" -eq 0 ] && [ "$SKIP_STAGE2" -eq 0 
         echo "  [OK] Partition source: $part ($(du -sh "$WORK_DIR/$part" | awk '{print $1}'))"
     done
 
-    # Check for mandatory bootstrap APEX archives in $WORK_DIR
-    REQUIRED_APEX_NAMES=(
-        "com.android.runtime.apex"
-        "com.android.i18n.apex"
-    )
-    for apex in "${REQUIRED_APEX_NAMES[@]}"; do
-        if [ ! -f "$WORK_DIR/$apex" ]; then
-            echo "Error: Required APEX file '$WORK_DIR/$apex' not found." >&2
-            exit 1
-        fi
-        echo "  [OK] Bootstrap APEX: $apex"
+    # Resolve authoritative APEX directory in donor tree
+    APEX_DIR=""
+    if [ -d "$WORK_DIR/system/system/apex" ]; then
+        APEX_DIR="$WORK_DIR/system/system/apex"
+    elif [ -d "$WORK_DIR/system/apex" ]; then
+        APEX_DIR="$WORK_DIR/system/apex"
+    elif [ -d "$WORK_DIR/apex" ]; then
+        APEX_DIR="$WORK_DIR/apex"
+    fi
+
+    if [ -z "$APEX_DIR" ] || [ ! -d "$APEX_DIR" ]; then
+        echo "Error: Authoritative APEX directory not found under '$WORK_DIR' (expected system/system/apex or system/apex)." >&2
+        exit 1
+    fi
+    echo "  [OK] Authoritative APEX source directory: $APEX_DIR"
+
+    # 1. Validate Runtime APEX
+    FOUND_RUNTIME=""
+    for cand in "$APEX_DIR/com.android.runtime.apex" "$APEX_DIR/com.google.android.runtime.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_RUNTIME="$cand"; break; fi
     done
-
-    # Check for ART APEX
-    if [ -f "$WORK_DIR/com.google.android.art_compressed.apex" ] || [ -f "$WORK_DIR/com.android.art.apex" ]; then
-        echo "  [OK] Bootstrap ART APEX found"
-    else
-        echo "Error: Neither com.google.android.art_compressed.apex nor com.android.art.apex found in '$WORK_DIR'." >&2
+    if [ -z "$FOUND_RUNTIME" ]; then
+        echo "Error: Mandatory runtime APEX module (com.android.runtime.apex or com.google.android.runtime.apex) missing in $APEX_DIR." >&2
         exit 1
     fi
+    echo "  [OK] Runtime APEX: $(basename "$FOUND_RUNTIME")"
 
-    # Check for Time Zone APEX
-    if [ -f "$WORK_DIR/com.google.android.tzdata6.apex" ] || [ -f "$WORK_DIR/com.android.tzdata.apex" ]; then
-        echo "  [OK] Bootstrap Timezone APEX found"
-    else
-        echo "Error: Neither com.google.android.tzdata6.apex nor com.android.tzdata.apex found in '$WORK_DIR'." >&2
+    # 2. Validate ART APEX
+    FOUND_ART=""
+    for cand in "$APEX_DIR/com.google.android.art_compressed.apex" \
+                "$APEX_DIR/com.android.art_compressed.apex" \
+                "$APEX_DIR/com.android.art.apex" \
+                "$APEX_DIR/com.google.android.art.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_ART="$cand"; break; fi
+    done
+    if [ -z "$FOUND_ART" ]; then
+        echo "Error: Mandatory ART APEX module (com.google.android.art_compressed.apex or com.android.art.apex) missing in $APEX_DIR." >&2
         exit 1
     fi
+    echo "  [OK] ART APEX: $(basename "$FOUND_ART")"
+
+    # 3. Validate i18n APEX
+    FOUND_I18N=""
+    for cand in "$APEX_DIR/com.android.i18n.apex" \
+                "$APEX_DIR/com.google.android.i18n.apex" \
+                "$APEX_DIR/com.google.android.i18n_compressed.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_I18N="$cand"; break; fi
+    done
+    if [ -z "$FOUND_I18N" ]; then
+        echo "Error: Mandatory i18n APEX module (com.android.i18n.apex) missing in $APEX_DIR." >&2
+        exit 1
+    fi
+    echo "  [OK] i18n APEX: $(basename "$FOUND_I18N")"
+
+    # 4. Validate Timezone APEX
+    FOUND_TZDATA=""
+    for cand in "$APEX_DIR/com.google.android.tzdata6.apex" \
+                "$APEX_DIR/com.google.android.tzdata.apex" \
+                "$APEX_DIR/com.android.tzdata.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_TZDATA="$cand"; break; fi
+    done
+    if [ -z "$FOUND_TZDATA" ]; then
+        echo "Error: Mandatory Timezone APEX module (com.google.android.tzdata6.apex or com.android.tzdata.apex) missing in $APEX_DIR." >&2
+        exit 1
+    fi
+    echo "  [OK] Timezone APEX: $(basename "$FOUND_TZDATA")"
 fi
 
 # ------------------------------------------------------------------------------
