@@ -13,6 +13,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Prioritize user-provided OTATOOLS if configured in environment
+if [ -n "${OTATOOLS:-}" ]; then
+    if [ -d "$OTATOOLS/bin" ]; then
+        export PATH="$OTATOOLS/bin:$OTATOOLS:$PATH"
+    elif [ -d "$OTATOOLS" ]; then
+        export PATH="$OTATOOLS:$PATH"
+    fi
+fi
+
 TARGET="${1:-$PROJECT_ROOT/build/stage1.img}"
 
 if [ ! -f "$TARGET" ]; then

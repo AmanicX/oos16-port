@@ -10,12 +10,14 @@ Unit and integration tests for the OxygenOS 16 build pipeline:
 - tools/safe/audit-no-writes.sh static safety audit enforcement
 """
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -39,6 +41,7 @@ class TestBuildAllCLI(unittest.TestCase):
         self.assertIn("--skip-stage2", res.stdout)
         self.assertIn("--verify-only", res.stdout)
         self.assertIn("--check-tools", res.stdout)
+        self.assertIn("--check-donor", res.stdout)
 
     def test_cli_unknown_argument(self):
         res = subprocess.run(
@@ -51,14 +54,17 @@ class TestBuildAllCLI(unittest.TestCase):
         self.assertIn("Unknown argument", res.stderr)
 
     def test_cli_mutually_exclusive_modes(self):
-        res = subprocess.run(
-            [BUILD_ALL_SCRIPT, "--stage2-only", "--boot-only"],
-            capture_output=True,
-            text=True,
-            cwd=PROJECT_ROOT,
-        )
-        self.assertNotEqual(res.returncode, 0)
-        self.assertIn("mutually exclusive", res.stderr)
+        modes = ["--stage2-only", "--boot-only", "--verify-only", "--check-tools", "--check-donor"]
+        for i in range(len(modes)):
+            for j in range(i + 1, len(modes)):
+                res = subprocess.run(
+                    [BUILD_ALL_SCRIPT, modes[i], modes[j]],
+                    capture_output=True,
+                    text=True,
+                    cwd=PROJECT_ROOT,
+                )
+                self.assertNotEqual(res.returncode, 0, f"Expected conflict between {modes[i]} and {modes[j]}")
+                self.assertIn("mutually exclusive", res.stderr)
 
     def test_cli_skip_stage2_with_stage2_only_conflict(self):
         res = subprocess.run(
@@ -227,16 +233,21 @@ class TestHardwareAssetValidation(unittest.TestCase):
 class TestDonorPartitionValidation(unittest.TestCase):
     """Test donor partition and bootstrap APEX input validation."""
 
-    def setUp(self):
-        kernel = os.path.join(PROJECT_ROOT, "stage1", "kernel_src", "kernel")
-        if not os.path.isfile(kernel):
-            self.skipTest("Hardware kernel assets not present in checkout (CI environment)")
+    def _create_valid_apex(self, path, pkg_name, version=1):
+        manifest = {
+            "name": pkg_name,
+            "version": version,
+            "versionName": "1.0",
+        }
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("apex_manifest.json", json.dumps(manifest))
+            zf.writestr("apex_payload.img", b"\x00" * 4096)
 
     def test_missing_work_directory_rejected(self):
         env = os.environ.copy()
         env["WORK_DIR"] = "/tmp/nonexistent_donor_work_dir_xyz"
         res = subprocess.run(
-            [BUILD_ALL_SCRIPT],
+            [BUILD_ALL_SCRIPT, "--check-donor"],
             capture_output=True,
             text=True,
             cwd=PROJECT_ROOT,
@@ -253,7 +264,7 @@ class TestDonorPartitionValidation(unittest.TestCase):
             env = os.environ.copy()
             env["WORK_DIR"] = tmp_work
             res = subprocess.run(
-                [BUILD_ALL_SCRIPT],
+                [BUILD_ALL_SCRIPT, "--check-donor"],
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
@@ -269,7 +280,7 @@ class TestDonorPartitionValidation(unittest.TestCase):
             env = os.environ.copy()
             env["WORK_DIR"] = tmp_work
             res = subprocess.run(
-                [BUILD_ALL_SCRIPT],
+                [BUILD_ALL_SCRIPT, "--check-donor"],
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
@@ -285,17 +296,14 @@ class TestDonorPartitionValidation(unittest.TestCase):
             apex_dir = os.path.join(tmp_work, "system", "system", "apex")
             os.makedirs(apex_dir, exist_ok=True)
             # Create art, i18n, tzdata, but omit runtime
-            with open(os.path.join(apex_dir, "com.google.android.art_compressed.apex"), "wb") as f:
-                f.write(b"MOCK_ART")
-            with open(os.path.join(apex_dir, "com.android.i18n.apex"), "wb") as f:
-                f.write(b"MOCK_I18N")
-            with open(os.path.join(apex_dir, "com.google.android.tzdata6.apex"), "wb") as f:
-                f.write(b"MOCK_TZDATA")
+            self._create_valid_apex(os.path.join(apex_dir, "com.google.android.art_compressed.apex"), "com.android.art")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.i18n.apex"), "com.android.i18n")
+            self._create_valid_apex(os.path.join(apex_dir, "com.google.android.tzdata6.apex"), "com.android.tzdata")
 
             env = os.environ.copy()
             env["WORK_DIR"] = tmp_work
             res = subprocess.run(
-                [BUILD_ALL_SCRIPT],
+                [BUILD_ALL_SCRIPT, "--check-donor"],
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
@@ -310,26 +318,22 @@ class TestDonorPartitionValidation(unittest.TestCase):
                 os.makedirs(os.path.join(tmp_work, p))
             apex_dir = os.path.join(tmp_work, "system", "system", "apex")
             os.makedirs(apex_dir, exist_ok=True)
-            for m in [
-                "com.android.runtime.apex",
-                "com.google.android.art_compressed.apex",
-                "com.android.i18n.apex",
-                "com.google.android.tzdata6.apex",
-            ]:
-                with open(os.path.join(apex_dir, m), "wb") as f:
-                    f.write(b"MOCK_APEX_PAYLOAD")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.runtime.apex"), "com.android.runtime")
+            self._create_valid_apex(os.path.join(apex_dir, "com.google.android.art_compressed.apex"), "com.android.art")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.i18n.apex"), "com.android.i18n")
+            self._create_valid_apex(os.path.join(apex_dir, "com.google.android.tzdata6.apex"), "com.android.tzdata")
 
             env = os.environ.copy()
             env["WORK_DIR"] = tmp_work
-            # Run up to Step 3 verification
             res = subprocess.run(
-                [BUILD_ALL_SCRIPT, "--help"],
+                [BUILD_ALL_SCRIPT, "--check-donor"],
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
                 env=env,
             )
-            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.returncode, 0, f"Expected validation to succeed, got:\n{res.stderr}\n{res.stdout}")
+            self.assertIn("All donor ROM partitions and APEX modules are verified", res.stdout)
 
     def test_flat_apex_resolution_from_system_apex(self):
         with tempfile.TemporaryDirectory() as tmp_work:
@@ -337,25 +341,121 @@ class TestDonorPartitionValidation(unittest.TestCase):
                 os.makedirs(os.path.join(tmp_work, p))
             apex_dir = os.path.join(tmp_work, "system", "apex")
             os.makedirs(apex_dir, exist_ok=True)
-            for m in [
-                "com.android.runtime.apex",
-                "com.android.art.apex",
-                "com.android.i18n.apex",
-                "com.android.tzdata.apex",
-            ]:
-                with open(os.path.join(apex_dir, m), "wb") as f:
-                    f.write(b"MOCK_APEX_PAYLOAD")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.runtime.apex"), "com.android.runtime")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.art.apex"), "com.android.art")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.i18n.apex"), "com.android.i18n")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.tzdata.apex"), "com.android.tzdata")
 
             env = os.environ.copy()
             env["WORK_DIR"] = tmp_work
             res = subprocess.run(
-                [BUILD_ALL_SCRIPT, "--help"],
+                [BUILD_ALL_SCRIPT, "--check-donor"],
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
                 env=env,
             )
-            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.returncode, 0, f"Expected validation to succeed, got:\n{res.stderr}\n{res.stdout}")
+            self.assertIn("All donor ROM partitions and APEX modules are verified", res.stdout)
+
+    def test_corrupted_apex_archive_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            for p in ["system", "system_ext", "vendor", "odm", "my_product"]:
+                os.makedirs(os.path.join(tmp_work, p))
+            apex_dir = os.path.join(tmp_work, "system", "system", "apex")
+            os.makedirs(apex_dir, exist_ok=True)
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.runtime.apex"), "com.android.runtime")
+            with open(os.path.join(apex_dir, "com.google.android.art_compressed.apex"), "wb") as f:
+                f.write(b"CORRUPTED_NON_ZIP_DATA")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.i18n.apex"), "com.android.i18n")
+            self._create_valid_apex(os.path.join(apex_dir, "com.google.android.tzdata6.apex"), "com.android.tzdata")
+
+            env = os.environ.copy()
+            env["WORK_DIR"] = tmp_work
+            res = subprocess.run(
+                [BUILD_ALL_SCRIPT, "--check-donor"],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Mandatory ART APEX manifest validation failed", res.stderr)
+
+    def test_mismatched_apex_package_identity_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            for p in ["system", "system_ext", "vendor", "odm", "my_product"]:
+                os.makedirs(os.path.join(tmp_work, p))
+            apex_dir = os.path.join(tmp_work, "system", "system", "apex")
+            os.makedirs(apex_dir, exist_ok=True)
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.runtime.apex"), "com.wrong.rogue.runtime")
+            self._create_valid_apex(os.path.join(apex_dir, "com.google.android.art_compressed.apex"), "com.android.art")
+            self._create_valid_apex(os.path.join(apex_dir, "com.android.i18n.apex"), "com.android.i18n")
+            self._create_valid_apex(os.path.join(apex_dir, "com.google.android.tzdata6.apex"), "com.android.tzdata")
+
+            env = os.environ.copy()
+            env["WORK_DIR"] = tmp_work
+            res = subprocess.run(
+                [BUILD_ALL_SCRIPT, "--check-donor"],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Mandatory runtime APEX manifest validation failed", res.stderr)
+
+
+class TestStage2WorkDirImmutability(unittest.TestCase):
+    """Test that build_stage2_erofs.sh never modifies WORK_DIR or leaves .orig files."""
+
+    def test_work_dir_remains_strictly_unmodified(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            work_dir = os.path.join(tmp_dir, "work")
+            out_dir = os.path.join(tmp_dir, "build", "images")
+            for p in ["system", "system_ext", "vendor", "odm", "my_product"]:
+                os.makedirs(os.path.join(work_dir, p))
+
+            # Create sample files in work_dir
+            v_prop = os.path.join(work_dir, "vendor", "vendor", "build.prop")
+            os.makedirs(os.path.dirname(v_prop), exist_ok=True)
+            orig_prop_content = "ro.build.id=ORIGINAL_PROP\n"
+            with open(v_prop, "w") as f:
+                f.write(orig_prop_content)
+
+            ctx_file = os.path.join(work_dir, "system_ext", "etc", "selinux", "system_ext_property_contexts")
+            os.makedirs(os.path.dirname(ctx_file), exist_ok=True)
+            orig_ctx_content = "ro.build.date u:object_r:build_prop:s0\n"
+            with open(ctx_file, "w") as f:
+                f.write(orig_ctx_content)
+
+            apex_dir = os.path.join(work_dir, "system", "system", "apex")
+            os.makedirs(apex_dir, exist_ok=True)
+            manifest = {"name": "com.android.runtime", "version": 1}
+            with zipfile.ZipFile(os.path.join(apex_dir, "com.android.runtime.apex"), "w") as zf:
+                zf.writestr("apex_manifest.json", json.dumps(manifest))
+                zf.writestr("apex_payload.img", b"\x00" * 4096)
+
+            stage2_script = os.path.join(PROJECT_ROOT, "scripts", "build_stage2_erofs.sh")
+            env = os.environ.copy()
+            env["WORK_DIR"] = work_dir
+            env["OUT_DIR"] = out_dir
+
+            # Run build_stage2_erofs.sh (may halt on missing full APEXes or fsck, but must not alter WORK_DIR)
+            subprocess.run([stage2_script], capture_output=True, text=True, env=env, cwd=PROJECT_ROOT)
+
+            with open(v_prop, "r") as f:
+                self.assertEqual(f.read(), orig_prop_content)
+            with open(ctx_file, "r") as f:
+                self.assertEqual(f.read(), orig_ctx_content)
+
+            # Check no .orig files anywhere in work_dir
+            orig_files = []
+            for root, _, files in os.walk(work_dir):
+                for f in files:
+                    if f.endswith(".orig"):
+                        orig_files.append(os.path.join(root, f))
+            self.assertEqual(orig_files, [], f"Found .orig backup files in WORK_DIR: {orig_files}")
 
 
 class TestOtatoolsEnvironmentHandling(unittest.TestCase):

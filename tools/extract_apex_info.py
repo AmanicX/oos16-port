@@ -577,13 +577,18 @@ def main():
         sys.exit(1)
 
     if args.expect_package:
-        expected = args.expect_package
-        expected_norm = expected.replace("com.google.android.", "com.android.")
-        actual_norm = name.replace("com.google.android.", "com.android.")
+        expected_candidates = [p.strip() for p in args.expect_package.replace("|", ",").split(",") if p.strip()]
+        matched = False
+        for expected in expected_candidates:
+            expected_norm = expected.replace("com.google.android.", "com.android.").rstrip("0123456789")
+            actual_norm = name.replace("com.google.android.", "com.android.").rstrip("0123456789")
+            if name == expected or actual_norm == expected_norm:
+                matched = True
+                break
 
-        if name != expected and actual_norm != expected_norm:
+        if not matched:
             sys.stderr.write(
-                f"ERROR: Package name mismatch! Expected '{expected}' (or '{expected_norm}'), got '{name}'\n"
+                f"ERROR: Package name mismatch! Expected '{args.expect_package}', got '{name}'\n"
             )
             sys.exit(1)
 

@@ -35,27 +35,16 @@ BUILD_PARENT="$(dirname "$OUT_DIR")"
 mkdir -p "$BUILD_PARENT"
 STAGING_DIR="$BUILD_PARENT/.staging_erofs_$$"
 BACKUP_OUT_DIR="$BUILD_PARENT/.backup_images_$$"
+BUILD_WORK_DIR="$BUILD_PARENT/.staging_work_$$"
 TMP_BUILD_DIR="$(mktemp -d /tmp/erofs_build.XXXXXX)"
 
 BUILD_SUCCESS=0
-INJECTED_FILES=()
-MODIFIED_BACKUPS=()
 
 cleanup() {
     local exit_code=$?
     if [ "$BUILD_SUCCESS" -ne 1 ]; then
         echo "Build did not complete successfully. Reverting modifications and cleaning up..." >&2
-        # 1. Remove newly injected files
-        for f in "${INJECTED_FILES[@]:-}"; do
-            [ -n "$f" ] && rm -f "$f" 2>/dev/null || true
-        done
-        # 2. Restore modified files from .orig backups
-        for f in "${MODIFIED_BACKUPS[@]:-}"; do
-            if [ -n "$f" ] && [ -f "$f.orig" ]; then
-                mv -f "$f.orig" "$f" 2>/dev/null || true
-            fi
-        done
-        # 3. Rollback output directory if backup exists
+        # Rollback output directory if backup exists
         if [ -d "$BACKUP_OUT_DIR" ]; then
             echo "Rolling back to previous valid build output..." >&2
             rm -rf "$OUT_DIR" 2>/dev/null || true
@@ -63,18 +52,15 @@ cleanup() {
         fi
     else
         # On success, clean up backups
-        for f in "${MODIFIED_BACKUPS[@]:-}"; do
-            [ -n "$f" ] && rm -f "$f.orig" 2>/dev/null || true
-        done
         rm -rf "$BACKUP_OUT_DIR" 2>/dev/null || true
     fi
 
-    rm -rf "$STAGING_DIR" "$TMP_BUILD_DIR" 2>/dev/null || true
+    rm -rf "$STAGING_DIR" "$TMP_BUILD_DIR" "$BUILD_WORK_DIR" 2>/dev/null || true
     exit "$exit_code"
 }
 trap cleanup EXIT ERR INT TERM
 
-mkdir -p "$STAGING_DIR"
+mkdir -p "$STAGING_DIR" "$BUILD_WORK_DIR"
 
 echo "=========================================================="
 echo "      STAGE-2 EROFS PARTITION REPACK & FEATURE INJECTION   "
@@ -109,7 +95,7 @@ fi
 echo "Using mkfs.erofs: $MKFS_EROFS"
 echo "Using fsck.erofs: $FSCK_EROFS"
 
-"$MKFS_EROFS" -V >/dev/null 2>&1 || { echo "ERROR: mkfs.erofs failed verification test" >&2; exit 1; }
+"$MKFS_EROFS" --help >/dev/null 2>&1 || { echo "ERROR: mkfs.erofs failed verification test" >&2; exit 1; }
 "$FSCK_EROFS" -V >/dev/null 2>&1 || { echo "ERROR: fsck.erofs failed verification test" >&2; exit 1; }
 
 # 1. Validate Mandatory Inputs
@@ -162,26 +148,41 @@ if [ "${#MISSING_MANDATORY[@]}" -gt 0 ]; then
 fi
 echo "All mandatory source directories and runtime APEX verified."
 
-# 2. Apply Feature Injections with Reversible Backups
+# 2. Stage Partition Trees into Isolated Disposable Workspace
+echo "Staging partition trees into isolated disposable workspace: $BUILD_WORK_DIR..."
+ALL_PARTITIONS=("system" "system_ext" "vendor" "odm" "my_product" "my_region")
+for part_name in "${ALL_PARTITIONS[@]}"; do
+    if [ -d "$WORK_DIR/$part_name" ]; then
+        mkdir -p "$BUILD_WORK_DIR/$part_name"
+        if cp -al "$WORK_DIR/$part_name/." "$BUILD_WORK_DIR/$part_name/" 2>/dev/null; then
+            echo "  Staged $part_name via hardlinks."
+        else
+            cp -a "$WORK_DIR/$part_name/." "$BUILD_WORK_DIR/$part_name/"
+            echo "  Staged $part_name via copy."
+        fi
+    fi
+done
+
+# Resolve APEX directory in staged workspace or source
+if [ -d "$BUILD_WORK_DIR/system/system/apex" ]; then
+    APEX_DIR="$BUILD_WORK_DIR/system/system/apex"
+elif [ -d "$BUILD_WORK_DIR/system/apex" ]; then
+    APEX_DIR="$BUILD_WORK_DIR/system/apex"
+fi
+
+# 3. Apply Feature Injections in Isolated Workspace
 echo "[1/6] Injecting Google Photos Unlimited Backup and PIF..."
 CONFIGS_DIR="$PROJECT_ROOT/configs"
 
 inject_file() {
     local src_file="$1"
     local dest_file="$2"
-    if [ -f "$dest_file" ]; then
-        if [ ! -f "$dest_file.orig" ]; then
-            cp -a "$dest_file" "$dest_file.orig"
-            MODIFIED_BACKUPS+=("$dest_file")
-        fi
-    else
-        INJECTED_FILES+=("$dest_file")
-    fi
+    rm -f "$dest_file" 2>/dev/null || true
     cp "$src_file" "$dest_file"
 }
 
 if [ -f "$CONFIGS_DIR/pixel_2016_experience.xml" ]; then
-    for target in "$WORK_DIR/my_product/etc/permissions" "$WORK_DIR/system/system/etc/permissions" "$WORK_DIR/system_ext/etc/permissions"; do
+    for target in "$BUILD_WORK_DIR/my_product/etc/permissions" "$BUILD_WORK_DIR/system/system/etc/permissions" "$BUILD_WORK_DIR/system_ext/etc/permissions"; do
         if [ -d "$target" ]; then
             inject_file "$CONFIGS_DIR/pixel_2016_experience.xml" "$target/pixel_2016_experience.xml"
         fi
@@ -189,14 +190,14 @@ if [ -f "$CONFIGS_DIR/pixel_2016_experience.xml" ]; then
 fi
 
 if [ -f "$CONFIGS_DIR/pif.json" ]; then
-    for target in "$WORK_DIR/my_product/etc" "$WORK_DIR/system/system/etc" "$WORK_DIR/system_ext/etc"; do
+    for target in "$BUILD_WORK_DIR/my_product/etc" "$BUILD_WORK_DIR/system/system/etc" "$BUILD_WORK_DIR/system_ext/etc"; do
         if [ -d "$target" ]; then
             inject_file "$CONFIGS_DIR/pif.json" "$target/pif.json"
         fi
     done
 fi
 
-# 3. Targeted Permission Corrections
+# 4. Targeted Permission Corrections
 echo "[2/6] Applying targeted execute permission corrections..."
 fix_executable_permissions() {
     local dir="$1"
@@ -207,11 +208,17 @@ fix_executable_permissions() {
         magic=$(head -c 4 "$file" 2>/dev/null || true)
         if [ "$magic" = $'\x7fELF' ]; then
             if [ ! -x "$file" ]; then
+                local tmp_f="${file}.mode_tmp_$$"
+                cp -a "$file" "$tmp_f"
+                mv -f "$tmp_f" "$file"
                 chmod +x "$file"
                 echo "    Added +x to ELF executable: $(basename "$file")"
             fi
         elif head -c 2 "$file" 2>/dev/null | grep -q '^#!'; then
             if [ ! -x "$file" ]; then
+                local tmp_f="${file}.mode_tmp_$$"
+                cp -a "$file" "$tmp_f"
+                mv -f "$tmp_f" "$file"
                 chmod +x "$file"
                 echo "    Added +x to shell script: $(basename "$file")"
             fi
@@ -219,17 +226,16 @@ fix_executable_permissions() {
     done
 }
 
-fix_executable_permissions "$WORK_DIR/vendor/vendor/bin"
-fix_executable_permissions "$WORK_DIR/odm/bin"
+fix_executable_permissions "$BUILD_WORK_DIR/vendor/vendor/bin"
+fix_executable_permissions "$BUILD_WORK_DIR/odm/bin"
 
-# 4. Configure Display Properties for 60Hz Replacement AMOLED Panel
+# 5. Configure Display Properties for 60Hz Replacement AMOLED Panel
 echo "[3/6] Setting fixed 60Hz display properties in vendor build.prop..."
-VENDOR_PROP="$WORK_DIR/vendor/vendor/build.prop"
+VENDOR_PROP="$BUILD_WORK_DIR/vendor/vendor/build.prop"
 if [ -f "$VENDOR_PROP" ]; then
-    if [ ! -f "$VENDOR_PROP.orig" ]; then
-        cp -a "$VENDOR_PROP" "$VENDOR_PROP.orig"
-        MODIFIED_BACKUPS+=("$VENDOR_PROP")
-    fi
+    tmp_prop="${VENDOR_PROP}.tmp_$$"
+    cp "$VENDOR_PROP" "$tmp_prop"
+    mv -f "$tmp_prop" "$VENDOR_PROP"
     for prop in \
         "ro.surface_flinger.game_default_frame_rate_override=60" \
         "ro.surface_flinger.enable_frame_rate_override=false" \
@@ -246,14 +252,13 @@ if [ -f "$VENDOR_PROP" ]; then
     done
 fi
 
-# 5. Resolve SELinux Property Context Prefix Conflicts
+# 6. Resolve SELinux Property Context Prefix Conflicts
 echo "[4/6] Verifying SELinux system_ext_property_contexts..."
-PROP_CTX="$WORK_DIR/system_ext/etc/selinux/system_ext_property_contexts"
+PROP_CTX="$BUILD_WORK_DIR/system_ext/etc/selinux/system_ext_property_contexts"
 if [ -f "$PROP_CTX" ]; then
-    if [ ! -f "$PROP_CTX.orig" ]; then
-        cp -a "$PROP_CTX" "$PROP_CTX.orig"
-        MODIFIED_BACKUPS+=("$PROP_CTX")
-    fi
+    tmp_ctx="${PROP_CTX}.tmp_$$"
+    cp "$PROP_CTX" "$tmp_ctx"
+    mv -f "$tmp_ctx" "$PROP_CTX"
     for prefix in \
         "ro.bootimage.build.fingerprint" \
         "ro.build.date" \
@@ -277,15 +282,15 @@ if [ -f "$PROP_CTX" ]; then
     done
 fi
 
-# 6. Build and Strictly Validate EROFS Partition Images into Temporary Staging
+# 7. Build and Strictly Validate EROFS Partition Images into Temporary Staging
 echo "[5/6] Building high-compression EROFS partition images in clean staging area..."
 PARTITIONS=(
-    "odm:$WORK_DIR/odm:1"
-    "vendor:$WORK_DIR/vendor:1"
-    "my_region:$WORK_DIR/my_region:0"
-    "system:$WORK_DIR/system:1"
-    "system_ext:$WORK_DIR/system_ext:1"
-    "my_product:$WORK_DIR/my_product:1"
+    "odm:$BUILD_WORK_DIR/odm:1"
+    "vendor:$BUILD_WORK_DIR/vendor:1"
+    "my_region:$BUILD_WORK_DIR/my_region:0"
+    "system:$BUILD_WORK_DIR/system:1"
+    "system_ext:$BUILD_WORK_DIR/system_ext:1"
+    "my_product:$BUILD_WORK_DIR/my_product:1"
 )
 
 for part_def in "${PARTITIONS[@]}"; do
@@ -330,21 +335,28 @@ extract_and_stage_apex() {
     local apex_id="$1"
     local output_base="$2"
     local mandatory="${3:-1}"
-    local apex_dir="${APEX_DIR:-$WORK_DIR/system/system/apex}"
-    if [ ! -d "$apex_dir" ] && [ -d "$WORK_DIR/system/apex" ]; then
+    local apex_dir="${APEX_DIR:-$BUILD_WORK_DIR/system/system/apex}"
+    if [ ! -d "$apex_dir" ] && [ -d "$BUILD_WORK_DIR/system/apex" ]; then
+        apex_dir="$BUILD_WORK_DIR/system/apex"
+    elif [ ! -d "$apex_dir" ] && [ -d "$WORK_DIR/system/system/apex" ]; then
+        apex_dir="$WORK_DIR/system/system/apex"
+    elif [ ! -d "$apex_dir" ] && [ -d "$WORK_DIR/system/apex" ]; then
         apex_dir="$WORK_DIR/system/apex"
     elif [ ! -d "$apex_dir" ] && [ -d "$WORK_DIR/apex" ]; then
         apex_dir="$WORK_DIR/apex"
     fi
     local target_pkg=""
+    local expected_pkgs=""
 
     case "$apex_id" in
         runtime)
+            expected_pkgs="com.android.runtime,com.google.android.runtime"
             for cand in "$apex_dir/com.android.runtime.apex" "$apex_dir/com.google.android.runtime.apex"; do
                 if [ -f "$cand" ]; then target_pkg="$cand"; break; fi
             done
             ;;
         art)
+            expected_pkgs="com.android.art,com.google.android.art"
             for cand in "$apex_dir/com.google.android.art_compressed.apex" \
                         "$apex_dir/com.android.art_compressed.apex" \
                         "$apex_dir/com.android.art.apex" \
@@ -353,6 +365,7 @@ extract_and_stage_apex() {
             done
             ;;
         i18n)
+            expected_pkgs="com.android.i18n,com.google.android.i18n"
             for cand in "$apex_dir/com.android.i18n.apex" \
                         "$apex_dir/com.google.android.i18n.apex" \
                         "$apex_dir/com.google.android.i18n_compressed.apex"; do
@@ -360,11 +373,15 @@ extract_and_stage_apex() {
             done
             ;;
         tzdata)
+            expected_pkgs="com.android.tzdata,com.google.android.tzdata,com.google.android.tzdata6"
             for cand in "$apex_dir/com.google.android.tzdata6.apex" \
                         "$apex_dir/com.google.android.tzdata.apex" \
                         "$apex_dir/com.android.tzdata.apex"; do
                 if [ -f "$cand" ]; then target_pkg="$cand"; break; fi
             done
+            ;;
+        *)
+            expected_pkgs="com.android.${apex_id}"
             ;;
     esac
 
@@ -437,7 +454,6 @@ extract_and_stage_apex() {
     fi
 
     # Extract authentic APEX version code from manifest without silent fallback
-    local expected_pkg="com.android.${apex_id}"
     echo " -> Extracting and validating manifest metadata via tools/extract_apex_info.py..."
     local pkg_name
     if ! pkg_name=$(python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --name-only); then
@@ -447,8 +463,8 @@ extract_and_stage_apex() {
     pkg_name=$(echo "$pkg_name" | tr -d '[:space:]')
 
     local pkg_version
-    if ! pkg_version=$(python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --expect-package "$expected_pkg" --version-only); then
-        echo "CRITICAL BUILD ERROR: APEX manifest extraction failed for $target_pkg ($expected_pkg)!" >&2
+    if ! pkg_version=$(python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$target_pkg" --expect-package "$expected_pkgs" --version-only); then
+        echo "CRITICAL BUILD ERROR: APEX manifest extraction failed for $target_pkg ($expected_pkgs)!" >&2
         exit 1
     fi
 

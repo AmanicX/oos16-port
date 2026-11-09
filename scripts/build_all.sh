@@ -37,6 +37,7 @@ STAGE2_ONLY=0
 BOOT_ONLY=0
 VERIFY_ONLY=0
 CHECK_TOOLS_ONLY=0
+CHECK_DONOR_ONLY=0
 
 usage() {
     cat << 'EOF'
@@ -51,6 +52,7 @@ Options:
   --boot-only      Only compile ARM64 helper and package Stage-1 boot images
   --verify-only    Run independent verification and static audits without rebuilding
   --check-tools    Validate host and Android tool dependencies and exit
+  --check-donor    Validate donor partition trees and APEX modules and exit
   -h, --help       Show this help message and exit
 
 Environment Variables:
@@ -82,6 +84,10 @@ while [ $# -gt 0 ]; do
             CHECK_TOOLS_ONLY=1
             shift
             ;;
+        --check-donor)
+            CHECK_DONOR_ONLY=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -100,9 +106,10 @@ ACTIVE_MODES=0
 [ "$BOOT_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$VERIFY_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$CHECK_TOOLS_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
+[ "$CHECK_DONOR_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 
 if [ "$ACTIVE_MODES" -gt 1 ]; then
-    echo "Error: Options --stage2-only, --boot-only, and --verify-only are mutually exclusive." >&2
+    echo "Error: Options --stage2-only, --boot-only, --verify-only, --check-tools, and --check-donor are mutually exclusive." >&2
     exit 1
 fi
 
@@ -119,6 +126,8 @@ echo "Project Root: $PROJECT_ROOT"
 echo "Execution Mode:"
 if [ "$CHECK_TOOLS_ONLY" -eq 1 ]; then
     echo "  [CHECK-TOOLS] Validating host and Android tool dependencies"
+elif [ "$CHECK_DONOR_ONLY" -eq 1 ]; then
+    echo "  [CHECK-DONOR] Validating donor partition trees and APEX modules"
 elif [ "$VERIFY_ONLY" -eq 1 ]; then
     echo "  [VERIFY-ONLY] Validating existing artifacts & static safety"
 elif [ "$STAGE2_ONLY" -eq 1 ]; then
@@ -138,44 +147,58 @@ echo ""
 echo "--- Step 1: Checking Host Tools and Dependencies ---"
 
 REQUIRED_HOST_TOOLS=(
-    "python3"
-    "go"
-    "sha256sum"
-    "stat"
-    "cpio"
-    "lz4"
+    "python3:--version"
+    "go:version"
+    "sha256sum:--version"
+    "stat:--version"
+    "cpio:--version"
+    "lz4:--version"
+    "unzip:-v"
+    "file:--version"
 )
 
-for tool in "${REQUIRED_HOST_TOOLS[@]}"; do
+for tool_entry in "${REQUIRED_HOST_TOOLS[@]}"; do
+    tool="${tool_entry%%:*}"
+    test_arg="${tool_entry##*:}"
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Error: Required host tool '$tool' is not installed or not in PATH." >&2
+        exit 1
+    fi
+    if ! "$tool" $test_arg >/dev/null 2>&1; then
+        echo "Error: Required host tool '$tool' failed execution test with '$test_arg'." >&2
         exit 1
     fi
     echo "  [OK] Host tool: $tool ($(command -v "$tool"))"
 done
 
-# 7-Zip check
-if command -v 7z >/dev/null 2>&1; then
+# 7-Zip check with functionality test
+if command -v 7z >/dev/null 2>&1 && 7z --help >/dev/null 2>&1; then
     echo "  [OK] 7-Zip archive tool: 7z ($(command -v 7z))"
-elif command -v 7za >/dev/null 2>&1; then
+elif command -v 7za >/dev/null 2>&1 && 7za --help >/dev/null 2>&1; then
     echo "  [OK] 7-Zip archive tool: 7za ($(command -v 7za))"
 else
-    echo "Error: 7-Zip (7z or 7za) is required for APEX extraction and not found." >&2
+    echo "Error: 7-Zip (7z or 7za) is required for APEX extraction and not found or non-functional." >&2
     exit 1
 fi
 
 # Android Packaging Tools (mkbootfs, mkbootimg, unpack_bootimg, mkfs.erofs, fsck.erofs)
 ANDROID_TOOLS=(
-    "mkbootfs"
-    "mkbootimg"
-    "unpack_bootimg"
-    "mkfs.erofs"
-    "fsck.erofs"
+    "mkbootfs:-h"
+    "mkbootimg:--help"
+    "unpack_bootimg:--help"
+    "mkfs.erofs:--help"
+    "fsck.erofs:-V"
 )
 
-for atool in "${ANDROID_TOOLS[@]}"; do
+for atool_entry in "${ANDROID_TOOLS[@]}"; do
+    atool="${atool_entry%%:*}"
+    atest_arg="${atool_entry##*:}"
     if ! command -v "$atool" >/dev/null 2>&1; then
         echo "Error: Required Android tool '$atool' was not found in PATH or external/coloros_port/otatools/bin." >&2
+        exit 1
+    fi
+    if ! "$atool" $atest_arg >/dev/null 2>&1; then
+        echo "Error: Required Android tool '$atool' failed execution test with '$atest_arg'." >&2
         exit 1
     fi
     echo "  [OK] Android tool: $atool ($(command -v "$atool"))"
@@ -184,6 +207,126 @@ done
 if [ "$CHECK_TOOLS_ONLY" -eq 1 ]; then
     echo ""
     echo "[OK] All required host and Android tool dependencies are verified."
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------
+# Helper: Donor ROM Partition Directories & APEX Validation
+# ------------------------------------------------------------------------------
+validate_donor_rom() {
+    WORK_DIR="${WORK_DIR:-$PROJECT_ROOT/work}"
+    echo ""
+    echo "--- Validating Donor ROM Partition Directories & APEX Modules ---"
+    if [ ! -d "$WORK_DIR" ]; then
+        echo "Error: Work directory '$WORK_DIR' does not exist." >&2
+        exit 1
+    fi
+
+    local mandatory_partitions=("system" "system_ext" "vendor" "odm" "my_product")
+    for part in "${mandatory_partitions[@]}"; do
+        if [ ! -d "$WORK_DIR/$part" ]; then
+            echo "Error: Mandatory donor partition directory '$WORK_DIR/$part' does not exist." >&2
+            exit 1
+        fi
+        echo "  [OK] Partition source: $part ($(du -sh "$WORK_DIR/$part" 2>/dev/null | awk '{print $1}' || echo "present"))"
+    done
+
+    # Resolve authoritative APEX directory in donor tree
+    APEX_DIR=""
+    if [ -d "$WORK_DIR/system/system/apex" ]; then
+        APEX_DIR="$WORK_DIR/system/system/apex"
+    elif [ -d "$WORK_DIR/system/apex" ]; then
+        APEX_DIR="$WORK_DIR/system/apex"
+    elif [ -d "$WORK_DIR/apex" ]; then
+        APEX_DIR="$WORK_DIR/apex"
+    fi
+
+    if [ -z "$APEX_DIR" ] || [ ! -d "$APEX_DIR" ]; then
+        echo "Error: Authoritative APEX directory not found under '$WORK_DIR' (expected system/system/apex or system/apex)." >&2
+        exit 1
+    fi
+    echo "  [OK] Authoritative APEX source directory: $APEX_DIR"
+
+    # 1. Validate Runtime APEX
+    FOUND_RUNTIME=""
+    for cand in "$APEX_DIR/com.android.runtime.apex" "$APEX_DIR/com.google.android.runtime.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_RUNTIME="$cand"; break; fi
+    done
+    if [ -z "$FOUND_RUNTIME" ]; then
+        echo "Error: Mandatory runtime APEX module (com.android.runtime.apex or com.google.android.runtime.apex) missing in $APEX_DIR." >&2
+        exit 1
+    fi
+    if [ -f "$PROJECT_ROOT/tools/extract_apex_info.py" ] && command -v python3 >/dev/null 2>&1; then
+        if ! python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$FOUND_RUNTIME" --expect-package "com.android.runtime,com.google.android.runtime" >/dev/null 2>&1; then
+            echo "Error: Mandatory runtime APEX manifest validation failed for $(basename "$FOUND_RUNTIME")." >&2
+            exit 1
+        fi
+    fi
+    echo "  [OK] Runtime APEX: $(basename "$FOUND_RUNTIME")"
+
+    # 2. Validate ART APEX
+    FOUND_ART=""
+    for cand in "$APEX_DIR/com.google.android.art_compressed.apex" \
+                "$APEX_DIR/com.android.art_compressed.apex" \
+                "$APEX_DIR/com.android.art.apex" \
+                "$APEX_DIR/com.google.android.art.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_ART="$cand"; break; fi
+    done
+    if [ -z "$FOUND_ART" ]; then
+        echo "Error: Mandatory ART APEX module (com.google.android.art_compressed.apex or com.android.art.apex) missing in $APEX_DIR." >&2
+        exit 1
+    fi
+    if [ -f "$PROJECT_ROOT/tools/extract_apex_info.py" ] && command -v python3 >/dev/null 2>&1; then
+        if ! python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$FOUND_ART" --expect-package "com.android.art,com.google.android.art" >/dev/null 2>&1; then
+            echo "Error: Mandatory ART APEX manifest validation failed for $(basename "$FOUND_ART")." >&2
+            exit 1
+        fi
+    fi
+    echo "  [OK] ART APEX: $(basename "$FOUND_ART")"
+
+    # 3. Validate i18n APEX
+    FOUND_I18N=""
+    for cand in "$APEX_DIR/com.android.i18n.apex" \
+                "$APEX_DIR/com.google.android.i18n.apex" \
+                "$APEX_DIR/com.google.android.i18n_compressed.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_I18N="$cand"; break; fi
+    done
+    if [ -z "$FOUND_I18N" ]; then
+        echo "Error: Mandatory i18n APEX module (com.android.i18n.apex) missing in $APEX_DIR." >&2
+        exit 1
+    fi
+    if [ -f "$PROJECT_ROOT/tools/extract_apex_info.py" ] && command -v python3 >/dev/null 2>&1; then
+        if ! python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$FOUND_I18N" --expect-package "com.android.i18n,com.google.android.i18n" >/dev/null 2>&1; then
+            echo "Error: Mandatory i18n APEX manifest validation failed for $(basename "$FOUND_I18N")." >&2
+            exit 1
+        fi
+    fi
+    echo "  [OK] i18n APEX: $(basename "$FOUND_I18N")"
+
+    # 4. Validate Timezone APEX
+    FOUND_TZDATA=""
+    for cand in "$APEX_DIR/com.google.android.tzdata6.apex" \
+                "$APEX_DIR/com.google.android.tzdata.apex" \
+                "$APEX_DIR/com.android.tzdata.apex"; do
+        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_TZDATA="$cand"; break; fi
+    done
+    if [ -z "$FOUND_TZDATA" ]; then
+        echo "Error: Mandatory Timezone APEX module (com.google.android.tzdata6.apex or com.android.tzdata.apex) missing in $APEX_DIR." >&2
+        exit 1
+    fi
+    if [ -f "$PROJECT_ROOT/tools/extract_apex_info.py" ] && command -v python3 >/dev/null 2>&1; then
+        if ! python3 "$PROJECT_ROOT/tools/extract_apex_info.py" --apex "$FOUND_TZDATA" --expect-package "com.android.tzdata,com.google.android.tzdata,com.google.android.tzdata6" >/dev/null 2>&1; then
+            echo "Error: Mandatory Timezone APEX manifest validation failed for $(basename "$FOUND_TZDATA")." >&2
+            exit 1
+        fi
+    fi
+    echo "  [OK] Timezone APEX: $(basename "$FOUND_TZDATA")"
+}
+
+if [ "$CHECK_DONOR_ONLY" -eq 1 ]; then
+    validate_donor_rom
+    echo ""
+    echo "[OK] All donor ROM partitions and APEX modules are verified."
     exit 0
 fi
 
@@ -270,91 +413,8 @@ echo "  [OK] Recovery DTBO verified (SHA: ${ACTUAL_RECOVERY_DTBO_SHA:0:16}..., s
 # ------------------------------------------------------------------------------
 # 3. Partition Input Verification (Donor ROM Extraction)
 # ------------------------------------------------------------------------------
-WORK_DIR="${WORK_DIR:-$PROJECT_ROOT/work}"
-
 if [ "$VERIFY_ONLY" -eq 0 ] && [ "$BOOT_ONLY" -eq 0 ] && [ "$SKIP_STAGE2" -eq 0 ]; then
-    echo ""
-    echo "--- Step 3: Validating Donor ROM Partition Directories & APEX Modules ---"
-    if [ ! -d "$WORK_DIR" ]; then
-        echo "Error: Work directory '$WORK_DIR' does not exist." >&2
-        exit 1
-    fi
-
-    MANDATORY_PARTITIONS=("system" "system_ext" "vendor" "odm" "my_product")
-    for part in "${MANDATORY_PARTITIONS[@]}"; do
-        if [ ! -d "$WORK_DIR/$part" ]; then
-            echo "Error: Mandatory donor partition directory '$WORK_DIR/$part' does not exist." >&2
-            exit 1
-        fi
-        echo "  [OK] Partition source: $part ($(du -sh "$WORK_DIR/$part" | awk '{print $1}'))"
-    done
-
-    # Resolve authoritative APEX directory in donor tree
-    APEX_DIR=""
-    if [ -d "$WORK_DIR/system/system/apex" ]; then
-        APEX_DIR="$WORK_DIR/system/system/apex"
-    elif [ -d "$WORK_DIR/system/apex" ]; then
-        APEX_DIR="$WORK_DIR/system/apex"
-    elif [ -d "$WORK_DIR/apex" ]; then
-        APEX_DIR="$WORK_DIR/apex"
-    fi
-
-    if [ -z "$APEX_DIR" ] || [ ! -d "$APEX_DIR" ]; then
-        echo "Error: Authoritative APEX directory not found under '$WORK_DIR' (expected system/system/apex or system/apex)." >&2
-        exit 1
-    fi
-    echo "  [OK] Authoritative APEX source directory: $APEX_DIR"
-
-    # 1. Validate Runtime APEX
-    FOUND_RUNTIME=""
-    for cand in "$APEX_DIR/com.android.runtime.apex" "$APEX_DIR/com.google.android.runtime.apex"; do
-        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_RUNTIME="$cand"; break; fi
-    done
-    if [ -z "$FOUND_RUNTIME" ]; then
-        echo "Error: Mandatory runtime APEX module (com.android.runtime.apex or com.google.android.runtime.apex) missing in $APEX_DIR." >&2
-        exit 1
-    fi
-    echo "  [OK] Runtime APEX: $(basename "$FOUND_RUNTIME")"
-
-    # 2. Validate ART APEX
-    FOUND_ART=""
-    for cand in "$APEX_DIR/com.google.android.art_compressed.apex" \
-                "$APEX_DIR/com.android.art_compressed.apex" \
-                "$APEX_DIR/com.android.art.apex" \
-                "$APEX_DIR/com.google.android.art.apex"; do
-        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_ART="$cand"; break; fi
-    done
-    if [ -z "$FOUND_ART" ]; then
-        echo "Error: Mandatory ART APEX module (com.google.android.art_compressed.apex or com.android.art.apex) missing in $APEX_DIR." >&2
-        exit 1
-    fi
-    echo "  [OK] ART APEX: $(basename "$FOUND_ART")"
-
-    # 3. Validate i18n APEX
-    FOUND_I18N=""
-    for cand in "$APEX_DIR/com.android.i18n.apex" \
-                "$APEX_DIR/com.google.android.i18n.apex" \
-                "$APEX_DIR/com.google.android.i18n_compressed.apex"; do
-        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_I18N="$cand"; break; fi
-    done
-    if [ -z "$FOUND_I18N" ]; then
-        echo "Error: Mandatory i18n APEX module (com.android.i18n.apex) missing in $APEX_DIR." >&2
-        exit 1
-    fi
-    echo "  [OK] i18n APEX: $(basename "$FOUND_I18N")"
-
-    # 4. Validate Timezone APEX
-    FOUND_TZDATA=""
-    for cand in "$APEX_DIR/com.google.android.tzdata6.apex" \
-                "$APEX_DIR/com.google.android.tzdata.apex" \
-                "$APEX_DIR/com.android.tzdata.apex"; do
-        if [ -f "$cand" ] && [ -s "$cand" ]; then FOUND_TZDATA="$cand"; break; fi
-    done
-    if [ -z "$FOUND_TZDATA" ]; then
-        echo "Error: Mandatory Timezone APEX module (com.google.android.tzdata6.apex or com.android.tzdata.apex) missing in $APEX_DIR." >&2
-        exit 1
-    fi
-    echo "  [OK] Timezone APEX: $(basename "$FOUND_TZDATA")"
+    validate_donor_rom
 fi
 
 # ------------------------------------------------------------------------------
