@@ -20,25 +20,25 @@
 | **H12** | Packaged Loader Audit | `build/loader.img` | Rebuilt SHA-256: `6ec495865fcad15429625ebb3b515864a56163d9bc848a80c4b1fe5abb5e0257` (built 2026-11-09 01:49:46 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `25c5433e1e9f3d2f94d7dd1e5b05ad13764c0c237a83654495c77c0b393a9de1` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **LOCAL PASS / CI SKIPPED** |
 | **H13** | Packaged Stage1 Audit | `build/stage1.img` | Rebuilt SHA-256: `01ba479dbae2522e5e94c70dd839f919f267880b4b0670df43d5b5236d4992b2` (built 2026-11-09 01:49:58 +0500 from tree at commit `f073d8d` with working tree changes subsequently committed in `cd6afa5` at 01:53:30) / Baseline: `c04480b53cf243ef15135ed3e5b1ab43e5738376520cbe8eddb53690997bee8f` (commit `f073d8d`). 36/36 static & handover checks passed locally; explicitly logged as skipped in CI checkout via `.gitignore` | 36/36 Passed locally, Skipped in CI checkout | **LOCAL PASS / CI SKIPPED** |
 | **H14** | Hardware Kernel Assets | `stage1/kernel_src/` | Kernel `c32e3a26...` (banner `4.14.357-perf-gcd3073fb68f1`), DTB `e4faf7c5...` (`qcom,sm8150`), recovery DTBO `7cfdd198...` (`samsung_oneplus`). Verified strictly locally; explicitly logged as skipped in CI checkout via `.gitignore` | Strict SHA-256 and symbol match locally, Skipped in CI checkout | **LOCAL PASS / CI SKIPPED** |
-| **H15** | Build Pipeline Unit & Integration Tests | `tests/test_build_pipeline.py` | 28 tests: CLI flags, authoritative APEX directory resolution (`system/system/apex` and `system/apex`), mandatory module rejection, OTATOOLS environment precedence, authentic hardware asset checksum/size verification, independent boot image verifier, 4-field PARTITION_MAP schema, static safety auditor enforcement | 28/28 tests pass | **PASS** |
+| **H15** | Build Pipeline Unit & Integration Tests | `tests/test_build_pipeline.py` | 29 tests: CLI flags, authoritative APEX directory resolution (`system/system/apex` and `system/apex`), mandatory module rejection, OTATOOLS environment precedence (bin and flat directory), authentic hardware asset checksum/size verification, independent boot image verifier, 4-field PARTITION_MAP schema, static safety auditor enforcement | 29/29 tests pass | **PASS** |
 
 ### Summary of Automated Test Suite
 
-- **Total Defined Test Methods in Codebase**: **267** (252 Python test methods across 15 classes in 8 files + 15 Go test functions).
+- **Total Defined Test Methods in Codebase**: **268** (253 Python test methods across 15 classes in 8 files + 15 Go test functions).
 - **CI Environment Verification (Historical Baseline: Run #20 ID `42530682479`, Run #21 ID `42532420525`)**:
   - Historical baseline established in CI runs #20 and #21 with 239 tests (224 Python + 15 Go).
-  - Current codebase expands pipeline tests by 28 tests (`tests/test_build_pipeline.py`).
-  - Next CI run will execute all defined Python tests (252 methods, including all 5 live loop-device integration tests) + 15 Go tests = 267 total tests.
+  - Current codebase expands pipeline tests by 29 tests (`tests/test_build_pipeline.py`).
+  - Next CI run will execute all defined Python tests (253 methods, including all 5 live loop-device integration tests) + 15 Go tests = 268 total tests.
 - **Actual Local Environment Execution (Developer Workstation)**:
-  - Python tests executed: **247 tests ran, 246 passed, 0 failed, 0 errors, 1 skipped** (unprivileged loop capability).
+  - Python tests executed: **248 tests ran, 247 passed, 0 failed, 0 errors, 1 skipped** (unprivileged loop capability).
   - Live loop-device tests: **1 test suite class skipped** (`TestLiveLoopBlockDeviceSafety`, containing 5 live loop test methods) because local loop-device capabilities were unavailable (`CAN_LOOP: False`).
   - Go tests executed: **15 passed, 0 failed**.
-  - **Actual local combined result**: **261 passed, 1 skipped test class** (out of 248 discovered units).
-  - Note on test counting: In Python's `unittest`, class-level `setUpClass` skips do not increment `testsRun`; all 246 executed tests passed.
+  - **Actual local combined result**: **262 passed, 1 skipped test class** (out of 249 discovered units).
+  - Note on test counting: In Python's `unittest`, class-level `setUpClass` skips do not increment `testsRun`; all 247 executed tests passed.
   - Local passing percentage: Do not claim 100% passing locally due to the unprivileged loop-device skip.
 - **Conditional Test Behavior**:
-  - When loop capabilities are present (CI / root / privileged VM): **252 Python + 15 Go = 267 passed** (5 live loop tests run).
-  - When loop capabilities are absent (unprivileged host): **246 Python passed (1 suite skipped) + 15 Go = 261 passed** (5 live loop tests skipped).
+  - When loop capabilities are present (CI / root / privileged VM): **253 Python + 15 Go = 268 passed** (5 live loop tests run).
+  - When loop capabilities are absent (unprivileged host): **247 Python passed (1 suite skipped) + 15 Go = 262 passed** (5 live loop tests skipped).
 - **Pre-Boot Static Safety Auditor**:
   - Local packaged boot images (`build/loader.img`, `build/stage1.img`): **36/36 checks passed**, 0 failed.
   - Ramdisks (`stage1/native_ramdisk`, `stage1/loader_ramdisk`): **34/34 checks passed**, 0 failed, 1 optional unverified cmdline (both locally and in CI).

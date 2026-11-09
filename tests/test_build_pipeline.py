@@ -38,6 +38,7 @@ class TestBuildAllCLI(unittest.TestCase):
         self.assertIn("Usage: scripts/build_all.sh", res.stdout)
         self.assertIn("--skip-stage2", res.stdout)
         self.assertIn("--verify-only", res.stdout)
+        self.assertIn("--check-tools", res.stdout)
 
     def test_cli_unknown_argument(self):
         res = subprocess.run(
@@ -365,22 +366,64 @@ class TestOtatoolsEnvironmentHandling(unittest.TestCase):
             bin_dir = os.path.join(custom_otatools, "bin")
             os.makedirs(bin_dir, exist_ok=True)
 
-            mock_tool = os.path.join(bin_dir, "mkbootfs")
-            with open(mock_tool, "w") as f:
-                f.write("#!/bin/sh\necho 'CUSTOM_OTATOOLS_MKBOOTFS'\n")
-            os.chmod(mock_tool, 0o755)
+            mock_tools = {}
+            for tool_name in ["mkbootfs", "mkbootimg", "unpack_bootimg", "mkfs.erofs", "fsck.erofs"]:
+                tool_path = os.path.join(bin_dir, tool_name)
+                with open(tool_path, "w") as f:
+                    f.write(f"#!/bin/sh\necho 'CUSTOM_OTATOOLS_{tool_name.upper()}'\n")
+                os.chmod(tool_path, 0o755)
+                mock_tools[tool_name] = tool_path
+
+            if not shutil.which("7z") and not shutil.which("7za"):
+                stub_7z = os.path.join(bin_dir, "7z")
+                with open(stub_7z, "w") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(stub_7z, 0o755)
 
             env = os.environ.copy()
             env["OTATOOLS"] = custom_otatools
             res = subprocess.run(
-                ["bash", "-c", f'OTATOOLS="{custom_otatools}" "{BUILD_ALL_SCRIPT}" --verify-only'],
+                [BUILD_ALL_SCRIPT, "--check-tools"],
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
                 env=env,
             )
-            self.assertEqual(res.returncode, 0, f"Expected verify-only to succeed, got {res.returncode}:\n{res.stderr}\n{res.stdout}")
-            self.assertIn(f"mkbootfs ({mock_tool})", res.stdout)
+            self.assertEqual(res.returncode, 0, f"Expected --check-tools to succeed, got {res.returncode}:\n{res.stderr}\n{res.stdout}")
+            self.assertIn(f"mkbootfs ({mock_tools['mkbootfs']})", res.stdout)
+            self.assertIn(f"mkbootimg ({mock_tools['mkbootimg']})", res.stdout)
+            self.assertIn(f"unpack_bootimg ({mock_tools['unpack_bootimg']})", res.stdout)
+            self.assertIn(f"mkfs.erofs ({mock_tools['mkfs.erofs']})", res.stdout)
+            self.assertIn(f"fsck.erofs ({mock_tools['fsck.erofs']})", res.stdout)
+
+    def test_otatools_flat_directory_precedence(self):
+        with tempfile.TemporaryDirectory() as custom_otatools:
+            mock_tools = {}
+            for tool_name in ["mkbootfs", "mkbootimg", "unpack_bootimg", "mkfs.erofs", "fsck.erofs"]:
+                tool_path = os.path.join(custom_otatools, tool_name)
+                with open(tool_path, "w") as f:
+                    f.write(f"#!/bin/sh\necho 'CUSTOM_FLAT_{tool_name.upper()}'\n")
+                os.chmod(tool_path, 0o755)
+                mock_tools[tool_name] = tool_path
+
+            if not shutil.which("7z") and not shutil.which("7za"):
+                stub_7z = os.path.join(custom_otatools, "7z")
+                with open(stub_7z, "w") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(stub_7z, 0o755)
+
+            env = os.environ.copy()
+            env["OTATOOLS"] = custom_otatools
+            res = subprocess.run(
+                [BUILD_ALL_SCRIPT, "--check-tools"],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env=env,
+            )
+            self.assertEqual(res.returncode, 0, f"Expected --check-tools to succeed with flat OTATOOLS, got {res.returncode}:\n{res.stderr}\n{res.stdout}")
+            self.assertIn(f"mkbootfs ({mock_tools['mkbootfs']})", res.stdout)
+            self.assertIn(f"mkbootimg ({mock_tools['mkbootimg']})", res.stdout)
 
 
 class TestBootImageIndependentVerifier(unittest.TestCase):

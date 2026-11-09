@@ -36,6 +36,7 @@ SKIP_STAGE2=0
 STAGE2_ONLY=0
 BOOT_ONLY=0
 VERIFY_ONLY=0
+CHECK_TOOLS_ONLY=0
 
 usage() {
     cat << 'EOF'
@@ -49,6 +50,7 @@ Options:
   --stage2-only    Only build Stage-2 EROFS partition images and APEX modules
   --boot-only      Only compile ARM64 helper and package Stage-1 boot images
   --verify-only    Run independent verification and static audits without rebuilding
+  --check-tools    Validate host and Android tool dependencies and exit
   -h, --help       Show this help message and exit
 
 Environment Variables:
@@ -76,6 +78,10 @@ while [ $# -gt 0 ]; do
             VERIFY_ONLY=1
             shift
             ;;
+        --check-tools)
+            CHECK_TOOLS_ONLY=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -93,6 +99,7 @@ ACTIVE_MODES=0
 [ "$STAGE2_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$BOOT_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$VERIFY_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
+[ "$CHECK_TOOLS_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 
 if [ "$ACTIVE_MODES" -gt 1 ]; then
     echo "Error: Options --stage2-only, --boot-only, and --verify-only are mutually exclusive." >&2
@@ -110,7 +117,9 @@ echo "    Master Build & Verification Orchestrator"
 echo "=========================================================="
 echo "Project Root: $PROJECT_ROOT"
 echo "Execution Mode:"
-if [ "$VERIFY_ONLY" -eq 1 ]; then
+if [ "$CHECK_TOOLS_ONLY" -eq 1 ]; then
+    echo "  [CHECK-TOOLS] Validating host and Android tool dependencies"
+elif [ "$VERIFY_ONLY" -eq 1 ]; then
     echo "  [VERIFY-ONLY] Validating existing artifacts & static safety"
 elif [ "$STAGE2_ONLY" -eq 1 ]; then
     echo "  [STAGE2-ONLY] Building EROFS partitions & APEX modules"
@@ -171,6 +180,12 @@ for atool in "${ANDROID_TOOLS[@]}"; do
     fi
     echo "  [OK] Android tool: $atool ($(command -v "$atool"))"
 done
+
+if [ "$CHECK_TOOLS_ONLY" -eq 1 ]; then
+    echo ""
+    echo "[OK] All required host and Android tool dependencies are verified."
+    exit 0
+fi
 
 # ------------------------------------------------------------------------------
 # 2. Hardware Asset Cryptographic & Architectural Validation
