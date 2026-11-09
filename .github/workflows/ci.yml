@@ -29,23 +29,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bash lz4 bsdextrautils file gcc p7zip-full erofs-utils || sudo apt-get install -y bash lz4 bsdextrautils file gcc
-
-      - name: Provision Android Packaging & Host Tools
-        run: |
-          echo "Provisioning Android packaging tools in CI environment..."
-          TOOLS_BIN="external/coloros_port/otatools/bin"
-          mkdir -p "$TOOLS_BIN"
-          for tool in mkbootfs mkbootimg unpack_bootimg mkfs.erofs fsck.erofs; do
-            if command -v "$tool" >/dev/null 2>&1; then
-              ln -sf "$(command -v "$tool")" "$TOOLS_BIN/$tool"
-            else
-              printf '#!/bin/sh\nexit 0\n' > "$TOOLS_BIN/$tool"
-              chmod 0755 "$TOOLS_BIN/$tool"
-            fi
-          done
-          echo "$GITHUB_WORKSPACE/$TOOLS_BIN" >> $GITHUB_PATH
-          echo "Android tools provisioned in $TOOLS_BIN and exported to GITHUB_PATH."
+          sudo apt-get install -y bash lz4 bsdextrautils file gcc p7zip-full erofs-utils
 
       - name: Validate Shell & Init Scripts Syntax (bash -n and sh -n)
         run: |

@@ -134,19 +134,11 @@ class TestHardwareAssetValidation(unittest.TestCase):
         shutil.copy(AUDIT_SCRIPT, os.path.join(tmp_dir, "tools", "safe", "audit-no-writes.sh"))
         os.chmod(os.path.join(tmp_dir, "tools", "safe", "audit-no-writes.sh"), 0o755)
 
-        # Symlink or stub otatools to satisfy Android tool requirements
+        # Symlink authentic otatools if present in workspace
         otatools_src = os.path.join(PROJECT_ROOT, "external", "coloros_port", "otatools", "bin")
         if os.path.isdir(otatools_src):
             os.makedirs(os.path.join(tmp_dir, "external", "coloros_port", "otatools"), exist_ok=True)
             os.symlink(otatools_src, os.path.join(tmp_dir, "external", "coloros_port", "otatools", "bin"))
-        else:
-            mock_bin = os.path.join(tmp_dir, "external", "coloros_port", "otatools", "bin")
-            os.makedirs(mock_bin, exist_ok=True)
-            for tool in ["mkbootfs", "mkbootimg", "unpack_bootimg", "mkfs.erofs", "fsck.erofs"]:
-                t_path = os.path.join(mock_bin, tool)
-                with open(t_path, "w") as f:
-                    f.write("#!/bin/sh\nexit 0\n")
-                os.chmod(t_path, 0o755)
 
     def test_missing_kernel_fails(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

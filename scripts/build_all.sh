@@ -38,6 +38,8 @@ BOOT_ONLY=0
 VERIFY_ONLY=0
 CHECK_TOOLS_ONLY=0
 CHECK_DONOR_ONLY=0
+DONOR_WORK_DIR="${DONOR_WORK_DIR:-}"
+TARGET_WORK_DIR="${TARGET_WORK_DIR:-}"
 
 usage() {
     cat << 'EOF'
@@ -53,10 +55,14 @@ Options:
   --verify-only    Run independent verification and static audits without rebuilding
   --check-tools    Validate host and Android tool dependencies and exit
   --check-donor    Validate donor partition trees and APEX modules and exit
+  --donor-dir DIR  Directory containing OxygenOS 16 donor partition images or trees
+  --target-dir DIR Directory containing OnePlus 7T target partition images or trees
   -h, --help       Show this help message and exit
 
 Environment Variables:
-  WORK_DIR         Directory containing donor partition trees (default: $PROJECT_ROOT/work)
+  DONOR_WORK_DIR   Directory containing donor partition trees (OnePlus 9 OOS16)
+  TARGET_WORK_DIR  Directory containing target partition trees (OnePlus 7T SM8150)
+  WORK_DIR         Unified fallback work directory (default: $PROJECT_ROOT/work)
   OTATOOLS         Directory containing mkbootfs, mkfs.erofs, etc. (optional)
 EOF
 }
@@ -87,6 +93,14 @@ while [ $# -gt 0 ]; do
         --check-donor)
             CHECK_DONOR_ONLY=1
             shift
+            ;;
+        --donor-dir)
+            DONOR_WORK_DIR="$2"
+            shift 2
+            ;;
+        --target-dir)
+            TARGET_WORK_DIR="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -182,7 +196,7 @@ else
 fi
 
 # Android Packaging Tools (mkbootfs, mkbootimg, unpack_bootimg, mkfs.erofs, fsck.erofs)
-if [ "$CHECK_DONOR_ONLY" -eq 0 ]; then
+if [ "$CHECK_DONOR_ONLY" -eq 0 ] && [ "$VERIFY_ONLY" -eq 0 ]; then
     ANDROID_TOOLS=(
         "mkbootfs:-h"
         "mkbootimg:--help"
@@ -219,32 +233,45 @@ validate_donor_rom() {
     WORK_DIR="${WORK_DIR:-$PROJECT_ROOT/work}"
     echo ""
     echo "--- Validating Donor ROM Partition Directories & APEX Modules ---"
-    if [ ! -d "$WORK_DIR" ]; then
+    
+    local donor_root="${DONOR_WORK_DIR:-$WORK_DIR}"
+    local target_root="${TARGET_WORK_DIR:-$WORK_DIR}"
+
+    if [ ! -d "$donor_root" ] && [ ! -d "$WORK_DIR" ]; then
         echo "Error: Work directory '$WORK_DIR' does not exist." >&2
         exit 1
     fi
 
-    local mandatory_partitions=("system" "system_ext" "vendor" "odm" "my_product")
-    for part in "${mandatory_partitions[@]}"; do
-        if [ ! -d "$WORK_DIR/$part" ]; then
+    local mandatory_donor=("system" "system_ext" "my_product")
+    for part in "${mandatory_donor[@]}"; do
+        if [ ! -d "$donor_root/$part" ] && [ ! -d "$WORK_DIR/$part" ]; then
             echo "Error: Mandatory donor partition directory '$WORK_DIR/$part' does not exist." >&2
             exit 1
         fi
-        echo "  [OK] Partition source: $part ($(du -sh "$WORK_DIR/$part" 2>/dev/null | awk '{print $1}' || echo "present"))"
+        echo "  [OK] Donor partition source: $part"
+    done
+
+    local mandatory_target=("vendor" "odm")
+    for part in "${mandatory_target[@]}"; do
+        if [ ! -d "$target_root/$part" ] && [ ! -d "$WORK_DIR/$part" ]; then
+            echo "Error: Mandatory target partition directory '$WORK_DIR/$part' does not exist." >&2
+            exit 1
+        fi
+        echo "  [OK] Target partition source: $part"
     done
 
     # Resolve authoritative APEX directory in donor tree
     APEX_DIR=""
-    if [ -d "$WORK_DIR/system/system/apex" ]; then
-        APEX_DIR="$WORK_DIR/system/system/apex"
-    elif [ -d "$WORK_DIR/system/apex" ]; then
-        APEX_DIR="$WORK_DIR/system/apex"
-    elif [ -d "$WORK_DIR/apex" ]; then
-        APEX_DIR="$WORK_DIR/apex"
-    fi
+    for cand_apex in "$donor_root/system/system/apex" "$donor_root/system/apex" "$donor_root/apex" \
+                     "$WORK_DIR/system/system/apex" "$WORK_DIR/system/apex" "$WORK_DIR/apex"; do
+        if [ -d "$cand_apex" ]; then
+            APEX_DIR="$cand_apex"
+            break
+        fi
+    done
 
     if [ -z "$APEX_DIR" ] || [ ! -d "$APEX_DIR" ]; then
-        echo "Error: Authoritative APEX directory not found under '$WORK_DIR' (expected system/system/apex or system/apex)." >&2
+        echo "Error: Authoritative APEX directory not found under '$donor_root' or '$WORK_DIR' (expected system/system/apex or system/apex)." >&2
         exit 1
     fi
     echo "  [OK] Authoritative APEX source directory: $APEX_DIR"
