@@ -182,27 +182,29 @@ else
 fi
 
 # Android Packaging Tools (mkbootfs, mkbootimg, unpack_bootimg, mkfs.erofs, fsck.erofs)
-ANDROID_TOOLS=(
-    "mkbootfs:-h"
-    "mkbootimg:--help"
-    "unpack_bootimg:--help"
-    "mkfs.erofs:--help"
-    "fsck.erofs:-V"
-)
+if [ "$CHECK_DONOR_ONLY" -eq 0 ]; then
+    ANDROID_TOOLS=(
+        "mkbootfs:-h"
+        "mkbootimg:--help"
+        "unpack_bootimg:--help"
+        "mkfs.erofs:--help"
+        "fsck.erofs:-V"
+    )
 
-for atool_entry in "${ANDROID_TOOLS[@]}"; do
-    atool="${atool_entry%%:*}"
-    atest_arg="${atool_entry##*:}"
-    if ! command -v "$atool" >/dev/null 2>&1; then
-        echo "Error: Required Android tool '$atool' was not found in PATH or external/coloros_port/otatools/bin." >&2
-        exit 1
-    fi
-    if ! "$atool" $atest_arg >/dev/null 2>&1; then
-        echo "Error: Required Android tool '$atool' failed execution test with '$atest_arg'." >&2
-        exit 1
-    fi
-    echo "  [OK] Android tool: $atool ($(command -v "$atool"))"
-done
+    for atool_entry in "${ANDROID_TOOLS[@]}"; do
+        atool="${atool_entry%%:*}"
+        atest_arg="${atool_entry##*:}"
+        if ! command -v "$atool" >/dev/null 2>&1; then
+            echo "Error: Required Android tool '$atool' was not found in PATH or external/coloros_port/otatools/bin." >&2
+            exit 1
+        fi
+        if ! "$atool" $atest_arg >/dev/null 2>&1; then
+            echo "Error: Required Android tool '$atool' failed execution test with '$atest_arg'." >&2
+            exit 1
+        fi
+        echo "  [OK] Android tool: $atool ($(command -v "$atool"))"
+    done
+fi
 
 if [ "$CHECK_TOOLS_ONLY" -eq 1 ]; then
     echo ""
