@@ -261,10 +261,13 @@ def stage_partition(source_info, staging_part_dir):
         for item in items:
             s = os.path.join(src_path, item)
             d = os.path.join(staging_part_dir, item)
-            if os.path.isdir(s):
+            if os.path.islink(s):
+                link_target = os.readlink(s)
+                os.symlink(link_target, d)
+            elif os.path.isdir(s):
                 shutil.copytree(s, d, symlinks=True)
             else:
-                shutil.copy2(s, d)
+                shutil.copy2(s, d, follow_symlinks=False)
     elif src_type == "image":
         extract_image_to_dir(src_path, staging_part_dir)
     else:
