@@ -450,7 +450,12 @@ def main():
     print(f"Target Partitions Directory: {args.partitions_dir}")
     print(f"Checksum Manifest:           {args.manifest}")
 
-    inventory = verify_hardware_assets(args.partitions_dir, args.manifest)
+    try:
+        inventory = verify_hardware_assets(args.partitions_dir, args.manifest)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
     print(f"Discovered and verified {len(inventory)} partition images.")
 
     # Check key integrated assets

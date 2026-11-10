@@ -37,8 +37,8 @@ class TestHardwareIntegration(unittest.TestCase):
     """Test suite for OnePlus 7T hardware asset integration, inspection, and verification."""
 
     def setUp(self):
-        self.partitions_dir = os.path.join(PROJECT_ROOT, "partitions")
-        self.manifest_path = os.path.join(PROJECT_ROOT, "partitions", "SHA256SUMS")
+        self.partitions_dir = getattr(self, "partitions_dir", os.path.join(PROJECT_ROOT, "partitions"))
+        self.manifest_path = getattr(self, "manifest_path", os.path.join(PROJECT_ROOT, "partitions", "SHA256SUMS"))
         self.test_dir = tempfile.mkdtemp(prefix="test_hw_integrate_")
 
     def tearDown(self):
@@ -125,6 +125,9 @@ class TestHardwareIntegration(unittest.TestCase):
 
     def test_cli_execution_and_manifest_generation(self):
         """Verify CLI execution generates both Markdown and JSON manifests and exits 0."""
+        if not os.path.isdir(self.partitions_dir):
+            self.skipTest("partitions/ directory not found in workspace")
+
         docs_out = os.path.join(self.test_dir, "HARDWARE_INTEGRATION_MANIFEST.md")
         json_out = os.path.join(self.test_dir, "HARDWARE_INTEGRATION_MANIFEST.json")
 
@@ -144,6 +147,44 @@ class TestHardwareIntegration(unittest.TestCase):
         self.assertEqual(data["total_images"], 84)
         self.assertEqual(data["status"], "100% VERIFIED")
         self.assertEqual(data["integrated_assets"]["stage1_kernel_dtb"]["dtb_sha256"], "e4faf7c553f88246077343de51487d90517bb534e345ee44893d2e4fb348df3c")
+
+    def test_cli_execution_with_mock_partitions(self):
+        """Verify CLI execution with explicit mock partitions flags succeeds in CI and local environments."""
+        mock_parts = os.path.join(self.test_dir, "mock_cli_parts")
+        os.makedirs(mock_parts, exist_ok=True)
+        mock_manifest = os.path.join(self.test_dir, "MOCK_SHA256SUMS")
+
+        manifest_lines = []
+        for name in iha.ASSET_CLASSIFICATIONS.keys():
+            img_path = os.path.join(mock_parts, name)
+            with open(img_path, "wb") as f:
+                f.write(f"MOCK_CONTENT_{name}".encode("utf-8"))
+            sha = iha.compute_sha256(img_path)
+            manifest_lines.append(f"{sha}  {name}\n")
+
+        with open(mock_manifest, "w", encoding="utf-8") as f:
+            f.writelines(manifest_lines)
+
+        docs_out = os.path.join(self.test_dir, "MOCK_MANIFEST.md")
+        json_out = os.path.join(self.test_dir, "MOCK_MANIFEST.json")
+
+        res = subprocess.run([
+            sys.executable, INTEGRATE_SCRIPT,
+            "--partitions-dir", mock_parts,
+            "--manifest", mock_manifest,
+            "--docs-out", docs_out,
+            "--json-out", json_out,
+        ], capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 0, f"Script failed: {res.stderr}\n{res.stdout}")
+        self.assertIn("All 84 OnePlus 7T hardware assets successfully verified and integrated", res.stdout)
+        self.assertTrue(os.path.isfile(docs_out))
+        self.assertTrue(os.path.isfile(json_out))
+
+        with open(json_out) as f:
+            data = json.load(f)
+        self.assertEqual(data["total_images"], 84)
+        self.assertEqual(data["status"], "100% VERIFIED")
 
 
 if __name__ == "__main__":
