@@ -22,7 +22,7 @@
 This project strictly separates four distinct partition provenance tiers:
 
 1. **Tier 1 — Authentic OnePlus 7T Physical Partition Images (`partitions/*.img`):**
-   - 83 raw dumped partition images from the physical device (boot, dtbo, modem, dsp, bluetooth, bootloader, trustzone, NVRAM).
+   - 84 authentic dumped partition images from the physical device (boot, dtbo, modem, dsp, bluetooth, bootloader, trustzone, NVRAM).
    - **Note on Dynamic Partitions:** The omitted dynamic `super` partition is NOT present in this raw dump. Dynamic logical partitions (`system`, `system_ext`, `product`, `vendor`, `odm`) are provided by Tiers 2 and 3.
    - **Note on Userdata:** The `data` partition is deliberately omitted from physical storage and replaced with an ephemeral 1024 MB RAM tmpfs (`/data`) during Stage 2.
    - **Safety Policy:** These images are inspected for hardware extraction and verification ONLY. NEVER flash, write, or restore them to the phone.

@@ -164,7 +164,12 @@ class TestDonorTargetResolver(unittest.TestCase):
         """Verify that assigning a OnePlus 9 / SM8350 donor vendor partition as target is rejected."""
         ven_prop = os.path.join(self.target_dir, "vendor", "vendor", "build.prop")
         with open(ven_prop, "w") as f:
-            f.write("ro.product.vendor.device=OnePlus9\nro.board.platform=lahaina\n")
+            f.write(
+                "ro.product.vendor.device=OnePlus9\n"
+                "ro.board.platform=lahaina\n"
+                "ro.vendor.build.version.sdk=36\n"
+                "ro.vendor.build.version.release=16\n"
+            )
 
         res = subprocess.run([
             sys.executable, RESOLVER_SCRIPT,
@@ -207,7 +212,7 @@ class TestDonorTargetResolver(unittest.TestCase):
 
         with self.assertRaises(ValueError) as ctx:
             rps.validate_vendor_target(os.path.join(self.target_dir, "vendor"))
-        self.assertIn("missing required device identity", str(ctx.exception).lower())
+        self.assertIn("missing required device property", str(ctx.exception).lower())
 
     def test_rejection_of_unrelated_sm8150_device(self):
         """Verify unrelated SM8150 devices (e.g. Pixel 4 / coral, Galaxy S10) are rejected."""
@@ -215,6 +220,8 @@ class TestDonorTargetResolver(unittest.TestCase):
         with open(os.path.join(ven_dir, "build.prop"), "w") as f:
             f.write(
                 "ro.board.platform=msmnile\n"
+                "ro.vendor.build.version.sdk=36\n"
+                "ro.vendor.build.version.release=16\n"
                 "ro.product.vendor.brand=Google\n"
                 "ro.product.vendor.device=coral\n"
                 "ro.product.vendor.model=Pixel 4 XL\n"
@@ -231,6 +238,8 @@ class TestDonorTargetResolver(unittest.TestCase):
         with open(os.path.join(ven_dir, "build.prop"), "w") as f:
             f.write(
                 "ro.board.platform=msmnile\n"
+                "ro.vendor.build.version.sdk=36\n"
+                "ro.vendor.build.version.release=16\n"
                 "ro.product.vendor.brand=OnePlus\n"
                 "ro.product.vendor.device=OnePlus7T\n"
                 "ro.product.vendor.model=HD1901\n"
@@ -254,7 +263,7 @@ class TestDonorTargetResolver(unittest.TestCase):
         """Verify ODM partition with empty build.prop or missing identity is rejected."""
         odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
         with open(odm_prop, "w") as f:
-            f.write("ro.odm.build.date=20261111\n")
+            f.write("ro.odm.build.version.sdk=36\nro.odm.build.version.release=16\n")
 
         with self.assertRaises(ValueError) as ctx:
             rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
@@ -265,6 +274,8 @@ class TestDonorTargetResolver(unittest.TestCase):
         odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
         with open(odm_prop, "w") as f:
             f.write(
+                "ro.odm.build.version.sdk=36\n"
+                "ro.odm.build.version.release=16\n"
                 "ro.product.odm.brand=OnePlus\n"
                 "ro.product.odm.device=OnePlus7T\n"
                 "ro.product.odm.model=SM-G975F\n"
@@ -279,6 +290,8 @@ class TestDonorTargetResolver(unittest.TestCase):
         odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
         with open(odm_prop, "w") as f:
             f.write(
+                "ro.odm.build.version.sdk=36\n"
+                "ro.odm.build.version.release=16\n"
                 "ro.product.odm.brand=OnePlus\n"
                 "ro.product.odm.device=OnePlus9\n"
                 "ro.product.odm.model=LE2113\n"
@@ -413,6 +426,268 @@ class TestDonorTargetResolver(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("Verifying source asset immutability after staging", res.stdout)
         self.assertIn("100% cryptographic source asset immutability verified", res.stdout)
+
+    def test_image_source_validation_erofs_verify_only(self):
+        """Verify that an EROFS image-based vendor source is extracted and validated in --verify-only mode."""
+        mkfs = shutil.which("mkfs.erofs") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/mkfs.erofs")
+        if not mkfs or not os.path.isfile(mkfs):
+            self.skipTest("mkfs.erofs not available for creating test EROFS image")
+
+        # Create temporary directory tree for vendor image
+        ven_tree = os.path.join(self.test_dir, "raw_vendor_tree", "vendor")
+        os.makedirs(ven_tree, exist_ok=True)
+        with open(os.path.join(ven_tree, "build.prop"), "w") as f:
+            f.write(
+                "ro.product.vendor.brand=OnePlus\n"
+                "ro.product.vendor.device=OnePlus7T\n"
+                "ro.product.vendor.model=HD1901\n"
+                "ro.board.platform=msmnile\n"
+                "ro.vendor.build.version.sdk=36\n"
+                "ro.vendor.build.version.release=16\n"
+            )
+
+        ven_img = os.path.join(self.target_dir, "vendor.erofs.img")
+        res_mkfs = subprocess.run([mkfs, ven_img, os.path.join(self.test_dir, "raw_vendor_tree")], capture_output=True, text=True)
+        self.assertEqual(res_mkfs.returncode, 0, f"mkfs.erofs failed: {res_mkfs.stderr}")
+
+        # Remove the directory vendor so resolver picks up vendor.erofs.img
+        shutil.rmtree(os.path.join(self.target_dir, "vendor"))
+
+        res = subprocess.run([
+            sys.executable, RESOLVER_SCRIPT,
+            "--donor-dir", self.donor_dir,
+            "--target-dir", self.target_dir,
+            "--verify-only",
+        ], capture_output=True, text=True)
+
+        self.assertEqual(res.returncode, 0, f"Resolver failed on EROFS image: {res.stderr}\n{res.stdout}")
+        self.assertIn("Extracting and validating image source for vendor", res.stdout)
+        self.assertIn("Vendor Target (Image): Device=OnePlus7T", res.stdout)
+        self.assertIn("All mandatory donor and target partition sources successfully verified", res.stdout)
+
+    def test_image_source_validation_corrupt_rejected(self):
+        """Verify that a corrupted image source fails extraction and fails closed in --verify-only."""
+        shutil.rmtree(os.path.join(self.target_dir, "vendor"))
+        ven_img = os.path.join(self.target_dir, "vendor.img")
+        with open(ven_img, "wb") as f:
+            f.write(b"\xe2\xe1\xf5\xe0" + b"\xff" * 2048)  # Corrupted EROFS
+
+        res = subprocess.run([
+            sys.executable, RESOLVER_SCRIPT,
+            "--donor-dir", self.donor_dir,
+            "--target-dir", self.target_dir,
+            "--verify-only",
+        ], capture_output=True, text=True)
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertTrue("failed" in (res.stderr + res.stdout).lower())
+
+    def test_image_source_validation_ext4_rejected(self):
+        """Verify that an ext4 image source is strictly rejected due to Android metadata preservation policy."""
+        shutil.rmtree(os.path.join(self.target_dir, "vendor"))
+        ven_img = os.path.join(self.target_dir, "vendor.img")
+        with open(ven_img, "wb") as f:
+            f.write(b"\x00" * 1080 + b"\x53\xef" + b"\x00" * 1024)
+
+        res = subprocess.run([
+            sys.executable, RESOLVER_SCRIPT,
+            "--donor-dir", self.donor_dir,
+            "--target-dir", self.target_dir,
+            "--verify-only",
+        ], capture_output=True, text=True)
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("rejected", (res.stderr + res.stdout).lower())
+
+    def test_image_source_validation_wrong_device_rejected(self):
+        """Verify that an extracted image source with wrong device identity fails validation."""
+        mkfs = shutil.which("mkfs.erofs") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/mkfs.erofs")
+        if not mkfs or not os.path.isfile(mkfs):
+            self.skipTest("mkfs.erofs not available for creating test EROFS image")
+
+        ven_tree = os.path.join(self.test_dir, "wrong_vendor_tree", "vendor")
+        os.makedirs(ven_tree, exist_ok=True)
+        with open(os.path.join(ven_tree, "build.prop"), "w") as f:
+            f.write(
+                "ro.product.vendor.brand=OnePlus\n"
+                "ro.product.vendor.device=OnePlus9\n"
+                "ro.product.vendor.model=LE2113\n"
+                "ro.board.platform=lahaina\n"
+                "ro.vendor.build.version.sdk=36\n"
+                "ro.vendor.build.version.release=16\n"
+            )
+
+        ven_img = os.path.join(self.target_dir, "vendor.erofs.img")
+        subprocess.run([mkfs, ven_img, os.path.join(self.test_dir, "wrong_vendor_tree")], check=True, capture_output=True)
+        shutil.rmtree(os.path.join(self.target_dir, "vendor"))
+
+        res = subprocess.run([
+            sys.executable, RESOLVER_SCRIPT,
+            "--donor-dir", self.donor_dir,
+            "--target-dir", self.target_dir,
+            "--verify-only",
+        ], capture_output=True, text=True)
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertTrue("contamination" in (res.stderr + res.stdout).lower() or "lahaina" in (res.stderr + res.stdout).lower())
+
+    def test_image_source_validation_missing_metadata_rejected(self):
+        """Verify that an extracted image missing build.prop fails validation."""
+        mkfs = shutil.which("mkfs.erofs") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/mkfs.erofs")
+        if not mkfs or not os.path.isfile(mkfs):
+            self.skipTest("mkfs.erofs not available for creating test EROFS image")
+
+        empty_tree = os.path.join(self.test_dir, "empty_vendor_tree")
+        os.makedirs(os.path.join(empty_tree, "dummy_dir"), exist_ok=True)
+        ven_img = os.path.join(self.target_dir, "vendor.erofs.img")
+        subprocess.run([mkfs, ven_img, empty_tree], check=True, capture_output=True)
+        shutil.rmtree(os.path.join(self.target_dir, "vendor"))
+
+        res = subprocess.run([
+            sys.executable, RESOLVER_SCRIPT,
+            "--donor-dir", self.donor_dir,
+            "--target-dir", self.target_dir,
+            "--verify-only",
+        ], capture_output=True, text=True)
+
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("missing build.prop", (res.stderr + res.stdout).lower())
+
+    def test_vendor_missing_version_properties_rejected(self):
+        """Verify vendor partition missing SDK or release version properties is rejected (no defaults)."""
+        prop_path = os.path.join(self.target_dir, "vendor", "vendor", "build.prop")
+        with open(prop_path, "w") as f:
+            f.write(
+                "ro.product.vendor.brand=OnePlus\n"
+                "ro.product.vendor.device=OnePlus7T\n"
+                "ro.product.vendor.model=HD1901\n"
+                "ro.board.platform=msmnile\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_vendor_target(os.path.join(self.target_dir, "vendor"))
+        self.assertIn("missing required android version properties", str(ctx.exception).lower())
+
+    def test_vendor_rejects_oneplus7t_pro(self):
+        """Verify vendor partition specifically for OnePlus 7T Pro (hotdog/HD1910) is rejected."""
+        prop_path = os.path.join(self.target_dir, "vendor", "vendor", "build.prop")
+        with open(prop_path, "w") as f:
+            f.write(
+                "ro.product.vendor.brand=OnePlus\n"
+                "ro.product.vendor.device=hotdog\n"
+                "ro.product.vendor.model=HD1910\n"
+                "ro.board.platform=msmnile\n"
+                "ro.vendor.build.version.sdk=36\n"
+                "ro.vendor.build.version.release=16\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_vendor_target(os.path.join(self.target_dir, "vendor"))
+        self.assertIn("oneplus 7t pro", str(ctx.exception).lower())
+
+    def test_odm_missing_version_properties_rejected(self):
+        """Verify ODM partition missing SDK or release version properties is rejected."""
+        prop_path = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
+        with open(prop_path, "w") as f:
+            f.write(
+                "ro.product.odm.brand=OnePlus\n"
+                "ro.product.odm.device=OnePlus7T\n"
+                "ro.product.odm.model=HD1901\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
+        self.assertIn("missing required version properties", str(ctx.exception).lower())
+
+    def test_odm_rejects_oneplus7t_pro(self):
+        """Verify ODM partition specifically for OnePlus 7T Pro (hotdog/HD1913) is rejected."""
+        prop_path = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
+        with open(prop_path, "w") as f:
+            f.write(
+                "ro.product.odm.brand=OnePlus\n"
+                "ro.product.odm.device=hotdog\n"
+                "ro.product.odm.model=HD1913\n"
+                "ro.odm.build.version.sdk=36\n"
+                "ro.odm.build.version.release=16\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
+        self.assertIn("oneplus 7t pro", str(ctx.exception).lower())
+
+    def test_regional_variants_accepted(self):
+        """Verify that genuine OnePlus 7T regional models (HD1900, HD1903, HD1905, HD1907) are accepted."""
+        for model in ["HD1900", "HD1903", "HD1905", "HD1907"]:
+            ven_prop = os.path.join(self.target_dir, "vendor", "vendor", "build.prop")
+            with open(ven_prop, "w") as f:
+                f.write(
+                    f"ro.product.vendor.brand=OnePlus\n"
+                    f"ro.product.vendor.device=hotdogb\n"
+                    f"ro.product.vendor.model={model}\n"
+                    f"ro.board.platform=msmnile\n"
+                    f"ro.vendor.build.version.sdk=36\n"
+                    f"ro.vendor.build.version.release=16\n"
+                )
+            meta_ven = rps.validate_vendor_target(os.path.join(self.target_dir, "vendor"))
+            self.assertEqual(meta_ven["model"], model)
+
+            odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
+            with open(odm_prop, "w") as f:
+                f.write(
+                    f"ro.product.odm.brand=OnePlus\n"
+                    f"ro.product.odm.device=hotdogb\n"
+                    f"ro.product.odm.model={model}\n"
+                    f"ro.odm.build.version.sdk=36\n"
+                    f"ro.odm.build.version.release=16\n"
+                )
+            meta_odm = rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
+            self.assertEqual(meta_odm["model"], model)
+
+    def test_immutability_detects_permission_change(self):
+        """Verify that changing file permissions is detected as an immutability violation."""
+        snap_dir = os.path.join(self.test_dir, "snap_test_perm")
+        os.makedirs(snap_dir, exist_ok=True)
+        target_f = os.path.join(snap_dir, "test.txt")
+        with open(target_f, "w") as f:
+            f.write("content")
+        os.chmod(target_f, 0o644)
+
+        snap = rps.snapshot_dir_state(snap_dir)
+        os.chmod(target_f, 0o755)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            rps.verify_immutability(snap, snap_dir, "snap_test_perm")
+        self.assertIn("mode:", str(ctx.exception))
+
+    def test_immutability_detects_root_directory_change(self):
+        """Verify that changing the root directory itself is detected as an immutability violation."""
+        snap_dir = os.path.join(self.test_dir, "snap_test_root")
+        os.makedirs(snap_dir, exist_ok=True)
+        os.chmod(snap_dir, 0o755)
+
+        snap = rps.snapshot_dir_state(snap_dir)
+        self.assertIn(".", snap)
+        os.chmod(snap_dir, 0o700)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            rps.verify_immutability(snap, snap_dir, "snap_test_root")
+        self.assertIn(". (mode:", str(ctx.exception))
+
+    def test_immutability_fails_on_unreadable_file(self):
+        """Verify snapshot fails closed and raises RuntimeError on unreadable file (no silent skip)."""
+        snap_dir = os.path.join(self.test_dir, "snap_test_unreadable")
+        os.makedirs(snap_dir, exist_ok=True)
+        unreadable_f = os.path.join(snap_dir, "secret.bin")
+        with open(unreadable_f, "wb") as f:
+            f.write(b"secret_data")
+        os.chmod(unreadable_f, 0o000)
+
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                rps.snapshot_dir_state(snap_dir)
+            self.assertIn("unreadable", str(ctx.exception).lower())
+        finally:
+            os.chmod(unreadable_f, 0o644)
 
 if __name__ == "__main__":
     unittest.main()

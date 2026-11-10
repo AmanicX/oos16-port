@@ -39,6 +39,7 @@ VERIFY_ONLY=0
 CHECK_TOOLS_ONLY=0
 CHECK_DONOR_ONLY=0
 CHECK_SOURCES_ONLY=0
+CHECK_HARDWARE_ONLY=0
 DONOR_WORK_DIR="${DONOR_WORK_DIR:-}"
 TARGET_WORK_DIR="${TARGET_WORK_DIR:-}"
 
@@ -50,16 +51,17 @@ Master build and verification orchestrator for the OxygenOS 16 RAM-only port
 on OnePlus 7T HD1901 (hotdogb).
 
 Options:
-  --skip-stage2    Skip packaging Stage-2 EROFS images (reuse existing build/images/)
-  --stage2-only    Only build Stage-2 EROFS partition images and APEX modules
-  --boot-only      Only compile ARM64 helper and package Stage-1 boot images
-  --verify-only    Run independent verification and static audits without rebuilding
-  --check-tools    Validate host and Android tool dependencies and exit
-  --check-donor    Validate donor partition trees and APEX modules and exit
-  --check-sources  Validate all donor and target partition sources via resolver and exit
-  --donor-dir DIR  Directory containing OxygenOS 16 donor partition images or trees
-  --target-dir DIR Directory containing OnePlus 7T target partition images or trees
-  -h, --help       Show this help message and exit
+  --skip-stage2      Skip packaging Stage-2 EROFS images (reuse existing build/images/)
+  --stage2-only      Only build Stage-2 EROFS partition images and APEX modules
+  --boot-only        Only compile ARM64 helper and package Stage-1 boot images
+  --verify-only      Run independent verification and static audits without rebuilding
+  --check-tools      Validate host and Android tool dependencies and exit
+  --check-donor      Validate donor partition trees and APEX modules and exit
+  --check-sources    Validate all donor and target partition sources via resolver and exit
+  --check-hardware   Validate all 84 OnePlus 7T hardware assets and firmware mounts and exit
+  --donor-dir DIR    Directory containing OxygenOS 16 donor partition images or trees
+  --target-dir DIR   Directory containing OnePlus 7T target partition images or trees
+  -h, --help         Show this help message and exit
 
 Environment Variables:
   DONOR_WORK_DIR   Directory containing donor partition trees (OnePlus 9 OOS16)
@@ -100,6 +102,10 @@ while [ $# -gt 0 ]; do
             CHECK_SOURCES_ONLY=1
             shift
             ;;
+        --check-hardware)
+            CHECK_HARDWARE_ONLY=1
+            shift
+            ;;
         --donor-dir)
             DONOR_WORK_DIR="$2"
             shift 2
@@ -128,9 +134,10 @@ ACTIVE_MODES=0
 [ "$CHECK_TOOLS_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$CHECK_DONOR_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$CHECK_SOURCES_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
+[ "$CHECK_HARDWARE_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 
 if [ "$ACTIVE_MODES" -gt 1 ]; then
-    echo "Error: Options --stage2-only, --boot-only, --verify-only, --check-tools, --check-donor, and --check-sources are mutually exclusive." >&2
+    echo "Error: Options --stage2-only, --boot-only, --verify-only, --check-tools, --check-donor, --check-sources, and --check-hardware are mutually exclusive." >&2
     exit 1
 fi
 
@@ -149,6 +156,10 @@ if [ "$CHECK_TOOLS_ONLY" -eq 1 ]; then
     echo "  [CHECK-TOOLS] Validating host and Android tool dependencies"
 elif [ "$CHECK_DONOR_ONLY" -eq 1 ]; then
     echo "  [CHECK-DONOR] Validating donor partition trees and APEX modules"
+elif [ "$CHECK_SOURCES_ONLY" -eq 1 ]; then
+    echo "  [CHECK-SOURCES] Validating donor and target partition sources via resolver"
+elif [ "$CHECK_HARDWARE_ONLY" -eq 1 ]; then
+    echo "  [CHECK-HARDWARE] Validating 84 OnePlus 7T hardware partition assets & firmware mounts"
 elif [ "$VERIFY_ONLY" -eq 1 ]; then
     echo "  [VERIFY-ONLY] Validating existing artifacts & static safety"
 elif [ "$STAGE2_ONLY" -eq 1 ]; then
@@ -382,11 +393,23 @@ if [ "$CHECK_SOURCES_ONLY" -eq 1 ]; then
     exit 0
 fi
 
+if [ "$CHECK_HARDWARE_ONLY" -eq 1 ]; then
+    echo ""
+    python3 "$PROJECT_ROOT/tools/integrate_hardware_assets.py" --verify-only
+    echo ""
+    echo "[OK] All 84 OnePlus 7T hardware assets and firmware mounts are verified."
+    exit 0
+fi
+
 # ------------------------------------------------------------------------------
 # 2. Hardware Asset Cryptographic & Architectural Validation
 # ------------------------------------------------------------------------------
 echo ""
 echo "--- Step 2: Validating Authentic OnePlus 7T Hardware Assets ---"
+
+if [ -d "$PROJECT_ROOT/partitions" ] && [ -f "$PROJECT_ROOT/tools/integrate_hardware_assets.py" ] && command -v python3 >/dev/null 2>&1; then
+    python3 "$PROJECT_ROOT/tools/integrate_hardware_assets.py" --verify-only
+fi
 
 KERNEL_IMG="$PROJECT_ROOT/stage1/kernel_src/kernel"
 DTB_IMG="$PROJECT_ROOT/stage1/kernel_src/dtb"

@@ -30,6 +30,8 @@ import hashlib
 import json
 import subprocess
 import stat
+import errno
+import tempfile
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -74,10 +76,12 @@ def _snapshot_entry(full_path, lst, is_symlink=False):
             for xname in os.listxattr(full_path, follow_symlinks=False):
                 try:
                     xattrs[xname] = os.getxattr(full_path, xname, follow_symlinks=False)
-                except OSError:
-                    pass
-        except OSError:
-            pass
+                except OSError as e:
+                    if e.errno in (errno.EACCES, errno.EPERM):
+                        raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Permission denied reading xattr {xname} on {full_path}: {e}")
+        except OSError as e:
+            if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to inspect xattrs on {full_path}: {e}")
 
     if is_symlink or stat.S_ISLNK(mode):
         target = os.readlink(full_path)
@@ -100,7 +104,10 @@ def _snapshot_entry(full_path, lst, is_symlink=False):
             "xattrs": xattrs,
         }
     elif stat.S_ISREG(mode):
-        sha = compute_sha256(full_path)
+        try:
+            sha = compute_sha256(full_path)
+        except Exception as e:
+            raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to hash regular file {full_path}: {e}")
         return {
             "type": "regular",
             "size": lst.st_size,
@@ -125,33 +132,53 @@ def _snapshot_entry(full_path, lst, is_symlink=False):
 def snapshot_dir_state(path):
     """
     Take a complete cryptographic and metadata snapshot of a source path
-    using os.lstat() to prevent following symlinks.
+    including the root directory, using os.lstat() to prevent following symlinks.
+    Fails closed if any entry cannot be inspected.
     """
     state = {}
     if not os.path.exists(path) and not os.path.islink(path):
         return state
 
     if os.path.islink(path):
-        lst = os.lstat(path)
+        try:
+            lst = os.lstat(path)
+        except Exception as e:
+            raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to lstat root symlink {path}: {e}")
         state["."] = _snapshot_entry(path, lst, is_symlink=True)
         return state
 
     if os.path.isfile(path):
-        lst = os.lstat(path)
+        try:
+            lst = os.lstat(path)
+        except Exception as e:
+            raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to lstat root file {path}: {e}")
         state["."] = _snapshot_entry(path, lst)
         return state
+
+    # When path is a directory, snapshot root directory itself
+    try:
+        root_lst = os.lstat(path)
+    except Exception as e:
+        raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to lstat root directory {path}: {e}")
+    state["."] = _snapshot_entry(path, root_lst)
 
     for root, dirs, files in os.walk(path, followlinks=False):
         rel_dir = os.path.relpath(root, path)
         if rel_dir != ".":
-            lst = os.lstat(root)
+            try:
+                lst = os.lstat(root)
+            except Exception as e:
+                raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to lstat directory {root}: {e}")
             state[rel_dir] = _snapshot_entry(root, lst)
 
         for d in sorted(dirs):
             full_d = os.path.join(root, d)
             if os.path.islink(full_d):
                 rel_d = os.path.relpath(full_d, path)
-                lst = os.lstat(full_d)
+                try:
+                    lst = os.lstat(full_d)
+                except Exception as e:
+                    raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to lstat symlink directory {full_d}: {e}")
                 state[rel_d] = _snapshot_entry(full_d, lst, is_symlink=True)
 
         for f in sorted(files):
@@ -159,9 +186,9 @@ def snapshot_dir_state(path):
             rel_f = os.path.relpath(full_f, path)
             try:
                 lst = os.lstat(full_f)
-                state[rel_f] = _snapshot_entry(full_f, lst, is_symlink=os.path.islink(full_f))
-            except OSError:
-                pass
+            except Exception as e:
+                raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to lstat file {full_f}: {e}")
+            state[rel_f] = _snapshot_entry(full_f, lst, is_symlink=os.path.islink(full_f))
 
     return state
 
@@ -230,36 +257,65 @@ def locate_partition_source(search_dirs, part_name):
 
 def extract_image_to_dir(image_path, target_dir):
     """
-    Extract an image into target_dir.
+    Extract an image into target_dir with metadata-preserving tools.
     EROFS images are extracted using fsck.erofs.
+    Sparse images are unsparsed with simg2img first.
     Ext4 images via 7-Zip are strictly rejected because 7-Zip discards Android
     filesystem metadata (UID/GID, SELinux labels, capabilities, special files).
     """
     os.makedirs(target_dir, exist_ok=True)
+    if not os.path.isfile(image_path):
+        raise RuntimeError(f"Image file does not exist: {image_path}")
+
     with open(image_path, "rb") as f:
-        head = f.read(2048)
+        head = f.read(4096)
 
-    is_erofs = (head[:4] == b"\xe2\xe1\xf5\xe0" or head[1024:1028] == b"\xe2\xe1\xf5\xe0")
-    is_ext4 = (head[1080:1082] == b"\x53\xef")
+    # Check for sparse Android image (0xed26ff3a)
+    is_sparse = (len(head) >= 4 and head[:4] == b"\x3a\xff\x26\xed")
+    working_image = image_path
+    temp_raw = None
 
-    if is_erofs:
-        fsck_tool = shutil.which("fsck.erofs") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/fsck.erofs")
-        if not fsck_tool or not os.path.isfile(fsck_tool):
-            raise RuntimeError(f"fsck.erofs required to extract EROFS image {image_path} but not found.")
-        cmd = [fsck_tool, f"--extract={target_dir}", image_path]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"fsck.erofs extraction failed on {image_path}: {res.stderr}")
-    elif is_ext4:
-        raise RuntimeError(
-            f"Extraction of ext4 image {image_path} via 7-Zip is rejected: "
-            f"7-Zip cannot preserve required Android filesystem metadata "
-            f"(UID/GID, SELinux labels, Linux capabilities, special files, hardlinks). "
-            f"Use pre-extracted partition directory trees with authentic fs_config and file_contexts, "
-            f"or an Android-compatible metadata-preserving extraction tool."
-        )
-    else:
-        raise RuntimeError(f"Unrecognized image format for {image_path}. Supported format: EROFS.")
+    try:
+        if is_sparse:
+            simg2img_tool = shutil.which("simg2img") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/simg2img")
+            if not simg2img_tool or not os.path.isfile(simg2img_tool):
+                raise RuntimeError(f"simg2img required to unsparse {image_path} but not found.")
+            temp_fd, temp_raw = tempfile.mkstemp(prefix="unsparse_", suffix=".img")
+            os.close(temp_fd)
+            res = subprocess.run([simg2img_tool, image_path, temp_raw], capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"simg2img failed to unsparse {image_path}: {res.stderr}")
+            working_image = temp_raw
+            with open(working_image, "rb") as f:
+                head = f.read(4096)
+
+        is_erofs = (len(head) >= 4 and (head[:4] == b"\xe2\xe1\xf5\xe0" or (len(head) >= 1028 and head[1024:1028] == b"\xe2\xe1\xf5\xe0")))
+        is_ext4 = (len(head) >= 1082 and head[1080:1082] == b"\x53\xef")
+
+        if is_erofs:
+            fsck_tool = shutil.which("fsck.erofs") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/fsck.erofs")
+            if not fsck_tool or not os.path.isfile(fsck_tool):
+                raise RuntimeError(f"fsck.erofs required to extract EROFS image {image_path} but not found.")
+            cmd = [fsck_tool, f"--extract={target_dir}", working_image]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"fsck.erofs extraction failed on {image_path}: {res.stderr.strip() or res.stdout.strip()}")
+        elif is_ext4:
+            raise RuntimeError(
+                f"Extraction of ext4 image {image_path} via 7-Zip is rejected: "
+                f"7-Zip cannot preserve required Android filesystem metadata "
+                f"(UID/GID, SELinux labels, Linux capabilities, special files, hardlinks). "
+                f"Use pre-extracted partition directory trees with authentic fs_config and file_contexts, "
+                f"or an Android-compatible metadata-preserving extraction tool."
+            )
+        else:
+            raise RuntimeError(f"Unrecognized or corrupted image format for {image_path}. Supported format: EROFS.")
+    finally:
+        if temp_raw and os.path.exists(temp_raw):
+            try:
+                os.unlink(temp_raw)
+            except OSError:
+                pass
 
 def validate_system_donor(staging_path):
     """Validate that staged system partition is authentic OxygenOS 16 / Android 16."""
@@ -311,10 +367,11 @@ def validate_vendor_target(staging_path):
     props = read_build_prop(prop_path)
 
     sdk = props.get("ro.vendor.build.version.sdk")
-    rel = props.get("ro.vendor.build.version.release")
-    if sdk and rel:
-        if sdk != "36" or rel != "16":
-            raise ValueError(f"Vendor partition is not Android 16 / SDK 36 (found release={rel}, sdk={sdk})")
+    rel = props.get("ro.vendor.build.version.release") or props.get("ro.vendor.build.version.release_or_codename")
+    if not sdk or not rel:
+        raise ValueError(f"Vendor partition missing required Android version properties (ro.vendor.build.version.sdk or release) in {prop_path}")
+    if sdk != "36" or rel != "16":
+        raise ValueError(f"Vendor partition is not Android 16 / SDK 36 (found release={rel}, sdk={sdk})")
 
     platform = props.get("ro.board.platform") or props.get("ro.product.board")
     if not platform:
@@ -334,8 +391,10 @@ def validate_vendor_target(staging_path):
     fingerprint = props.get("ro.vendor.build.fingerprint") or props.get("ro.build.fingerprint")
 
     # Missing required device identity
-    if not device and not model and not fingerprint:
-        raise ValueError("Vendor partition missing required device identity properties (device, model, fingerprint)")
+    if not device:
+        raise ValueError("Vendor partition missing required device property (ro.product.vendor.device/ro.product.device)")
+    if not model:
+        raise ValueError("Vendor partition missing required model property (ro.product.vendor.model/ro.product.model)")
 
     # Reject donor contamination
     contaminated = ["lemonade", "oneplus9", "le2113", "le2115", "le2110", "lahaina", "sm8350"]
@@ -344,16 +403,26 @@ def validate_vendor_target(staging_path):
             raise ValueError(f"CRITICAL ERROR: Donor device contamination detected in vendor property '{val}'!")
 
     # Validate brand
-    if brand and brand.lower() != "oneplus":
+    if brand and brand.lower() not in ["oneplus", "oplus"]:
         raise ValueError(f"Vendor partition brand '{brand}' is not OnePlus! Rejecting unrelated SM8150 vendor.")
 
-    # Validate target device
-    allowed_devices = ["oneplus7t", "hotdogb", "hotdog", "oneplus7tpro"]
-    if device and device.lower() not in allowed_devices:
+    # Target device allowlist strictly for OnePlus 7T (hotdogb)
+    # Explicitly reject OnePlus 7T Pro (hotdog)
+    if device.lower() in ["hotdog", "oneplus7tpro"]:
+        raise ValueError(f"Vendor partition device '{device}' is OnePlus 7T Pro (hotdog), not target OnePlus 7T (hotdogb)!")
+
+    allowed_devices = ["oneplus7t", "hotdogb", "oneplus7t_eea"]
+    if device.lower() not in allowed_devices:
         raise ValueError(f"Vendor partition device '{device}' does not match OnePlus 7T (expected hotdogb/OnePlus7T)!")
 
+    # Target model allowlist strictly for OnePlus 7T models
+    # Explicitly reject OnePlus 7T Pro models (HD1910, HD1911, HD1913, HD1917, HD1925)
+    pro_models = ["hd1910", "hd1911", "hd1913", "hd1917", "hd1925", "oneplus 7t pro", "oneplus7tpro"]
+    if model.lower() in pro_models:
+        raise ValueError(f"Vendor partition model '{model}' is OnePlus 7T Pro, not target OnePlus 7T!")
+
     allowed_models = ["hd1901", "hd1900", "hd1903", "hd1905", "hd1907", "oneplus 7t", "oneplus7t"]
-    if model and model.lower() not in allowed_models:
+    if model.lower() not in allowed_models:
         raise ValueError(f"Vendor partition model '{model}' does not match OnePlus 7T (expected HD1901/HD1900/etc.)!")
 
     # Contradictory check
@@ -366,11 +435,12 @@ def validate_vendor_target(staging_path):
             raise ValueError(f"Vendor fingerprint does not match OnePlus 7T: '{fingerprint}'")
 
     return {
-        "device": device or "OnePlus7T",
-        "model": model or "HD1901",
+        "device": device,
+        "model": model,
         "platform": platform,
-        "sdk": sdk or "36",
-        "release": rel or "16",
+        "sdk": sdk,
+        "release": rel,
+        "brand": brand or "OnePlus",
         "fingerprint": fingerprint or "unknown",
     }
 
@@ -387,11 +457,12 @@ def validate_odm_target(staging_path):
         raise ValueError(f"ODM partition missing build.prop under {staging_path}")
     props = read_build_prop(prop_path)
 
-    sdk = props.get("ro.odm.build.version.sdk")
-    rel = props.get("ro.odm.build.version.release")
-    if sdk and rel:
-        if sdk != "36" or rel != "16":
-            raise ValueError(f"ODM partition version is not Android 16 / SDK 36 (found release={rel}, sdk={sdk})")
+    sdk = props.get("ro.odm.build.version.sdk") or props.get("ro.build.version.sdk")
+    rel = props.get("ro.odm.build.version.release") or props.get("ro.odm.build.version.release_or_codename") or props.get("ro.build.version.release")
+    if not sdk or not rel:
+        raise ValueError(f"ODM partition missing required version properties (ro.odm.build.version.sdk/release) in {prop_path}")
+    if sdk != "36" or rel != "16":
+        raise ValueError(f"ODM partition version is not Android 16 / SDK 36 (found release={rel}, sdk={sdk})")
 
     device = props.get("ro.product.odm.device") or props.get("ro.product.device")
     model = props.get("ro.product.odm.model") or props.get("ro.product.model")
@@ -399,8 +470,10 @@ def validate_odm_target(staging_path):
     fingerprint = props.get("ro.odm.build.fingerprint") or props.get("ro.build.fingerprint")
     soc_model = props.get("ro.soc.model")
 
-    if not device and not model:
-        raise ValueError("ODM partition missing required device identity properties (ro.product.odm.device or model)")
+    if not device:
+        raise ValueError("ODM partition missing required device identity property (ro.product.odm.device or ro.product.device)")
+    if not model:
+        raise ValueError("ODM partition missing required model identity property (ro.product.odm.model or ro.product.model)")
 
     # Reject donor contamination
     contaminated = ["lemonade", "oneplus9", "le2113", "le2115", "le2110", "lahaina", "sm8350"]
@@ -408,33 +481,43 @@ def validate_odm_target(staging_path):
         if val and any(k in val.lower() for k in contaminated):
             raise ValueError(f"CRITICAL ERROR: Donor device contamination detected in ODM property '{val}'!")
 
-    if brand and brand.lower() != "oneplus":
+    if brand and brand.lower() not in ["oneplus", "oplus"]:
         raise ValueError(f"ODM partition brand '{brand}' is not OnePlus!")
 
-    allowed_devices = ["oneplus7t", "hotdogb", "hotdog", "oneplus7tpro"]
+    # Check for OnePlus 7T Pro
+    if device.lower() in ["hotdog", "oneplus7tpro"]:
+        raise ValueError(f"ODM partition device '{device}' is OnePlus 7T Pro (hotdog), not target OnePlus 7T (hotdogb)!")
+
+    pro_models = ["hd1910", "hd1911", "hd1913", "hd1917", "hd1925", "oneplus 7t pro", "oneplus7tpro"]
+    if model.lower() in pro_models:
+        raise ValueError(f"ODM partition model '{model}' is OnePlus 7T Pro, not target OnePlus 7T!")
+
+    allowed_devices = ["oneplus7t", "hotdogb", "oneplus7t_eea"]
     allowed_models = ["hd1901", "hd1900", "hd1903", "hd1905", "hd1907", "oneplus 7t", "oneplus7t"]
 
-    if device and model:
-        if device.lower() in allowed_devices and model.lower() not in allowed_models:
-            raise ValueError(f"Contradictory ODM device properties: device={device}, model={model}")
-        if device.lower() not in allowed_devices and model.lower() in allowed_models:
-            raise ValueError(f"Contradictory ODM device properties: device={device}, model={model}")
+    if device.lower() in allowed_devices and model.lower() not in allowed_models:
+        raise ValueError(f"Contradictory ODM device properties: device={device}, model={model}")
+    if device.lower() not in allowed_devices and model.lower() in allowed_models:
+        raise ValueError(f"Contradictory ODM device properties: device={device}, model={model}")
 
-    if device and device.lower() not in allowed_devices:
+    if device.lower() not in allowed_devices:
         raise ValueError(f"ODM partition device '{device}' does not match OnePlus 7T!")
 
-    if model and model.lower() not in allowed_models:
+    if model.lower() not in allowed_models:
         raise ValueError(f"ODM partition model '{model}' does not match OnePlus 7T!")
 
-    if soc_model and soc_model.upper() not in ["SM8150", "SM8150-AC", "MSMNILE"]:
-        raise ValueError(f"ODM partition SoC model '{soc_model}' does not match SM8150!")
+    if soc_model:
+        if soc_model.upper() not in ["SM8150", "SM8150-AC", "MSMNILE"]:
+            raise ValueError(f"ODM partition SoC model '{soc_model}' does not match SM8150!")
 
     return {
         "device": device,
         "model": model,
         "brand": brand or "OnePlus",
+        "sdk": sdk,
+        "release": rel,
         "fingerprint": fingerprint or "unknown",
-        "soc_model": soc_model or "SM8150",
+        "soc_model": soc_model or "unspecified",
     }
 
 def stage_partition(source_info, staging_part_dir):
@@ -569,6 +652,25 @@ def main():
                 elif part == "odm":
                     meta = validate_odm_target(info["path"])
                     print(f"  [OK] ODM Target: Device={meta['device']}, Model={meta['model']}")
+            elif info["type"] == "image":
+                print(f"  Extracting and validating image source for {part}: {info['path']}...")
+                with tempfile.TemporaryDirectory(prefix=f"verify_{part}_") as temp_dir:
+                    extract_image_to_dir(info["path"], temp_dir)
+                    if part == "system":
+                        meta = validate_system_donor(temp_dir)
+                        print(f"  [OK] System Donor (Image): Android {meta['release']} (SDK {meta['sdk']})")
+                    elif part == "vendor":
+                        meta = validate_vendor_target(temp_dir)
+                        print(f"  [OK] Vendor Target (Image): Device={meta['device']} ({meta['platform']}), SDK={meta['sdk']}")
+                    elif part == "odm":
+                        meta = validate_odm_target(temp_dir)
+                        print(f"  [OK] ODM Target (Image): Device={meta['device']}, Model={meta['model']}")
+                    elif part in ["my_product", "my_region", "product"]:
+                        if not os.listdir(temp_dir):
+                            raise RuntimeError(f"Extracted image {info['path']} is empty!")
+                        print(f"  [OK] {part.capitalize()} Donor (Image): Extracted and verified non-empty")
+            else:
+                raise ValueError(f"Unknown source type '{info['type']}' for partition {part}")
         print("\nAll mandatory donor and target partition sources successfully verified.")
         return 0
 
