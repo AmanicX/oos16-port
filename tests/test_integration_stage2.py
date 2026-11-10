@@ -1055,8 +1055,8 @@ exit 1
         self.assertNotIn("watchdog_cancel", fatal_fn)
         self.assertIn("Safety watchdog will reboot to bootloader", fatal_fn)
 
-    def test_display_prerequisites_and_60hz_properties(self):
-        """Verify display hardware checks and fixed 60Hz AMOLED properties."""
+    def test_display_prerequisites_and_clean_baseline(self):
+        """Verify display hardware checks and clean bootable baseline (no unverified display hacks)."""
         stage2_script = os.path.join(PROJECT_ROOT, "scripts/stage2_init.sh")
         build_erofs = os.path.join(PROJECT_ROOT, "scripts/build_stage2_erofs.sh")
 
@@ -1070,7 +1070,7 @@ exit 1
         self.assertIn("/dev/kgsl-3d0", s2_content)
         self.assertIn("panel0-backlight", s2_content)
 
-        # 60Hz display properties configured in vendor build.prop
+        # Clean baseline: verify unverified 60Hz display property injections are absent from build_stage2_erofs.sh
         for prop in [
             "ro.surface_flinger.game_default_frame_rate_override=60",
             "ro.surface_flinger.enable_frame_rate_override=false",
@@ -1079,7 +1079,7 @@ exit 1
             "debug.sf.frame_rate_multiple_threshold=60",
             "ro.vendor.display.default_fps=60",
         ]:
-            self.assertIn(prop, erofs_content)
+            self.assertNotIn(prop, erofs_content)
 
     def test_runner_aborts_on_missing_meminfo(self):
         """Verify runner fails closed if /proc/meminfo cannot be read from target."""

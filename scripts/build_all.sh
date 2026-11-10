@@ -38,6 +38,7 @@ BOOT_ONLY=0
 VERIFY_ONLY=0
 CHECK_TOOLS_ONLY=0
 CHECK_DONOR_ONLY=0
+CHECK_SOURCES_ONLY=0
 DONOR_WORK_DIR="${DONOR_WORK_DIR:-}"
 TARGET_WORK_DIR="${TARGET_WORK_DIR:-}"
 
@@ -55,6 +56,7 @@ Options:
   --verify-only    Run independent verification and static audits without rebuilding
   --check-tools    Validate host and Android tool dependencies and exit
   --check-donor    Validate donor partition trees and APEX modules and exit
+  --check-sources  Validate all donor and target partition sources via resolver and exit
   --donor-dir DIR  Directory containing OxygenOS 16 donor partition images or trees
   --target-dir DIR Directory containing OnePlus 7T target partition images or trees
   -h, --help       Show this help message and exit
@@ -94,6 +96,10 @@ while [ $# -gt 0 ]; do
             CHECK_DONOR_ONLY=1
             shift
             ;;
+        --check-sources)
+            CHECK_SOURCES_ONLY=1
+            shift
+            ;;
         --donor-dir)
             DONOR_WORK_DIR="$2"
             shift 2
@@ -121,9 +127,10 @@ ACTIVE_MODES=0
 [ "$VERIFY_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$CHECK_TOOLS_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 [ "$CHECK_DONOR_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
+[ "$CHECK_SOURCES_ONLY" -eq 1 ] && ACTIVE_MODES=$((ACTIVE_MODES + 1))
 
 if [ "$ACTIVE_MODES" -gt 1 ]; then
-    echo "Error: Options --stage2-only, --boot-only, --verify-only, --check-tools, and --check-donor are mutually exclusive." >&2
+    echo "Error: Options --stage2-only, --boot-only, --verify-only, --check-tools, --check-donor, and --check-sources are mutually exclusive." >&2
     exit 1
 fi
 
@@ -196,7 +203,7 @@ else
 fi
 
 # Android Packaging Tools (mkbootfs, mkbootimg, unpack_bootimg, mkfs.erofs, fsck.erofs)
-if [ "$CHECK_DONOR_ONLY" -eq 0 ] && [ "$VERIFY_ONLY" -eq 0 ]; then
+if [ "$CHECK_DONOR_ONLY" -eq 0 ] && [ "$CHECK_SOURCES_ONLY" -eq 0 ] && [ "$VERIFY_ONLY" -eq 0 ]; then
     ANDROID_TOOLS=(
         "mkbootfs:-h"
         "mkbootimg:--help"
@@ -249,15 +256,6 @@ validate_donor_rom() {
             exit 1
         fi
         echo "  [OK] Donor partition source: $part"
-    done
-
-    local mandatory_target=("vendor" "odm")
-    for part in "${mandatory_target[@]}"; do
-        if [ ! -d "$target_root/$part" ] && [ ! -d "$WORK_DIR/$part" ]; then
-            echo "Error: Mandatory target partition directory '$WORK_DIR/$part' does not exist." >&2
-            exit 1
-        fi
-        echo "  [OK] Target partition source: $part"
     done
 
     # Resolve authoritative APEX directory in donor tree
@@ -352,10 +350,35 @@ validate_donor_rom() {
     echo "  [OK] Timezone APEX: $(basename "$FOUND_TZDATA")"
 }
 
+# ------------------------------------------------------------------------------
+# Helper: Authoritative Partition Sources Validation (Donor & Target via Resolver)
+# ------------------------------------------------------------------------------
+validate_partition_sources() {
+    WORK_DIR="${WORK_DIR:-$PROJECT_ROOT/work}"
+    echo ""
+    echo "--- Validating Authoritative Partition Sources via Resolver ---"
+    local resolver_args=(--verify-only)
+    [ -n "$DONOR_WORK_DIR" ] && resolver_args+=(--donor-dir "$DONOR_WORK_DIR")
+    [ -n "$TARGET_WORK_DIR" ] && resolver_args+=(--target-dir "$TARGET_WORK_DIR")
+    [ -n "$WORK_DIR" ] && resolver_args+=(--work-dir "$WORK_DIR")
+
+    if ! python3 "$PROJECT_ROOT/tools/resolve_partition_sources.py" "${resolver_args[@]}"; then
+        echo "Error: Authoritative partition sources validation failed." >&2
+        exit 1
+    fi
+}
+
 if [ "$CHECK_DONOR_ONLY" -eq 1 ]; then
     validate_donor_rom
     echo ""
     echo "[OK] All donor ROM partitions and APEX modules are verified."
+    exit 0
+fi
+
+if [ "$CHECK_SOURCES_ONLY" -eq 1 ]; then
+    validate_partition_sources
+    echo ""
+    echo "[OK] All donor and target partition sources are verified via resolver."
     exit 0
 fi
 
@@ -462,6 +485,10 @@ fi
 if [ "$VERIFY_ONLY" -eq 0 ] && [ "$BOOT_ONLY" -eq 0 ] && [ "$SKIP_STAGE2" -eq 0 ]; then
     echo ""
     echo "--- Step 5: Packaging Stage-2 EROFS Partition Images ---"
+    validate_partition_sources
+    export DONOR_WORK_DIR
+    export TARGET_WORK_DIR
+    export WORK_DIR
     "$PROJECT_ROOT/scripts/build_stage2_erofs.sh"
     echo "  [OK] Stage-2 EROFS partitions and APEX modules generated successfully"
 fi

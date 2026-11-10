@@ -3,14 +3,16 @@
 # build_stage2_erofs.sh - Build and Repack EROFS Partitions for Stage-2 RAM Boot
 # OxygenOS 16 (Android 16 / SDK 36 / Baklava) on OnePlus 7T (HD1901 / hotdogb)
 #
-# Provenance:
-# - Donor ROM: OnePlus 9 (lemonade / LE2113) OxygenOS 16 (ota_full-LE2113_16.0.10.500.zip)
-# - Device Base: LineageOS 23.2 (hotdogb) / crDroid 12.x vendor/odm
-# - Injections:
-#   * Google Photos Unlimited Original Quality Backup (pixel_2016_experience.xml)
-#   * Play Integrity Fix template (pif.json)
-#   * SELinux duplicate property prefix resolution (system_ext_property_contexts)
-#   * 60Hz AMOLED replacement panel optimizations (dsi_samsung_s6e3fc2x01_cmd_display)
+# Provenance Architecture:
+# - Tier 1 (Target Physical): OnePlus 7T (hotdogb) physical images (partitions/*.img)
+# - Tier 2 (Donor Userspace): OnePlus 9 (lemonade / LE2113) OxygenOS 16 logical partitions
+# - Tier 3 (Target HAL Base): OnePlus 7T SM8150 HALs & device tree (work/vendor, work/odm)
+# - Tier 4 (Generated Boot): RAM-only EROFS partition images (build/images/*.erofs.img)
+#
+# Baseline:
+# - Clean bootable baseline (no feature bloat, zero hardlink mutations)
+# - SELinux duplicate property prefix resolution (system_ext_property_contexts)
+# - Strict fail-closed partition resolver integration
 # ==============================================================================
 
 set -euo pipefail
@@ -164,44 +166,15 @@ RESOLVER_ARGS=(
 if python3 "$PROJECT_ROOT/tools/resolve_partition_sources.py" "${RESOLVER_ARGS[@]}"; then
     echo "  [OK] Authoritative partition sources staged and immutability verified."
 else
-    echo "  Notice: Standard resolver staging fallback to direct directory copy..."
-    ALL_PARTITIONS=("system" "system_ext" "vendor" "odm" "my_product" "my_region")
-    for part_name in "${ALL_PARTITIONS[@]}"; do
-        src_cand=""
-        if [ "$part_name" = "vendor" ] || [ "$part_name" = "odm" ]; then
-            if [ -n "$TARGET_WORK_DIR" ] && [ -d "$TARGET_WORK_DIR/$part_name" ]; then
-                src_cand="$TARGET_WORK_DIR/$part_name"
-            elif [ -d "$WORK_DIR/$part_name" ]; then
-                src_cand="$WORK_DIR/$part_name"
-            fi
-        else
-            if [ -n "$DONOR_WORK_DIR" ] && [ -d "$DONOR_WORK_DIR/$part_name" ]; then
-                src_cand="$DONOR_WORK_DIR/$part_name"
-            elif [ -d "$WORK_DIR/$part_name" ]; then
-                src_cand="$WORK_DIR/$part_name"
-            fi
-        fi
-
-        if [ -n "$src_cand" ] && [ -d "$src_cand" ]; then
-            mkdir -p "$BUILD_WORK_DIR/$part_name"
-            # Independent copy (NEVER hardlinks) to strictly guarantee source asset immutability
-            cp -a "$src_cand/." "$BUILD_WORK_DIR/$part_name/"
-            echo "  Staged $part_name via independent copy from $src_cand."
-        fi
-    done
+    echo "CRITICAL BUILD ERROR: Authoritative partition resolver failed!" >&2
+    echo "Halting Stage-2 build immediately (fail-closed enforcement)." >&2
+    exit 1
 fi
 
-# Ensure minimal build manifests exist even in test fallback modes
-if [ ! -f "$STAGING_DIR/BUILD_MANIFEST.json" ]; then
-    cat > "$STAGING_DIR/BUILD_MANIFEST.json" << 'EOF'
-{"target_device": "OnePlus 7T HD1901 (hotdogb)", "status": "staged"}
-EOF
-fi
-if [ ! -f "$STAGING_DIR/PROVENANCE_MANIFEST.txt" ]; then
-    cat > "$STAGING_DIR/PROVENANCE_MANIFEST.txt" << 'EOF'
-# Authoritative Partition Provenance Log
-# Target: OnePlus 7T HD1901 (hotdogb) SM8150
-EOF
+# Ensure authoritative manifests were produced by the resolver
+if [ ! -f "$STAGING_DIR/BUILD_MANIFEST.json" ] || [ ! -f "$STAGING_DIR/PROVENANCE_MANIFEST.txt" ]; then
+    echo "CRITICAL BUILD ERROR: Resolver failed to generate required manifests!" >&2
+    exit 1
 fi
 
 # Resolve APEX directory in staged workspace or source
@@ -211,11 +184,11 @@ elif [ -d "$BUILD_WORK_DIR/system/apex" ]; then
     APEX_DIR="$BUILD_WORK_DIR/system/apex"
 fi
 
-# 3. Clean Bootable Baseline (No Google Photos or PIF injections)
-echo "[1/4] Minimal bootable baseline: skipping non-essential feature injections (Google Photos / PIF)..."
+# 3. Clean Bootable Baseline
+echo "[1/5] Minimal bootable baseline: prioritizing core compatibility (no feature or display injections)..."
 
 # 4. Targeted Permission Corrections
-echo "[2/4] Applying targeted execute permission corrections..."
+echo "[2/5] Applying targeted execute permission corrections..."
 fix_executable_permissions() {
     local dir="$1"
     if [ ! -d "$dir" ]; then return 0; fi
@@ -246,31 +219,8 @@ fix_executable_permissions() {
 fix_executable_permissions "$BUILD_WORK_DIR/vendor/vendor/bin"
 fix_executable_permissions "$BUILD_WORK_DIR/odm/bin"
 
-# 5. Configure Display Properties for 60Hz Replacement AMOLED Panel
-echo "[3/6] Setting fixed 60Hz display properties in vendor build.prop..."
-VENDOR_PROP="$BUILD_WORK_DIR/vendor/vendor/build.prop"
-if [ -f "$VENDOR_PROP" ]; then
-    tmp_prop="${VENDOR_PROP}.tmp_$$"
-    cp "$VENDOR_PROP" "$tmp_prop"
-    mv -f "$tmp_prop" "$VENDOR_PROP"
-    for prop in \
-        "ro.surface_flinger.game_default_frame_rate_override=60" \
-        "ro.surface_flinger.enable_frame_rate_override=false" \
-        "persist.sys.sf.native_mode=0" \
-        "vendor.display.enable_optimize_refresh=1" \
-        "debug.sf.frame_rate_multiple_threshold=60" \
-        "ro.vendor.display.default_fps=60"; do
-        key="${prop%%=*}"
-        if grep -q "^$key=" "$VENDOR_PROP"; then
-            sed -i "s|^$key=.*|$prop|" "$VENDOR_PROP"
-        else
-            echo "$prop" >> "$VENDOR_PROP"
-        fi
-    done
-fi
-
-# 6. Resolve SELinux Property Context Prefix Conflicts
-echo "[4/6] Verifying SELinux system_ext_property_contexts..."
+# 5. Resolve SELinux Property Context Prefix Conflicts
+echo "[3/5] Verifying SELinux system_ext_property_contexts..."
 PROP_CTX="$BUILD_WORK_DIR/system_ext/etc/selinux/system_ext_property_contexts"
 if [ -f "$PROP_CTX" ]; then
     tmp_ctx="${PROP_CTX}.tmp_$$"
@@ -299,8 +249,8 @@ if [ -f "$PROP_CTX" ]; then
     done
 fi
 
-# 7. Build and Strictly Validate EROFS Partition Images into Temporary Staging
-echo "[5/6] Building high-compression EROFS partition images in clean staging area..."
+# 6. Build and Strictly Validate EROFS Partition Images into Temporary Staging
+echo "[4/5] Building high-compression EROFS partition images in clean staging area..."
 PARTITIONS=(
     "odm:$BUILD_WORK_DIR/odm:1"
     "vendor:$BUILD_WORK_DIR/vendor:1"
@@ -346,7 +296,7 @@ for part_def in "${PARTITIONS[@]}"; do
 done
 
 # 7. Extract and Stage All Required Bootstrap APEX Packages
-echo "[6/6] Packaging Android 16 Bootstrap APEX Modules (runtime, art, i18n, tzdata)..."
+echo "[5/5] Packaging Android 16 Bootstrap APEX Modules (runtime, art, i18n, tzdata)..."
 
 extract_and_stage_apex() {
     local apex_id="$1"

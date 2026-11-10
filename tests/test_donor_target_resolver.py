@@ -6,9 +6,14 @@ Unit tests for tools/resolve_partition_sources.py.
 Verifies:
 1. Authoritative resolution of donor and target partition trees and images.
 2. Immediate fail-closed rejection on missing mandatory donor or target partitions.
-3. Strict rejection of cross-device contamination (e.g. donor OnePlus 9 vendor as target vendor).
-4. Strict rejection of invalid/incompatible Android versions (e.g. non-Android 16 system).
-5. Cryptographic source asset immutability before and after successful and failed staging attempts.
+3. Strict rejection of cross-device contamination (donor OnePlus 9 / SM8350 vendor or ODM).
+4. Strict validation of Android release 16 and SDK 36 (both required; neither can compensate for the other).
+5. Strict target vendor and ODM device identity checks, rejecting unrelated SM8150 devices and contradictory properties.
+6. Rejection of ODM trees lacking build.prop or identity properties (zero silent default fallbacks).
+7. Comprehensive symlink handling across all variants (relative, absolute, dir, file, broken, dangling, chains, outside).
+8. Detection of modified or removed symlinks and files in the cryptographic immutability checker.
+9. Immutability verification on failure paths.
+10. Explicit rejection of 7-Zip for ext4 extraction due to loss of Android filesystem metadata.
 """
 
 import os
@@ -22,6 +27,10 @@ import json
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 RESOLVER_SCRIPT = os.path.join(PROJECT_ROOT, "tools", "resolve_partition_sources.py")
 
+# Import functions directly for targeted unit testing
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "tools"))
+import resolve_partition_sources as rps
+
 class TestDonorTargetResolver(unittest.TestCase):
     """Test suite for partition-source resolver logic, role enforcement, and asset immutability."""
 
@@ -34,9 +43,7 @@ class TestDonorTargetResolver(unittest.TestCase):
         os.makedirs(self.target_dir, exist_ok=True)
         os.makedirs(self.staging_dir, exist_ok=True)
 
-        # Setup valid mock donor structure
         self._setup_mock_donor(self.donor_dir)
-        # Setup valid mock target structure
         self._setup_mock_target(self.target_dir)
 
     def tearDown(self):
@@ -55,7 +62,7 @@ class TestDonorTargetResolver(unittest.TestCase):
         sys_ext_dir = os.path.join(base_dir, "system_ext", "etc")
         os.makedirs(sys_ext_dir, exist_ok=True)
         with open(os.path.join(sys_ext_dir, "build.prop"), "w") as f:
-            f.write("ro.build.version.release=16\nro.product.system_ext.brand=oplus\n")
+            f.write("ro.build.version.release=16\nro.build.version.sdk=36\nro.product.system_ext.brand=oplus\n")
 
         # my_product
         my_prod_dir = os.path.join(base_dir, "my_product")
@@ -68,13 +75,28 @@ class TestDonorTargetResolver(unittest.TestCase):
         ven_dir = os.path.join(base_dir, "vendor", "vendor")
         os.makedirs(ven_dir, exist_ok=True)
         with open(os.path.join(ven_dir, "build.prop"), "w") as f:
-            f.write("ro.product.vendor.device=OnePlus7T\nro.product.vendor.model=HD1901\nro.board.platform=msmnile\nro.vendor.build.version.sdk=36\nro.vendor.build.version.release=16\n")
+            f.write(
+                "ro.product.vendor.brand=OnePlus\n"
+                "ro.product.vendor.device=OnePlus7T\n"
+                "ro.product.vendor.model=HD1901\n"
+                "ro.board.platform=msmnile\n"
+                "ro.vendor.build.version.sdk=36\n"
+                "ro.vendor.build.version.release=16\n"
+                "ro.vendor.build.fingerprint=OnePlus/OnePlus7T/OnePlus7T:16/BP4A:user/release-keys\n"
+            )
 
         # odm
         odm_dir = os.path.join(base_dir, "odm", "odm", "etc")
         os.makedirs(odm_dir, exist_ok=True)
         with open(os.path.join(odm_dir, "build.prop"), "w") as f:
-            f.write("ro.product.odm.device=OnePlus7T\nro.product.odm.model=HD1901\nro.odm.build.version.sdk=36\n")
+            f.write(
+                "ro.product.odm.brand=OnePlus\n"
+                "ro.product.odm.device=OnePlus7T\n"
+                "ro.product.odm.model=HD1901\n"
+                "ro.odm.build.version.sdk=36\n"
+                "ro.odm.build.version.release=16\n"
+                "ro.soc.model=SM8150\n"
+            )
 
     def test_valid_resolution_and_staging(self):
         """Verify successful resolution and independent staging from valid donor and target dirs."""
@@ -92,7 +114,7 @@ class TestDonorTargetResolver(unittest.TestCase):
 
         self.assertEqual(res.returncode, 0, f"Resolver failed: {res.stderr}\n{res.stdout}")
         self.assertIn("Partition staging and source verification completed successfully", res.stdout)
-        self.assertIn("100% source asset immutability verified", res.stdout)
+        self.assertIn("100% cryptographic source asset immutability verified", res.stdout)
 
         # Verify staged contents
         self.assertTrue(os.path.isfile(os.path.join(self.staging_dir, "system", "system", "build.prop")))
@@ -140,7 +162,6 @@ class TestDonorTargetResolver(unittest.TestCase):
 
     def test_rejection_of_donor_vendor_contamination(self):
         """Verify that assigning a OnePlus 9 / SM8350 donor vendor partition as target is rejected."""
-        # Replace target vendor with donor vendor (OnePlus 9 lahaina)
         ven_prop = os.path.join(self.target_dir, "vendor", "vendor", "build.prop")
         with open(ven_prop, "w") as f:
             f.write("ro.product.vendor.device=OnePlus9\nro.board.platform=lahaina\n")
@@ -155,11 +176,232 @@ class TestDonorTargetResolver(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("Donor vendor partition (OnePlus 9 / SM8350) mistakenly assigned as target vendor", res.stderr + res.stdout)
 
-    def test_rejection_of_non_android_16_system(self):
-        """Verify that system partition with wrong Android version is rejected."""
+    def test_rejection_of_wrong_android_versions(self):
+        """Verify that system partition requires BOTH SDK 36 and release 16 (neither can compensate for the other)."""
         sys_prop = os.path.join(self.donor_dir, "system", "system", "build.prop")
+
+        # Case 1: SDK 36 but release 15 (should fail)
         with open(sys_prop, "w") as f:
-            f.write("ro.build.version.release=15\nro.build.version.sdk=35\n")
+            f.write("ro.build.version.release=15\nro.build.version.sdk=36\n")
+        with self.assertRaises(ValueError):
+            rps.validate_system_donor(os.path.join(self.donor_dir, "system"))
+
+        # Case 2: SDK 35 but release 16 (should fail)
+        with open(sys_prop, "w") as f:
+            f.write("ro.build.version.release=16\nro.build.version.sdk=35\n")
+        with self.assertRaises(ValueError):
+            rps.validate_system_donor(os.path.join(self.donor_dir, "system"))
+
+        # Case 3: Both correct
+        with open(sys_prop, "w") as f:
+            f.write("ro.build.version.release=16\nro.build.version.sdk=36\n")
+        meta = rps.validate_system_donor(os.path.join(self.donor_dir, "system"))
+        self.assertEqual(meta["release"], "16")
+        self.assertEqual(meta["sdk"], "36")
+
+    def test_rejection_of_missing_vendor_identity(self):
+        """Verify vendor partition missing device identity properties is rejected."""
+        ven_dir = os.path.join(self.target_dir, "vendor", "vendor")
+        with open(os.path.join(ven_dir, "build.prop"), "w") as f:
+            f.write("ro.board.platform=msmnile\nro.vendor.build.version.sdk=36\nro.vendor.build.version.release=16\n")
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_vendor_target(os.path.join(self.target_dir, "vendor"))
+        self.assertIn("missing required device identity", str(ctx.exception).lower())
+
+    def test_rejection_of_unrelated_sm8150_device(self):
+        """Verify unrelated SM8150 devices (e.g. Pixel 4 / coral, Galaxy S10) are rejected."""
+        ven_dir = os.path.join(self.target_dir, "vendor", "vendor")
+        with open(os.path.join(ven_dir, "build.prop"), "w") as f:
+            f.write(
+                "ro.board.platform=msmnile\n"
+                "ro.product.vendor.brand=Google\n"
+                "ro.product.vendor.device=coral\n"
+                "ro.product.vendor.model=Pixel 4 XL\n"
+                "ro.vendor.build.fingerprint=google/coral/coral:12/SP1A:user/release-keys\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_vendor_target(os.path.join(self.target_dir, "vendor"))
+        self.assertIn("not oneplus", str(ctx.exception).lower())
+
+    def test_rejection_of_contradictory_vendor_identity(self):
+        """Verify vendor partition with contradictory device identity properties is rejected."""
+        ven_dir = os.path.join(self.target_dir, "vendor", "vendor")
+        with open(os.path.join(ven_dir, "build.prop"), "w") as f:
+            f.write(
+                "ro.board.platform=msmnile\n"
+                "ro.product.vendor.brand=OnePlus\n"
+                "ro.product.vendor.device=OnePlus7T\n"
+                "ro.product.vendor.model=HD1901\n"
+                "ro.vendor.build.fingerprint=google/coral/coral:12:user/release-keys\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_vendor_target(os.path.join(self.target_dir, "vendor"))
+        self.assertIn("contradictory", str(ctx.exception).lower())
+
+    def test_rejection_of_missing_odm_build_prop(self):
+        """Verify ODM partition missing build.prop is strictly rejected without silent fallback."""
+        odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
+        os.remove(odm_prop)
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
+        self.assertIn("missing build.prop", str(ctx.exception).lower())
+
+    def test_rejection_of_missing_odm_identity_properties(self):
+        """Verify ODM partition with empty build.prop or missing identity is rejected."""
+        odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
+        with open(odm_prop, "w") as f:
+            f.write("ro.odm.build.date=20261111\n")
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
+        self.assertIn("missing required device identity", str(ctx.exception).lower())
+
+    def test_rejection_of_contradictory_odm_identity(self):
+        """Verify ODM partition with contradictory device/model is rejected."""
+        odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
+        with open(odm_prop, "w") as f:
+            f.write(
+                "ro.product.odm.brand=OnePlus\n"
+                "ro.product.odm.device=OnePlus7T\n"
+                "ro.product.odm.model=SM-G975F\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
+        self.assertIn("contradictory", str(ctx.exception).lower())
+
+    def test_rejection_of_donor_odm_contamination(self):
+        """Verify donor ODM properties (OnePlus 9 / lemonade) are rejected."""
+        odm_prop = os.path.join(self.target_dir, "odm", "odm", "etc", "build.prop")
+        with open(odm_prop, "w") as f:
+            f.write(
+                "ro.product.odm.brand=OnePlus\n"
+                "ro.product.odm.device=OnePlus9\n"
+                "ro.product.odm.model=LE2113\n"
+            )
+
+        with self.assertRaises(ValueError) as ctx:
+            rps.validate_odm_target(os.path.join(self.target_dir, "odm"))
+        self.assertIn("donor device contamination", str(ctx.exception).lower())
+
+    def test_comprehensive_symlink_handling(self):
+        """
+        Verify staging properly handles all 8 symlink variants without dereferencing:
+        1. Relative symlink
+        2. Absolute symlink
+        3. Symlink to directory
+        4. Symlink to file
+        5. Broken symlink (target does not exist)
+        6. Dangling symlink (target removed)
+        7. Symlink chain (link -> link -> target)
+        8. Symlink target outside the source directory
+        """
+        symlink_test_dir = os.path.join(self.test_dir, "symlink_source")
+        staging_dest = os.path.join(self.test_dir, "symlink_staged")
+        os.makedirs(symlink_test_dir, exist_ok=True)
+
+        # Base target file and dir
+        real_file = os.path.join(symlink_test_dir, "real_file.txt")
+        with open(real_file, "w") as f: f.write("HELLO_FILE\n")
+        real_dir = os.path.join(symlink_test_dir, "real_dir")
+        os.makedirs(real_dir, exist_ok=True)
+        with open(os.path.join(real_dir, "inner.txt"), "w") as f: f.write("INNER\n")
+
+        # 1. Relative symlink to file
+        os.symlink("real_file.txt", os.path.join(symlink_test_dir, "rel_file_link"))
+        # 2. Absolute symlink
+        os.symlink("/system/bin/app_process64", os.path.join(symlink_test_dir, "abs_link"))
+        # 3. Symlink to directory
+        os.symlink("real_dir", os.path.join(symlink_test_dir, "dir_link"))
+        # 4. Symlink to file
+        os.symlink("real_file.txt", os.path.join(symlink_test_dir, "file_link"))
+        # 5. Broken symlink
+        os.symlink("/non/existent/target/path", os.path.join(symlink_test_dir, "broken_link"))
+        # 6. Dangling symlink
+        temp_dangle = os.path.join(symlink_test_dir, "dangle_src.txt")
+        with open(temp_dangle, "w") as f: f.write("TMP")
+        os.symlink("dangle_src.txt", os.path.join(symlink_test_dir, "dangling_link"))
+        os.remove(temp_dangle)
+        # 7. Symlink chain: chain1 -> chain2 -> real_file.txt
+        os.symlink("real_file.txt", os.path.join(symlink_test_dir, "chain2"))
+        os.symlink("chain2", os.path.join(symlink_test_dir, "chain1"))
+        # 8. Symlink target outside directory
+        os.symlink("../../outside_target.txt", os.path.join(symlink_test_dir, "outside_link"))
+
+        # Snapshot before staging
+        snap_before = rps.snapshot_dir_state(symlink_test_dir)
+
+        # Stage via stage_partition
+        rps.stage_partition({"type": "directory", "path": symlink_test_dir}, staging_dest)
+
+        # Verify staged symlinks
+        expected_links = {
+            "rel_file_link": "real_file.txt",
+            "abs_link": "/system/bin/app_process64",
+            "dir_link": "real_dir",
+            "file_link": "real_file.txt",
+            "broken_link": "/non/existent/target/path",
+            "dangling_link": "dangle_src.txt",
+            "chain1": "chain2",
+            "chain2": "real_file.txt",
+            "outside_link": "../../outside_target.txt",
+        }
+
+        for link_name, expected_target in expected_links.items():
+            staged_path = os.path.join(staging_dest, link_name)
+            self.assertTrue(os.path.islink(staged_path), f"Staged {link_name} is not a symlink! Accidental dereferencing occurred.")
+            actual_target = os.readlink(staged_path)
+            self.assertEqual(actual_target, expected_target, f"Staged {link_name} target '{actual_target}' != '{expected_target}'")
+
+        # Verify source files were not modified
+        rps.verify_immutability(snap_before, symlink_test_dir, "symlink_source")
+
+    def test_immutability_checker_detects_symlink_tampering(self):
+        """Verify the cryptographic immutability checker detects modified or removed symlinks."""
+        test_dir = os.path.join(self.test_dir, "immut_symlink_test")
+        os.makedirs(test_dir, exist_ok=True)
+        link_path = os.path.join(test_dir, "test_link")
+        os.symlink("original_target", link_path)
+
+        snap = rps.snapshot_dir_state(test_dir)
+
+        # Case 1: Target changed
+        os.remove(link_path)
+        os.symlink("altered_target", link_path)
+        with self.assertRaises(RuntimeError) as ctx:
+            rps.verify_immutability(snap, test_dir, "test_dir")
+        self.assertIn("symlink target", str(ctx.exception))
+
+        # Case 2: Symlink removed
+        os.remove(link_path)
+        with self.assertRaises(RuntimeError) as ctx:
+            rps.verify_immutability(snap, test_dir, "test_dir")
+        self.assertIn("Removed entries", str(ctx.exception))
+
+    def test_rejection_of_7z_for_ext4_image_extraction(self):
+        """Verify that extracting an ext4 image via 7-Zip is explicitly rejected due to metadata loss."""
+        # Create mock ext4 image header with 0x53 0xef at offset 1080
+        img_path = os.path.join(self.test_dir, "test_vendor.img")
+        with open(img_path, "wb") as f:
+            f.write(b"\x00" * 1080)
+            f.write(b"\x53\xef")
+            f.write(b"\x00" * 1024)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            rps.extract_image_to_dir(img_path, os.path.join(self.test_dir, "ext4_out"))
+        self.assertIn("rejected", str(ctx.exception).lower())
+        self.assertIn("7-zip cannot preserve required android filesystem metadata", str(ctx.exception).lower())
+
+    def test_immutability_verified_even_on_staging_failure(self):
+        """Verify that source asset immutability is verified even if staging fails midway."""
+        # Corrupt vendor so validation fails after staging begins
+        ven_prop = os.path.join(self.target_dir, "vendor", "vendor", "build.prop")
+        with open(ven_prop, "w") as f:
+            f.write("ro.board.platform=lahaina\n")  # triggers failure
 
         res = subprocess.run([
             sys.executable, RESOLVER_SCRIPT,
@@ -169,47 +411,8 @@ class TestDonorTargetResolver(unittest.TestCase):
         ], capture_output=True, text=True)
 
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("System partition is not Android 16 / SDK 36", res.stderr + res.stdout)
-
-    def test_source_asset_immutability_on_success_and_failure(self):
-        """Verify source assets are 100% byte-for-byte unmodified across repeated builds and failures."""
-        # Record checksum of donor and target files
-        sys_prop = os.path.join(self.donor_dir, "system", "system", "build.prop")
-        ven_prop = os.path.join(self.target_dir, "vendor", "vendor", "build.prop")
-        with open(sys_prop, "rb") as f: orig_sys_data = f.read()
-        with open(ven_prop, "rb") as f: orig_ven_data = f.read()
-
-        # 1. Run successful staging
-        res = subprocess.run([
-            sys.executable, RESOLVER_SCRIPT,
-            "--donor-dir", self.donor_dir,
-            "--target-dir", self.target_dir,
-            "--staging-dir", os.path.join(self.test_dir, "staging1"),
-        ], capture_output=True, text=True)
-        self.assertEqual(res.returncode, 0)
-
-        # 2. Modify staged files (simulate build modifications in staging)
-        staged_ven_prop = os.path.join(self.test_dir, "staging1", "vendor", "vendor", "build.prop")
-        with open(staged_ven_prop, "a") as f:
-            f.write("INJECTED_BUILD_PROPERTY=1\n")
-
-        # Verify source file was NOT mutated by staged file modification (tests NO hardlinks)
-        with open(ven_prop, "rb") as f: current_ven_data = f.read()
-        self.assertEqual(orig_ven_data, current_ven_data, "Target vendor asset was mutated through hardlinks!")
-
-        # 3. Repeated staging
-        res2 = subprocess.run([
-            sys.executable, RESOLVER_SCRIPT,
-            "--donor-dir", self.donor_dir,
-            "--target-dir", self.target_dir,
-            "--staging-dir", os.path.join(self.test_dir, "staging2"),
-        ], capture_output=True, text=True)
-        self.assertEqual(res2.returncode, 0)
-
-        with open(sys_prop, "rb") as f: final_sys_data = f.read()
-        with open(ven_prop, "rb") as f: final_ven_data = f.read()
-        self.assertEqual(orig_sys_data, final_sys_data, "Donor system asset changed after repeated staging!")
-        self.assertEqual(orig_ven_data, final_ven_data, "Target vendor asset changed after repeated staging!")
+        self.assertIn("Verifying source asset immutability after staging", res.stdout)
+        self.assertIn("100% cryptographic source asset immutability verified", res.stdout)
 
 if __name__ == "__main__":
     unittest.main()
