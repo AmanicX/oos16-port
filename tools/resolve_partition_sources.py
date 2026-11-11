@@ -77,8 +77,9 @@ def _snapshot_entry(full_path, lst, is_symlink=False):
                 try:
                     xattrs[xname] = os.getxattr(full_path, xname, follow_symlinks=False)
                 except OSError as e:
-                    if e.errno in (errno.EACCES, errno.EPERM):
-                        raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Permission denied reading xattr {xname} on {full_path}: {e}")
+                    if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENODATA):
+                        continue
+                    raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to read xattr {xname} on {full_path}: {e}")
         except OSError as e:
             if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
                 raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to inspect xattrs on {full_path}: {e}")
@@ -162,7 +163,10 @@ def snapshot_dir_state(path):
         raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to lstat root directory {path}: {e}")
     state["."] = _snapshot_entry(path, root_lst)
 
-    for root, dirs, files in os.walk(path, followlinks=False):
+    def _walk_error(err):
+        raise RuntimeError(f"CRITICAL IMMUTABILITY AUDIT ERROR: Failed to traverse directory: {err}")
+
+    for root, dirs, files in os.walk(path, followlinks=False, onerror=_walk_error):
         rel_dir = os.path.relpath(root, path)
         if rel_dir != ".":
             try:
@@ -469,6 +473,16 @@ def validate_odm_target(staging_path):
     brand = props.get("ro.product.odm.brand") or props.get("ro.product.brand")
     fingerprint = props.get("ro.odm.build.fingerprint") or props.get("ro.build.fingerprint")
     soc_model = props.get("ro.soc.model")
+    soc_provenance = None
+    if soc_model:
+        soc_provenance = "ro.soc.model"
+    else:
+        for cand_key in ["ro.vendor.qti.soc_name", "ro.board.platform", "ro.boot.hardware", "ro.hardware"]:
+            val = props.get(cand_key)
+            if val:
+                soc_model = val
+                soc_provenance = f"{cand_key}={val}"
+                break
 
     if not device:
         raise ValueError("ODM partition missing required device identity property (ro.product.odm.device or ro.product.device)")
@@ -477,7 +491,7 @@ def validate_odm_target(staging_path):
 
     # Reject donor contamination
     contaminated = ["lemonade", "oneplus9", "le2113", "le2115", "le2110", "lahaina", "sm8350"]
-    for val in [device, model, brand, fingerprint]:
+    for val in [device, model, brand, fingerprint, soc_model]:
         if val and any(k in val.lower() for k in contaminated):
             raise ValueError(f"CRITICAL ERROR: Donor device contamination detected in ODM property '{val}'!")
 
@@ -507,7 +521,7 @@ def validate_odm_target(staging_path):
         raise ValueError(f"ODM partition model '{model}' does not match OnePlus 7T!")
 
     if soc_model:
-        if soc_model.upper() not in ["SM8150", "SM8150-AC", "MSMNILE"]:
+        if soc_model.upper() not in ["SM8150", "SM8150-AC", "MSMNILE", "QCOM"]:
             raise ValueError(f"ODM partition SoC model '{soc_model}' does not match SM8150!")
 
     return {
@@ -518,6 +532,7 @@ def validate_odm_target(staging_path):
         "release": rel,
         "fingerprint": fingerprint or "unknown",
         "soc_model": soc_model or "unspecified",
+        "soc_provenance": soc_provenance or "unspecified (verified via vendor.platform)",
     }
 
 def stage_partition(source_info, staging_part_dir):

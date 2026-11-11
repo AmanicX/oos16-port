@@ -395,9 +395,9 @@ fi
 
 if [ "$CHECK_HARDWARE_ONLY" -eq 1 ]; then
     echo ""
-    python3 "$PROJECT_ROOT/tools/integrate_hardware_assets.py" --verify-only
+    python3 "$PROJECT_ROOT/tools/integrate_hardware_assets.py" --verify-integration
     echo ""
-    echo "[OK] All 84 OnePlus 7T hardware assets and firmware mounts are verified."
+    echo "[OK] All 84 OnePlus 7T hardware assets, Stage-1 payloads, and firmware mounts are verified."
     exit 0
 fi
 
@@ -408,7 +408,7 @@ echo ""
 echo "--- Step 2: Validating Authentic OnePlus 7T Hardware Assets ---"
 
 if [ -d "$PROJECT_ROOT/partitions" ] && [ -f "$PROJECT_ROOT/tools/integrate_hardware_assets.py" ] && command -v python3 >/dev/null 2>&1; then
-    python3 "$PROJECT_ROOT/tools/integrate_hardware_assets.py" --verify-only
+    python3 "$PROJECT_ROOT/tools/integrate_hardware_assets.py" --verify-integration
 fi
 
 KERNEL_IMG="$PROJECT_ROOT/stage1/kernel_src/kernel"

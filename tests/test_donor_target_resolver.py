@@ -689,5 +689,88 @@ class TestDonorTargetResolver(unittest.TestCase):
         finally:
             os.chmod(unreadable_f, 0o644)
 
+    def test_immutability_fails_on_inaccessible_directory(self):
+        """Verify snapshot fails closed and raises RuntimeError on inaccessible directory via onerror."""
+        snap_dir = os.path.join(self.test_dir, "snap_test_inaccessible")
+        sub_dir = os.path.join(snap_dir, "locked_dir")
+        os.makedirs(sub_dir, exist_ok=True)
+        os.chmod(sub_dir, 0o000)
+
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                rps.snapshot_dir_state(snap_dir)
+            self.assertIn("traverse directory", str(ctx.exception).lower())
+        finally:
+            os.chmod(sub_dir, 0o755)
+
+    def test_odm_soc_fallback_to_authentic_property(self):
+        """Verify validate_odm_target falls back to authentic hardware property when ro.soc.model is absent."""
+        odm_dir = os.path.join(self.test_dir, "odm_fallback")
+        os.makedirs(os.path.join(odm_dir, "etc"), exist_ok=True)
+        with open(os.path.join(odm_dir, "etc", "build.prop"), "w") as f:
+            f.write(
+                "ro.odm.build.version.sdk=36\n"
+                "ro.odm.build.version.release=16\n"
+                "ro.product.odm.device=hotdogb\n"
+                "ro.product.odm.model=HD1901\n"
+                "ro.board.platform=msmnile\n"
+            )
+        meta = rps.validate_odm_target(odm_dir)
+        self.assertEqual(meta["soc_model"], "msmnile")
+        self.assertEqual(meta["soc_provenance"], "ro.board.platform=msmnile")
+
+    def test_odm_soc_unspecified_when_no_soc_property(self):
+        """Verify validate_odm_target records unspecified when no SoC property exists (no fabricated default)."""
+        odm_dir = os.path.join(self.test_dir, "odm_no_soc")
+        os.makedirs(os.path.join(odm_dir, "etc"), exist_ok=True)
+        with open(os.path.join(odm_dir, "etc", "build.prop"), "w") as f:
+            f.write(
+                "ro.odm.build.version.sdk=36\n"
+                "ro.odm.build.version.release=16\n"
+                "ro.product.odm.device=hotdogb\n"
+                "ro.product.odm.model=HD1901\n"
+            )
+        meta = rps.validate_odm_target(odm_dir)
+        self.assertEqual(meta["soc_model"], "unspecified")
+        self.assertIn("unspecified", meta["soc_provenance"])
+
+    def test_sparse_image_unsparse_handling(self):
+        """Verify extract_image_to_dir detects Android sparse images and unsparses them via simg2img."""
+        simg_tool = shutil.which("simg2img") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/simg2img")
+        img2simg_tool = shutil.which("img2simg") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/img2simg")
+        mkfs_tool = shutil.which("mkfs.erofs") or os.path.join(PROJECT_ROOT, "external/coloros_port/otatools/bin/mkfs.erofs")
+
+        if not (simg_tool and os.path.isfile(simg_tool)) or not (img2simg_tool and os.path.isfile(img2simg_tool)) or not (mkfs_tool and os.path.isfile(mkfs_tool)):
+            self.skipTest("img2simg, simg2img or mkfs.erofs not available")
+
+        # Create source tree
+        raw_tree = os.path.join(self.test_dir, "sparse_tree")
+        os.makedirs(raw_tree, exist_ok=True)
+        with open(os.path.join(raw_tree, "hello.txt"), "w") as f:
+            f.write("sparse_erofs_test")
+
+        # Build raw erofs image
+        raw_img = os.path.join(self.test_dir, "raw.erofs")
+        subprocess.run([mkfs_tool, raw_img, raw_tree], check=True, capture_output=True)
+
+        # Convert to sparse image
+        sparse_img = os.path.join(self.test_dir, "sparse.erofs")
+        subprocess.run([img2simg_tool, raw_img, sparse_img], check=True, capture_output=True)
+
+        # Verify sparse magic 0xed26ff3a
+        with open(sparse_img, "rb") as f:
+            head = f.read(4)
+        self.assertEqual(head, b"\x3a\xff\x26\xed")
+
+        # Extract sparse image
+        out_tree = os.path.join(self.test_dir, "extracted_sparse")
+        os.makedirs(out_tree, exist_ok=True)
+        rps.extract_image_to_dir(sparse_img, out_tree)
+
+        self.assertTrue(os.path.isfile(os.path.join(out_tree, "hello.txt")))
+        with open(os.path.join(out_tree, "hello.txt")) as f:
+            self.assertEqual(f.read(), "sparse_erofs_test")
+
+
 if __name__ == "__main__":
     unittest.main()
